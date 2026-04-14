@@ -1,270 +1,220 @@
 <!DOCTYPE html>
 <html lang="ko">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>모바일 IMU + 프레임 전송 테스트</title>
-  <style>
-    body {
-      font-family: sans-serif;
-      padding: 16px;
-      line-height: 1.5;
-    }
-    h1 {
-      font-size: 28px;
-      margin-bottom: 20px;
-    }
-    button {
-      padding: 12px 18px;
-      margin-right: 10px;
-      margin-bottom: 10px;
-      border: none;
-      border-radius: 20px;
-      background: #e9e9e9;
-      font-size: 16px;
-    }
-    #status {
-      font-size: 18px;
-      margin: 18px 0;
-    }
-    video, canvas {
-      width: 100%;
-      max-width: 360px;
-      border: 1px solid #ccc;
-      margin-bottom: 16px;
-    }
-    #log {
-      white-space: pre-wrap;
-      background: #f3f3f3;
-      padding: 14px;
-      min-height: 180px;
-      border-radius: 6px;
-      font-size: 15px;
-    }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AR 네비게이션 - 카메라 & IMU 스트리밍</title>
+    <style>
+        body { font-family: sans-serif; padding: 16px; text-align: center; background: #f0f2f5; margin: 0; }
+        h2 { color: #333; margin-bottom: 20px; }
+        video { width: 100%; max-width: 400px; border-radius: 12px; background: #000; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .controls { margin: 20px 0; display: flex; flex-direction: column; gap: 10px; align-items: center; }
+        button { padding: 15px 30px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; font-size: 16px; width: 100%; max-width: 300px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); transition: transform 0.1s; }
+        button:active { transform: scale(0.98); }
+        #startBtn { background: #10b981; color: white; }
+        #stopBtn { background: #ef4444; color: white; display: none; }
+        .status { font-size: 15px; color: #4b5563; margin-top: 10px; font-weight: bold; background: #e5e7eb; padding: 8px 16px; border-radius: 20px; display: inline-block; }
+        #log { background: #fff; padding: 12px; border-radius: 8px; height: 200px; overflow-y: auto; text-align: left; font-size: 13px; margin-top: 20px; border: 1px solid #ddd; box-shadow: inset 0 2px 4px rgba(0,0,0,0.05); }
+        #log div { margin-bottom: 4px; border-bottom: 1px solid #f0f0f0; padding-bottom: 4px; }
+    </style>
 </head>
 <body>
-  <h1>모바일 IMU + 프레임 전송 테스트</h1>
+    <h2>🚀 센서 & 카메라 융합 스트리밍</h2>
+    
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas" width="640" height="480" style="display:none;"></canvas>
 
-  <button id="startBtn">센서/카메라 시작</button>
-  <button id="sendFrameBtn">프레임 1장 전송</button>
+    <div class="controls">
+        <button id="startBtn" onclick="startSystem()">스트리밍 시작</button>
+        <button id="stopBtn" onclick="stopSystem()">스트리밍 중지</button>
+        <div class="status" id="stats">대기 중...</div>
+    </div>
 
-  <div id="status">대기중</div>
+    <div id="log"></div>
 
-  <video id="video" autoplay playsinline muted></video>
-  <canvas id="canvas" width="640" height="480" style="display:none;"></canvas>
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const stats = document.getElementById('stats');
+        const logEl = document.getElementById('log');
 
-  <div id="log"></div>
+        let ws = null;
+        let streamingInterval = null;
+        let sessionId = null;
+        let isStreaming = false;
+        let frameCount = 0;
+        let imuCount = 0;
+        const TARGET_FPS = 10; // 초당 10프레임 (사진)
 
-  <script>
-    const statusEl = document.getElementById("status");
-    const logEl = document.getElementById("log");
-    const video = document.getElementById("video");
-    const canvas = document.getElementById("canvas");
-    const ctx = canvas.getContext("2d");
-
-    let ws = null;
-    let sessionId = null;
-    let cameraEnabled = false;
-    let imuEnabled = false;
-
-    function log(msg) {
-      console.log(msg);
-      logEl.textContent += msg + "\n";
-    }
-
-    function nowTs() {
-      return performance.timeOrigin + performance.now();
-    }
-
-    function getBaseUrl() {
-      return window.location.origin;
-    }
-
-    function getWsUrl() {
-      const origin = window.location.origin;
-      if (origin.startsWith("https://")) {
-        return origin.replace("https://", "wss://") + "/ws/mobile";
-      } else {
-        return origin.replace("http://", "ws://") + "/ws/mobile";
-      }
-    }
-
-    async function requestMotionPermissionIfNeeded() {
-      log("IMU 권한 요청 함수 진입");
-
-      if (
-        typeof DeviceMotionEvent !== "undefined" &&
-        typeof DeviceMotionEvent.requestPermission === "function"
-      ) {
-        log("iPhone 방식 권한 요청 필요");
-        const result = await DeviceMotionEvent.requestPermission();
-        log("IMU 권한 결과: " + result);
-
-        if (result !== "granted") {
-          throw new Error("IMU 권한이 허용되지 않음");
+        // 화면에 로그 띄우는 함수
+        function log(msg) {
+            const timeString = new Date().toLocaleTimeString();
+            logEl.innerHTML += `<div><strong>[${timeString}]</strong> ${msg}</div>`;
+            logEl.scrollTop = logEl.scrollHeight; // 자동 스크롤
         }
-      } else {
-        log("별도 IMU 권한 요청 없이 진행");
-      }
-    }
 
-    async function connectWebSocket() {
-      log("WebSocket 연결 시도");
-      return new Promise((resolve, reject) => {
-        ws = new WebSocket(getWsUrl());
-
-        ws.onopen = () => {
-          log("WebSocket 연결됨");
-          ws.send(JSON.stringify({ type: "hello" }));
-        };
-
-        ws.onmessage = (event) => {
-          log("WS 수신: " + event.data);
-
-          try {
-            const data = JSON.parse(event.data);
-            if (data.session_id) {
-              sessionId = data.session_id;
-              log("세션 ID 저장: " + sessionId);
+        // 1. 카메라 권한 및 켜기
+        async function initCamera() {
+            try {
+                log("카메라 접근 권한을 요청합니다...");
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: "environment", width: 640, height: 480 }, 
+                    audio: false 
+                });
+                video.srcObject = stream;
+                log("📷 카메라 준비 완료!");
+            } catch (err) {
+                log("❌ 카메라 에러: " + err.message);
+                alert("카메라 권한을 허용해주세요!");
             }
-          } catch (e) {
-            log("WS JSON 파싱 실패");
-          }
+        }
 
-          resolve();
-        };
+        // 2. iOS IMU 권한 요청 (사파리 필수)
+        async function requestMotionPermission() {
+            if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") {
+                log("iOS 센서 권한을 요청합니다...");
+                const perm = await DeviceMotionEvent.requestPermission();
+                if (perm !== "granted") {
+                    throw new Error("IMU 센서 권한이 거부되었습니다.");
+                }
+                log("✅ 센서 권한 획득 완료");
+            }
+        }
 
-        ws.onerror = (err) => {
-          log("WebSocket 오류 발생");
-          reject(new Error("WebSocket 연결 실패"));
-        };
-      });
-    }
+        // 3. 웹소켓 주소 자동 생성 (ngrok 대응)
+        function getWsUrl() {
+            const origin = window.location.origin;
+            if (origin.startsWith("https://")) {
+                return origin.replace("https://", "wss://") + "/ws/imu";
+            } else {
+                return origin.replace("http://", "ws://") + "/ws/imu";
+            }
+        }
 
-    async function startCamera() {
-      log("카메라 시작 시도");
+        // 4. IMU 데이터 실시간 전송 (devicemotion 이벤트)
+        function handleMotion(event) {
+            if (!isStreaming || !ws || ws.readyState !== WebSocket.OPEN) return;
+            
+            const payload = {
+                type: "imu",
+                session_id: sessionId,
+                timestamp: performance.timeOrigin + performance.now(),
+                accel_g: {
+                    x: event.accelerationIncludingGravity?.x || 0,
+                    y: event.accelerationIncludingGravity?.y || 0,
+                    z: event.accelerationIncludingGravity?.z || 0
+                },
+                gyro: {
+                    alpha: event.rotationRate?.alpha || 0,
+                    beta: event.rotationRate?.beta || 0,
+                    gamma: event.rotationRate?.gamma || 0
+                }
+            };
+            ws.send(JSON.stringify(payload));
+            imuCount++;
+        }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment" },
-        audio: false
-      });
+        // 5. 프레임 이미지 캡처 및 전송 (HTTP POST)
+        async function sendFrame() {
+            if (!isStreaming || video.readyState !== video.HAVE_ENOUGH_DATA) return;
 
-      video.srcObject = stream;
-      cameraEnabled = true;
-      log("카메라 시작 완료");
-    }
+            // 캔버스에 현재 영상 그리기
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            
+            // 이미지 압축 (0.6 퀄리티로 용량 절약)
+            const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.6));
+            
+            const formData = new FormData();
+            formData.append("session_id", sessionId);
+            formData.append("timestamp", (performance.timeOrigin + performance.now()) / 1000.0);
+            formData.append("frame", blob, "frame.jpg");
 
-    function startIMU() {
-      if (imuEnabled) {
-        log("IMU 이미 시작됨");
-        return;
-      }
+            try {
+                const res = await fetch("/stream-frame", { method: "POST", body: formData });
+                if (res.ok) {
+                    frameCount++;
+                    stats.innerText = `🟢 찰칵: ${frameCount}장 | 센서: ${imuCount}번`;
+                }
+            } catch (e) {
+                // 스트리밍 중 일시적인 네트워크 끊김은 무시
+                console.warn("프레임 전송 실패", e);
+            }
+        }
 
-      window.addEventListener("devicemotion", (event) => {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        // 메인 시작 함수 (버튼 클릭 시 실행)
+        async function startSystem() {
+            try {
+                document.getElementById('startBtn').disabled = true;
+                stats.innerText = "초기화 중...";
 
-        const payload = {
-          type: "imu",
-          timestamp: nowTs(),
-          accel: {
-            x: event.acceleration?.x ?? null,
-            y: event.acceleration?.y ?? null,
-            z: event.acceleration?.z ?? null
-          },
-          accel_g: {
-            x: event.accelerationIncludingGravity?.x ?? null,
-            y: event.accelerationIncludingGravity?.y ?? null,
-            z: event.accelerationIncludingGravity?.z ?? null
-          },
-          gyro: {
-            alpha: event.rotationRate?.alpha ?? null,
-            beta: event.rotationRate?.beta ?? null,
-            gamma: event.rotationRate?.gamma ?? null
-          },
-          interval: event.interval ?? null
-        };
+                await requestMotionPermission(); 
+                
+                // 웹소켓 연결 시도
+                ws = new WebSocket(getWsUrl());
+                
+                ws.onopen = () => {
+                    log("🌐 서버와 실시간 파이프라인 연결 성공!");
+                    
+                    sessionId = "session_" + Date.now();
+                    isStreaming = true;
+                    frameCount = 0;
+                    imuCount = 0;
+                    
+                    // 센서 수집 및 사진 캡처 타이머 가동
+                    window.addEventListener("devicemotion", handleMotion);
+                    streamingInterval = setInterval(sendFrame, 1000 / TARGET_FPS);
+                    
+                    // UI 변경
+                    document.getElementById('startBtn').style.display = 'none';
+                    document.getElementById('startBtn').disabled = false;
+                    document.getElementById('stopBtn').style.display = 'inline-block';
+                    log(`🚀 [${sessionId}] 데이터 전송을 시작합니다.`);
+                };
 
-        ws.send(JSON.stringify(payload));
-      });
+                ws.onerror = (err) => {
+                    log("❌ 웹소켓 연결 실패! ngrok 주소를 다시 확인해주세요.");
+                    document.getElementById('startBtn').disabled = false;
+                    stats.innerText = "연결 실패";
+                };
+                
+            } catch (e) {
+                log("❌ 실행 에러: " + e.message);
+                document.getElementById('startBtn').disabled = false;
+                stats.innerText = "에러 발생";
+            }
+        }
 
-      imuEnabled = true;
-      log("IMU 이벤트 수집 시작");
-    }
+        // 메인 중지 함수
+        // 메인 중지 함수 수정
+        async function stopSystem() {
+            isStreaming = false;
+            clearInterval(streamingInterval);
+            window.removeEventListener("devicemotion", handleMotion);
+            if (ws) ws.close();
+            
+            document.getElementById('startBtn').style.display = 'inline-block';
+            document.getElementById('stopBtn').style.display = 'none';
+            stats.innerText = `⏹ 스트리밍 종료 (사진: ${frameCount}장, 센서: ${imuCount}번)`;
+            log("⏹ 데이터 수집 완료. 서버에 SLAM 분석을 요청합니다...");
 
-    async function sendFrame() {
-      log("프레임 전송 시도");
+            // 🚨 서버에 SLAM 실행 요청 보내기
+            const formData = new FormData();
+            formData.append("session_id", sessionId);
+            try {
+                const res = await fetch("/trigger-slam", { method: "POST", body: formData });
+                const result = await res.json();
+                if(result.ok) {
+                    log("⚙️ ORB-SLAM3 엔진 구동 시작! (VS Code 터미널을 확인하세요)");
+                }
+            } catch(e) {
+                log("❌ SLAM 요청 실패: " + e.message);
+            }
+        }
 
-      if (!cameraEnabled) {
-        alert("먼저 센서/카메라 시작을 눌러주세요.");
-        return;
-      }
+        // 페이지 열리자마자 카메라 켜기
+        window.onload = initCamera;
 
-      if (!sessionId) {
-        alert("세션 ID가 없습니다. WebSocket 연결을 먼저 확인하세요.");
-        return;
-      }
-
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-      const blob = await new Promise((resolve) => {
-        canvas.toBlob(resolve, "image/jpeg", 0.8);
-      });
-
-      const formData = new FormData();
-      formData.append("session_id", sessionId);
-      formData.append("timestamp", String(nowTs()));
-      formData.append("frame", blob, "frame.jpg");
-
-      const res = await fetch(getBaseUrl() + "/frame", {
-        method: "POST",
-        body: formData
-      });
-
-      const result = await res.json();
-      log("프레임 업로드 응답: " + JSON.stringify(result));
-    }
-
-    log("스크립트 로드됨");
-    log("현재 origin: " + window.location.origin);
-    log("WebSocket 주소: " + getWsUrl());
-
-    document.getElementById("startBtn").addEventListener("click", async () => {
-      log("버튼 클릭됨");
-
-      try {
-        statusEl.textContent = "초기화 중...";
-        log("1. IMU 권한 요청 시작");
-
-        // 아이폰 대응: 클릭 직후 바로 실행
-        await requestMotionPermissionIfNeeded();
-
-        log("2. WebSocket 연결 시작");
-        await connectWebSocket();
-
-        log("3. 카메라 시작");
-        await startCamera();
-
-        log("4. IMU 시작");
-        startIMU();
-
-        statusEl.textContent = "센서/카메라 동작 중";
-        log("초기화 완료");
-      } catch (err) {
-        console.error(err);
-        statusEl.textContent = "오류 발생";
-        log("오류: " + err.message);
-      }
-    });
-
-    document.getElementById("sendFrameBtn").addEventListener("click", async () => {
-      try {
-        await sendFrame();
-      } catch (err) {
-        console.error(err);
-        log("프레임 전송 오류: " + err.message);
-      }
-    });
-  </script>
+    </script>
 </body>
 </html>
