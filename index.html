@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VGGT 업로드 & 좌표 테스트</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 20px; }
+    h1 { margin-bottom: 20px; }
+    .section { margin-bottom: 24px; padding: 16px; border: 1px solid #ddd; border-radius: 10px; }
+    .preview-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; margin-top: 12px; }
+    .preview-grid img, .preview-grid video { width: 100%; height: 140px; object-fit: cover; border-radius: 8px; border: 1px solid #ccc; }
+    button { padding: 12px 20px; font-size: 16px; cursor: pointer; border: none; border-radius: 8px; }
+    #uploadBtn { background-color: #2563eb; color: white; }
+    #uploadBtn:disabled { background-color: #9ca3af; cursor: not-allowed; }
+    #status { margin-top: 16px; font-weight: bold; }
+    #progressBar { width: 100%; height: 20px; margin-top: 12px; }
+    pre { background: #f7f7f7; padding: 12px; border-radius: 8px; overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <h1>사진/동영상 업로드 → 좌표 JSON</h1>
+
+  <div class="section">
+    <label><strong>사진 업로드</strong></label><br><br>
+    <input type="file" id="imageInput" accept="image/*" multiple />
+    <div id="imagePreview" class="preview-grid"></div>
+  </div>
+
+  <div class="section">
+    <label><strong>동영상 업로드</strong></label><br><br>
+    <input type="file" id="videoInput" accept="video/*" />
+    <div id="videoPreview" class="preview-grid"></div>
+  </div>
+
+  <button id="uploadBtn">서버로 보내기</button>
+  <progress id="progressBar" value="0" max="100"></progress>
+  <div id="status"></div>
+
+  <h3>서버 응답 JSON</h3>
+  <pre id="resultBox">아직 없음</pre>
+
+  <script>
+    const imageInput = document.getElementById("imageInput");
+    const videoInput = document.getElementById("videoInput");
+    const imagePreview = document.getElementById("imagePreview");
+    const videoPreview = document.getElementById("videoPreview");
+    const uploadBtn = document.getElementById("uploadBtn");
+    const status = document.getElementById("status");
+    const progressBar = document.getElementById("progressBar");
+    const resultBox = document.getElementById("resultBox");
+
+    // ✅ 여기를 /predict로 바꿔서 모델까지 실행
+    const SERVER_URL = "http://localhost:8000/predict";
+
+    imageInput.addEventListener("change", () => {
+      imagePreview.innerHTML = "";
+      for (const file of imageInput.files) {
+        const img = document.createElement("img");
+        img.src = URL.createObjectURL(file);
+        imagePreview.appendChild(img);
+      }
+    });
+
+    videoInput.addEventListener("change", () => {
+      videoPreview.innerHTML = "";
+      const file = videoInput.files[0];
+      if (!file) return;
+      const video = document.createElement("video");
+      video.src = URL.createObjectURL(file);
+      video.controls = true;
+      videoPreview.appendChild(video);
+    });
+
+    uploadBtn.addEventListener("click", () => {
+      const imageFiles = imageInput.files;
+      const videoFile = videoInput.files[0];
+
+      if (imageFiles.length === 0 && !videoFile) {
+        status.textContent = "사진 또는 동영상을 선택하세요.";
+        return;
+      }
+
+      const formData = new FormData();
+      for (const file of imageFiles) formData.append("images", file);
+      if (videoFile) formData.append("video", videoFile);
+
+      // 테스트용 사용자 ID
+      formData.append("user_id", "test_user");
+
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", SERVER_URL, true);
+
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          const percent = Math.round((event.loaded / event.total) * 100);
+          progressBar.value = percent;
+          status.textContent = `업로드 중... ${percent}%`;
+        }
+      };
+
+      xhr.onload = () => {
+        if (xhr.status === 200) {
+          const response = JSON.parse(xhr.responseText);
+          
+          // ✅ 상태 텍스트를 단순하게 변경
+          status.textContent = "업로드 완료!";
+          
+          // ✅ 다시 전체 JSON 결과값(경로 포함)을 예쁘게 출력하도록 변경!
+          resultBox.textContent = JSON.stringify(response, null, 2);
+          
+        } else {
+          status.textContent = `업로드 실패 (status: ${xhr.status})`;
+          resultBox.textContent = xhr.responseText;
+        }
+      };
+
+      xhr.onerror = () => {
+        status.textContent = "서버 연결 실패";
+      };
+
+      progressBar.value = 0;
+      status.textContent = "업로드 시작...";
+      xhr.send(formData);
+    });
+  </script>
+</body>
+</html>
