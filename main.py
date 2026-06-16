@@ -5,7 +5,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pathlib import Path
 import csv
 import json
-import math
+import zipfile
 
 
 app = FastAPI()
@@ -361,7 +361,6 @@ async def websocket_stream(websocket: WebSocket):
                     accel = payload.get("accel_g", {})
                     gyro = payload.get("gyro", {})
 
-                    # Android Gyroscope 값은 이미 rad/s라서 변환하지 않음
                     gx = float(gyro.get("alpha", 0.0))
                     gy = float(gyro.get("beta", 0.0))
                     gz = float(gyro.get("gamma", 0.0))
@@ -385,7 +384,6 @@ async def websocket_stream(websocket: WebSocket):
 
                     imu_received_count += 1
 
-                    # 너무 자주 응답하면 느려질 수 있으므로 200개마다 응답
                     if imu_received_count % 200 == 0:
                         await websocket.send_text(json.dumps({
                             "ok": True,
@@ -510,7 +508,6 @@ async def websocket_stream(websocket: WebSocket):
 
                 frame_received_count += 1
 
-                # 10장마다 한 번 응답
                 if frame_received_count % 10 == 0:
                     await websocket.send_text(json.dumps({
                         "ok": True,
@@ -576,6 +573,99 @@ def session_summary(session_id: str):
         "imu_count": imu_count,
         "synced_count": synced_count,
     }
+
+
+# =========================================================
+# Render 저장 세션 목록 확인용
+# =========================================================
+@app.get("/sessions")
+def list_sessions():
+    sessions = []
+
+    if not BASE_UPLOAD_DIR.exists():
+        return {
+            "ok": True,
+            "sessions": []
+        }
+
+    for session_dir in sorted(BASE_UPLOAD_DIR.iterdir(), reverse=True):
+        if not session_dir.is_dir():
+            continue
+
+        frames_path = session_dir / "frames.csv"
+        imu_path = session_dir / "imu.csv"
+        synced_path = session_dir / "synced.json"
+
+        frame_count = 0
+        imu_count = 0
+        synced_count = 0
+
+        if frames_path.exists():
+            with open(frames_path, "r", newline="", encoding="utf-8") as f:
+                frame_count = max(0, len(list(csv.reader(f))) - 1)
+
+        if imu_path.exists():
+            with open(imu_path, "r", newline="", encoding="utf-8") as f:
+                imu_count = max(0, len(list(csv.reader(f))) - 1)
+
+        if synced_path.exists():
+            try:
+                synced = json.loads(synced_path.read_text(encoding="utf-8"))
+                synced_count = len(synced)
+            except Exception:
+                synced_count = 0
+
+        sessions.append({
+            "session_id": session_dir.name,
+            "frame_count": frame_count,
+            "imu_count": imu_count,
+            "synced_count": synced_count,
+            "summary_url": f"/session/{session_dir.name}/summary",
+            "download_url": f"/session/{session_dir.name}/download",
+        })
+
+    return {
+        "ok": True,
+        "sessions": sessions
+    }
+
+
+# =========================================================
+# Render 저장 세션 ZIP 다운로드
+# =========================================================
+@app.get("/session/{session_id}/download")
+def download_session(session_id: str):
+    session_id = safe_session_id(session_id)
+    session_dir = BASE_UPLOAD_DIR / session_id
+
+    if not session_dir.exists() or not session_dir.is_dir():
+        return JSONResponse(
+            status_code=404,
+            content={
+                "ok": False,
+                "message": f"session not found: {session_id}"
+            }
+        )
+
+    zip_path = session_dir / f"{session_id}.zip"
+
+    if zip_path.exists():
+        zip_path.unlink()
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for file_path in session_dir.rglob("*"):
+            if file_path == zip_path:
+                continue
+
+            if file_path.is_file():
+                arcname = file_path.relative_to(session_dir.parent)
+                zip_file.write(file_path, arcname)
+
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"{session_id}.zip"
+    )
 
 
 # =========================================================
