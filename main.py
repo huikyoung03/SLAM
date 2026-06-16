@@ -118,7 +118,7 @@ def init_session_files(session_dir: Path):
     if not calib_txt.exists():
         # DROID-SLAM calibration 형식: fx fy cx cy
         # 현재는 임시값
-        calib_txt.write_text("517.3 516.5 318.6 255.3\n", encoding="utf-8")
+        calib_txt.write_text("640 480 320 240\n", encoding="utf-8")
 
     if not meta_json.exists():
         meta = {
