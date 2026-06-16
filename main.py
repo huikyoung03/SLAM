@@ -36,6 +36,14 @@ def root():
 
 
 # =========================================================
+# 라우트 확인용
+# =========================================================
+@app.get("/routes")
+def routes():
+    return [route.path for route in app.routes]
+
+
+# =========================================================
 # 공통 유틸
 # =========================================================
 def sec_to_ns(timestamp_sec: float) -> int:
@@ -46,15 +54,7 @@ def ms_to_sec(timestamp_ms: float) -> float:
     return timestamp_ms / 1000.0
 
 
-def deg_to_rad(value: float) -> float:
-    return value * math.pi / 180.0
-
-
 def safe_session_id(session_id: str) -> str:
-    """
-    세션 이름에 경로 문자가 들어가면 uploads 밖으로 파일이 생성될 수 있으므로
-    안전한 문자만 남긴다.
-    """
     allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
     cleaned = "".join(ch for ch in session_id if ch in allowed)
 
@@ -117,7 +117,7 @@ def init_session_files(session_dir: Path):
 
     if not calib_txt.exists():
         # DROID-SLAM calibration 형식: fx fy cx cy
-        # 현재는 임시값. 실제 모바일 카메라 보정값을 알게 되면 교체 필요.
+        # 현재는 임시값
         calib_txt.write_text("517.3 516.5 318.6 255.3\n", encoding="utf-8")
 
     if not meta_json.exists():
@@ -142,7 +142,7 @@ def init_session_files(session_dir: Path):
             "imu_format": "timestamp_sec,timestamp_ns,gx,gy,gz,ax,ay,az",
             "gyro_unit": "rad/s",
             "accel_unit": "m/s^2",
-            "note": "이미지와 IMU를 하나의 WebSocket(/ws/stream)으로 수신한다. Android gyro는 rad/s 그대로 저장한다.",
+            "note": "이미지와 IMU를 하나의 WebSocket(/ws/stream)으로 수신한다.",
         }
 
         meta_json.write_text(
@@ -160,7 +160,6 @@ def get_next_frame_id(session_dir: Path) -> int:
     with open(frames_csv, "r", newline="", encoding="utf-8") as f:
         rows = list(csv.reader(f))
 
-    # header 제외
     return max(0, len(rows) - 1)
 
 
@@ -222,7 +221,6 @@ def build_synced_json(session_dir: Path):
             imu_window = []
         else:
             prev_ts = frames[i - 1]["timestamp_ns"]
-
             imu_window = [
                 imu for imu in imu_samples
                 if prev_ts < imu["timestamp_ns"] <= curr_ts
@@ -322,7 +320,6 @@ async def websocket_stream(websocket: WebSocket):
 
                 # ---------------------------------------------
                 # 프레임 메타데이터 수신
-                # 다음 binary 메시지를 이 메타데이터와 연결함
                 # ---------------------------------------------
                 elif msg_type == "frame_meta":
                     session_id = payload.get("session_id")
@@ -340,8 +337,8 @@ async def websocket_stream(websocket: WebSocket):
                 # ---------------------------------------------
                 # IMU 수신
                 # Android SensorManager:
-                # - accelerometer: m/s^2
-                # - gyroscope: rad/s
+                # accelerometer: m/s^2
+                # gyroscope: rad/s
                 # ---------------------------------------------
                 elif msg_type == "imu":
                     session_id = payload.get("session_id")
@@ -364,8 +361,7 @@ async def websocket_stream(websocket: WebSocket):
                     accel = payload.get("accel_g", {})
                     gyro = payload.get("gyro", {})
 
-                    # 중요:
-                    # Android Gyroscope 값은 이미 rad/s 이므로 deg_to_rad 변환하지 않음.
+                    # Android Gyroscope 값은 이미 rad/s라서 변환하지 않음
                     gx = float(gyro.get("alpha", 0.0))
                     gy = float(gyro.get("beta", 0.0))
                     gz = float(gyro.get("gamma", 0.0))
@@ -389,8 +385,7 @@ async def websocket_stream(websocket: WebSocket):
 
                     imu_received_count += 1
 
-                    # IMU는 매우 자주 오므로 매번 응답하지 않음.
-                    # 200개마다 한 번만 응답해서 통신 부하를 줄임.
+                    # 너무 자주 응답하면 느려질 수 있으므로 200개마다 응답
                     if imu_received_count % 200 == 0:
                         await websocket.send_text(json.dumps({
                             "ok": True,
@@ -491,7 +486,6 @@ async def websocket_stream(websocket: WebSocket):
                 with open(image_path, "wb") as f:
                     f.write(image_bytes)
 
-                # Android 앱에서는 frame timestamp도 ms 단위로 보냄
                 timestamp_ms = float(pending_frame_meta.get("timestamp", 0.0))
                 timestamp_sec = ms_to_sec(timestamp_ms)
                 timestamp_ns = sec_to_ns(timestamp_sec)
@@ -516,8 +510,7 @@ async def websocket_stream(websocket: WebSocket):
 
                 frame_received_count += 1
 
-                # 프레임도 너무 자주 응답하면 느려질 수 있으므로
-                # 10장마다 한 번만 응답
+                # 10장마다 한 번 응답
                 if frame_received_count % 10 == 0:
                     await websocket.send_text(json.dumps({
                         "ok": True,
