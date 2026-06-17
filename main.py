@@ -160,7 +160,6 @@ def init_session_files(session_dir: Path):
     times_txt = session_dir / "times.txt"
     calib_txt = session_dir / "calib.txt"
     meta_json = session_dir / "meta.json"
-    latency_csv = session_dir / "latency.csv"
 
     if not frames_csv.exists():
         with open(frames_csv, "w", newline="", encoding="utf-8") as f:
@@ -187,17 +186,6 @@ def init_session_files(session_dir: Path):
                 "ax",
                 "ay",
                 "az",
-            ])
-
-    if not latency_csv.exists():
-        with open(latency_csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "frame_id",
-                "client_timestamp_sec",
-                "server_saved_sec",
-                "clock_latency_ms",
-                "size_bytes",
             ])
 
     if not times_txt.exists():
@@ -946,21 +934,6 @@ async def websocket_stream(websocket: WebSocket):
                     encoding="utf-8",
                 ) as f:
                     f.write(f"{timestamp_sec:.9f}\n")
-
-                with open(
-                    session_dir / "latency.csv",
-                    "a",
-                    newline="",
-                    encoding="utf-8",
-                ) as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        frame_id,
-                        f"{timestamp_sec:.9f}",
-                        f"{server_saved_sec:.9f}",
-                        f"{clock_latency_ms:.3f}",
-                        size_bytes,
-                    ])
 
                 frame_received_count += 1
 
