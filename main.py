@@ -1,4 +1,3 @@
-```python
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -892,4 +891,3 @@ async def trigger_slam_legacy():
             ),
         },
     )
-```
