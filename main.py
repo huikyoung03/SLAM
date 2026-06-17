@@ -1,3 +1,4 @@
+```python
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -138,15 +139,26 @@ def init_session_files(session_dir: Path):
                 "imu": "IMU 데이터 전송",
                 "stop": "수집 종료 및 synced.json 생성",
             },
-            "frame_format": "timestamp_ms,width,height,format + binary image bytes",
-            "imu_format": "timestamp_sec,timestamp_ns,gx,gy,gz,ax,ay,az",
+            "frame_format": (
+                "timestamp_ms,width,height,format + binary image bytes"
+            ),
+            "imu_format": (
+                "timestamp_sec,timestamp_ns,gx,gy,gz,ax,ay,az"
+            ),
             "gyro_unit": "rad/s",
             "accel_unit": "m/s^2",
-            "note": "이미지와 IMU를 하나의 WebSocket(/ws/stream)으로 수신한다.",
+            "note": (
+                "이미지와 IMU를 하나의 WebSocket(/ws/stream)으로 "
+                "수신한다."
+            ),
         }
 
         meta_json.write_text(
-            json.dumps(meta, indent=2, ensure_ascii=False),
+            json.dumps(
+                meta,
+                indent=2,
+                ensure_ascii=False,
+            ),
             encoding="utf-8",
         )
 
@@ -178,6 +190,7 @@ def build_synced_json(session_dir: Path):
         raise FileNotFoundError("imu.csv not found")
 
     frames = []
+
     with open(frames_path, "r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
 
@@ -193,6 +206,7 @@ def build_synced_json(session_dir: Path):
             })
 
     imu_samples = []
+
     with open(imu_path, "r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
 
@@ -221,8 +235,10 @@ def build_synced_json(session_dir: Path):
             imu_window = []
         else:
             prev_ts = frames[i - 1]["timestamp_ns"]
+
             imu_window = [
-                imu for imu in imu_samples
+                imu
+                for imu in imu_samples
                 if prev_ts < imu["timestamp_ns"] <= curr_ts
             ]
 
@@ -243,14 +259,21 @@ def build_synced_json(session_dir: Path):
         })
 
     synced_path.write_text(
-        json.dumps(synced, indent=2, ensure_ascii=False),
+        json.dumps(
+            synced,
+            indent=2,
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
 
     avg_imu_per_frame = 0.0
 
     if len(synced) > 0:
-        avg_imu_per_frame = sum(item["imu_count"] for item in synced) / len(synced)
+        avg_imu_per_frame = (
+            sum(item["imu_count"] for item in synced)
+            / len(synced)
+        )
 
     return {
         "synced_path": str(synced_path),
@@ -267,6 +290,11 @@ def build_synced_json(session_dir: Path):
 async def websocket_stream(websocket: WebSocket):
     await websocket.accept()
 
+    print(
+        "[WEBSOCKET CONNECTED] 클라이언트 연결됨",
+        flush=True,
+    )
+
     pending_frame_meta = None
 
     imu_received_count = 0
@@ -282,12 +310,15 @@ async def websocket_stream(websocket: WebSocket):
             if message.get("text") is not None:
                 try:
                     payload = json.loads(message["text"])
+
                 except json.JSONDecodeError:
-                    await websocket.send_text(json.dumps({
-                        "ok": False,
-                        "type": "error",
-                        "message": "invalid json message",
-                    }, ensure_ascii=False))
+                    await websocket.send_text(
+                        json.dumps({
+                            "ok": False,
+                            "type": "error",
+                            "message": "invalid json message",
+                        }, ensure_ascii=False)
+                    )
                     continue
 
                 msg_type = payload.get("type")
@@ -299,24 +330,36 @@ async def websocket_stream(websocket: WebSocket):
                     session_id = payload.get("session_id")
 
                     if not session_id:
-                        await websocket.send_text(json.dumps({
-                            "ok": False,
-                            "type": "error",
-                            "message": "session_id missing",
-                        }, ensure_ascii=False))
+                        await websocket.send_text(
+                            json.dumps({
+                                "ok": False,
+                                "type": "error",
+                                "message": "session_id missing",
+                            }, ensure_ascii=False)
+                        )
                         continue
 
                     session_id = safe_session_id(session_id)
-                    get_session_dir(session_id)
+                    session_dir = get_session_dir(session_id)
 
                     imu_received_count = 0
                     frame_received_count = 0
+                    pending_frame_meta = None
 
-                    await websocket.send_text(json.dumps({
-                        "ok": True,
-                        "type": "started",
-                        "session_id": session_id,
-                    }, ensure_ascii=False))
+                    print(
+                        f"[SESSION START] "
+                        f"session_id={session_id}, "
+                        f"path={session_dir}",
+                        flush=True,
+                    )
+
+                    await websocket.send_text(
+                        json.dumps({
+                            "ok": True,
+                            "type": "started",
+                            "session_id": session_id,
+                        }, ensure_ascii=False)
+                    )
 
                 # ---------------------------------------------
                 # 프레임 메타데이터 수신
@@ -325,11 +368,15 @@ async def websocket_stream(websocket: WebSocket):
                     session_id = payload.get("session_id")
 
                     if not session_id:
-                        await websocket.send_text(json.dumps({
-                            "ok": False,
-                            "type": "error",
-                            "message": "session_id missing in frame_meta",
-                        }, ensure_ascii=False))
+                        await websocket.send_text(
+                            json.dumps({
+                                "ok": False,
+                                "type": "error",
+                                "message": (
+                                    "session_id missing in frame_meta"
+                                ),
+                            }, ensure_ascii=False)
+                        )
                         continue
 
                     pending_frame_meta = payload
@@ -344,17 +391,23 @@ async def websocket_stream(websocket: WebSocket):
                     session_id = payload.get("session_id")
 
                     if not session_id:
-                        await websocket.send_text(json.dumps({
-                            "ok": False,
-                            "type": "error",
-                            "message": "session_id missing in imu",
-                        }, ensure_ascii=False))
+                        await websocket.send_text(
+                            json.dumps({
+                                "ok": False,
+                                "type": "error",
+                                "message": (
+                                    "session_id missing in imu"
+                                ),
+                            }, ensure_ascii=False)
+                        )
                         continue
 
                     session_id = safe_session_id(session_id)
                     session_dir = get_session_dir(session_id)
 
-                    timestamp_ms = float(payload.get("timestamp", 0.0))
+                    timestamp_ms = float(
+                        payload.get("timestamp", 0.0)
+                    )
                     timestamp_sec = ms_to_sec(timestamp_ms)
                     timestamp_ns = sec_to_ns(timestamp_sec)
 
@@ -369,8 +422,14 @@ async def websocket_stream(websocket: WebSocket):
                     ay = float(accel.get("y", 0.0))
                     az = float(accel.get("z", 0.0))
 
-                    with open(session_dir / "imu.csv", "a", newline="", encoding="utf-8") as f:
+                    with open(
+                        session_dir / "imu.csv",
+                        "a",
+                        newline="",
+                        encoding="utf-8",
+                    ) as f:
                         writer = csv.writer(f)
+
                         writer.writerow([
                             f"{timestamp_sec:.9f}",
                             timestamp_ns,
@@ -384,13 +443,27 @@ async def websocket_stream(websocket: WebSocket):
 
                     imu_received_count += 1
 
+                    # IMU는 양이 많으므로 200개마다 로그 출력
                     if imu_received_count % 200 == 0:
-                        await websocket.send_text(json.dumps({
-                            "ok": True,
-                            "type": "imu_saved",
-                            "imu_received_count": imu_received_count,
-                            "timestamp_ns": timestamp_ns,
-                        }, ensure_ascii=False))
+                        print(
+                            f"[IMU RECEIVED] "
+                            f"count={imu_received_count}, "
+                            f"time={timestamp_sec:.6f}, "
+                            f"gyro=({gx:.4f}, {gy:.4f}, {gz:.4f}), "
+                            f"accel=({ax:.4f}, {ay:.4f}, {az:.4f})",
+                            flush=True,
+                        )
+
+                        await websocket.send_text(
+                            json.dumps({
+                                "ok": True,
+                                "type": "imu_saved",
+                                "imu_received_count": (
+                                    imu_received_count
+                                ),
+                                "timestamp_ns": timestamp_ns,
+                            }, ensure_ascii=False)
+                        )
 
                 # ---------------------------------------------
                 # 수집 종료 및 synced.json 생성
@@ -399,11 +472,15 @@ async def websocket_stream(websocket: WebSocket):
                     session_id = payload.get("session_id")
 
                     if not session_id:
-                        await websocket.send_text(json.dumps({
-                            "ok": False,
-                            "type": "error",
-                            "message": "session_id missing in stop",
-                        }, ensure_ascii=False))
+                        await websocket.send_text(
+                            json.dumps({
+                                "ok": False,
+                                "type": "error",
+                                "message": (
+                                    "session_id missing in stop"
+                                ),
+                            }, ensure_ascii=False)
+                        )
                         continue
 
                     session_id = safe_session_id(session_id)
@@ -416,26 +493,45 @@ async def websocket_stream(websocket: WebSocket):
                         f"--imagedir={session_dir / 'images'} "
                         f"--calib={session_dir / 'calib.txt'} "
                         f"--disable_vis "
-                        f"--reconstruction_path={session_dir / 'reconstruction.pth'}"
+                        f"--reconstruction_path="
+                        f"{session_dir / 'reconstruction.pth'}"
                     )
 
-                    await websocket.send_text(json.dumps({
-                        "ok": True,
-                        "type": "stopped",
-                        "message": "DROID-SLAM용 데이터 생성 완료",
-                        "session_id": session_id,
-                        "session_dir": str(session_dir),
-                        "droid_ready": True,
-                        "droid_command": droid_command,
-                        **sync_result,
-                    }, ensure_ascii=False))
+                    print(
+                        f"[SESSION STOP] "
+                        f"session_id={session_id}, "
+                        f"frames={sync_result['frame_count']}, "
+                        f"imu={sync_result['imu_count']}, "
+                        f"avg_imu_per_frame="
+                        f"{sync_result['avg_imu_per_frame']:.2f}",
+                        flush=True,
+                    )
+
+                    await websocket.send_text(
+                        json.dumps({
+                            "ok": True,
+                            "type": "stopped",
+                            "message": (
+                                "DROID-SLAM용 데이터 생성 완료"
+                            ),
+                            "session_id": session_id,
+                            "session_dir": str(session_dir),
+                            "droid_ready": True,
+                            "droid_command": droid_command,
+                            **sync_result,
+                        }, ensure_ascii=False)
+                    )
 
                 else:
-                    await websocket.send_text(json.dumps({
-                        "ok": False,
-                        "type": "error",
-                        "message": f"unknown message type: {msg_type}",
-                    }, ensure_ascii=False))
+                    await websocket.send_text(
+                        json.dumps({
+                            "ok": False,
+                            "type": "error",
+                            "message": (
+                                f"unknown message type: {msg_type}"
+                            ),
+                        }, ensure_ascii=False)
+                    )
 
             # -------------------------------------------------
             # 이미지 binary bytes 수신
@@ -445,21 +541,32 @@ async def websocket_stream(websocket: WebSocket):
                 image_bytes = message["bytes"]
 
                 if pending_frame_meta is None:
-                    await websocket.send_text(json.dumps({
-                        "ok": False,
-                        "type": "error",
-                        "message": "image binary received but frame_meta missing",
-                    }, ensure_ascii=False))
+                    await websocket.send_text(
+                        json.dumps({
+                            "ok": False,
+                            "type": "error",
+                            "message": (
+                                "image binary received but "
+                                "frame_meta missing"
+                            ),
+                        }, ensure_ascii=False)
+                    )
                     continue
 
                 session_id = pending_frame_meta.get("session_id")
 
                 if not session_id:
-                    await websocket.send_text(json.dumps({
-                        "ok": False,
-                        "type": "error",
-                        "message": "session_id missing in pending frame_meta",
-                    }, ensure_ascii=False))
+                    await websocket.send_text(
+                        json.dumps({
+                            "ok": False,
+                            "type": "error",
+                            "message": (
+                                "session_id missing in "
+                                "pending frame_meta"
+                            ),
+                        }, ensure_ascii=False)
+                    )
+
                     pending_frame_meta = None
                     continue
 
@@ -469,7 +576,9 @@ async def websocket_stream(websocket: WebSocket):
 
                 frame_id = get_next_frame_id(session_dir)
 
-                image_format = str(pending_frame_meta.get("format", "webp")).lower()
+                image_format = str(
+                    pending_frame_meta.get("format", "webp")
+                ).lower()
 
                 if image_format in ["jpg", "jpeg"]:
                     ext = "jpg"
@@ -481,18 +590,31 @@ async def websocket_stream(websocket: WebSocket):
                 filename = f"{frame_id:06d}.{ext}"
                 image_path = images_dir / filename
 
+                # 이미지 한 장 저장
                 with open(image_path, "wb") as f:
                     f.write(image_bytes)
 
-                timestamp_ms = float(pending_frame_meta.get("timestamp", 0.0))
+                timestamp_ms = float(
+                    pending_frame_meta.get("timestamp", 0.0)
+                )
                 timestamp_sec = ms_to_sec(timestamp_ms)
                 timestamp_ns = sec_to_ns(timestamp_sec)
 
-                width = int(pending_frame_meta.get("width", 640))
-                height = int(pending_frame_meta.get("height", 480))
+                width = int(
+                    pending_frame_meta.get("width", 640)
+                )
+                height = int(
+                    pending_frame_meta.get("height", 480)
+                )
 
-                with open(session_dir / "frames.csv", "a", newline="", encoding="utf-8") as f:
+                with open(
+                    session_dir / "frames.csv",
+                    "a",
+                    newline="",
+                    encoding="utf-8",
+                ) as f:
                     writer = csv.writer(f)
+
                     writer.writerow([
                         frame_id,
                         f"{timestamp_sec:.9f}",
@@ -503,36 +625,71 @@ async def websocket_stream(websocket: WebSocket):
                         save_format,
                     ])
 
-                with open(session_dir / "times.txt", "a", encoding="utf-8") as f:
+                with open(
+                    session_dir / "times.txt",
+                    "a",
+                    encoding="utf-8",
+                ) as f:
                     f.write(f"{timestamp_sec:.9f}\n")
 
                 frame_received_count += 1
 
+                # -------------------------------------------------
+                # 중요 변경 부분
+                # 이미지가 한 장 들어올 때마다 즉시 터미널에 출력함
+                # flush=True로 출력 버퍼링을 최소화함
+                # -------------------------------------------------
+                print(
+                    f"[FRAME RECEIVED] "
+                    f"count={frame_received_count}, "
+                    f"frame_id={frame_id}, "
+                    f"file={filename}, "
+                    f"bytes={len(image_bytes)}, "
+                    f"size={width}x{height}, "
+                    f"format={save_format}, "
+                    f"time={timestamp_sec:.6f}",
+                    flush=True,
+                )
+
+                # 앱으로 보내는 응답은 기존처럼 10장마다 전송
+                # 매 프레임 응답 시 통신량이 늘 수 있어 유지함
                 if frame_received_count % 10 == 0:
-                    await websocket.send_text(json.dumps({
-                        "ok": True,
-                        "type": "frame_saved",
-                        "frame_received_count": frame_received_count,
-                        "frame_id": frame_id,
-                        "filename": filename,
-                        "format": save_format,
-                        "timestamp_ns": timestamp_ns,
-                    }, ensure_ascii=False))
+                    await websocket.send_text(
+                        json.dumps({
+                            "ok": True,
+                            "type": "frame_saved",
+                            "frame_received_count": (
+                                frame_received_count
+                            ),
+                            "frame_id": frame_id,
+                            "filename": filename,
+                            "format": save_format,
+                            "timestamp_ns": timestamp_ns,
+                        }, ensure_ascii=False)
+                    )
 
                 pending_frame_meta = None
 
     except WebSocketDisconnect:
-        print("stream websocket disconnected")
+        print(
+            "[WEBSOCKET DISCONNECTED] 클라이언트 연결 종료",
+            flush=True,
+        )
 
     except Exception as e:
-        print(f"stream websocket error: {e}")
+        print(
+            f"[WEBSOCKET ERROR] {e}",
+            flush=True,
+        )
 
         try:
-            await websocket.send_text(json.dumps({
-                "ok": False,
-                "type": "error",
-                "message": str(e),
-            }, ensure_ascii=False))
+            await websocket.send_text(
+                json.dumps({
+                    "ok": False,
+                    "type": "error",
+                    "message": str(e),
+                }, ensure_ascii=False)
+            )
         except Exception:
             pass
 
@@ -554,15 +711,33 @@ def session_summary(session_id: str):
     synced_count = 0
 
     if frames_path.exists():
-        with open(frames_path, "r", newline="", encoding="utf-8") as f:
-            frame_count = max(0, len(list(csv.reader(f))) - 1)
+        with open(
+            frames_path,
+            "r",
+            newline="",
+            encoding="utf-8",
+        ) as f:
+            frame_count = max(
+                0,
+                len(list(csv.reader(f))) - 1,
+            )
 
     if imu_path.exists():
-        with open(imu_path, "r", newline="", encoding="utf-8") as f:
-            imu_count = max(0, len(list(csv.reader(f))) - 1)
+        with open(
+            imu_path,
+            "r",
+            newline="",
+            encoding="utf-8",
+        ) as f:
+            imu_count = max(
+                0,
+                len(list(csv.reader(f))) - 1,
+            )
 
     if synced_path.exists():
-        synced = json.loads(synced_path.read_text(encoding="utf-8"))
+        synced = json.loads(
+            synced_path.read_text(encoding="utf-8")
+        )
         synced_count = len(synced)
 
     return {
@@ -576,7 +751,7 @@ def session_summary(session_id: str):
 
 
 # =========================================================
-# Render 저장 세션 목록 확인용
+# 저장 세션 목록 확인용
 # =========================================================
 @app.get("/sessions")
 def list_sessions():
@@ -585,10 +760,13 @@ def list_sessions():
     if not BASE_UPLOAD_DIR.exists():
         return {
             "ok": True,
-            "sessions": []
+            "sessions": [],
         }
 
-    for session_dir in sorted(BASE_UPLOAD_DIR.iterdir(), reverse=True):
+    for session_dir in sorted(
+        BASE_UPLOAD_DIR.iterdir(),
+        reverse=True,
+    ):
         if not session_dir.is_dir():
             continue
 
@@ -601,17 +779,36 @@ def list_sessions():
         synced_count = 0
 
         if frames_path.exists():
-            with open(frames_path, "r", newline="", encoding="utf-8") as f:
-                frame_count = max(0, len(list(csv.reader(f))) - 1)
+            with open(
+                frames_path,
+                "r",
+                newline="",
+                encoding="utf-8",
+            ) as f:
+                frame_count = max(
+                    0,
+                    len(list(csv.reader(f))) - 1,
+                )
 
         if imu_path.exists():
-            with open(imu_path, "r", newline="", encoding="utf-8") as f:
-                imu_count = max(0, len(list(csv.reader(f))) - 1)
+            with open(
+                imu_path,
+                "r",
+                newline="",
+                encoding="utf-8",
+            ) as f:
+                imu_count = max(
+                    0,
+                    len(list(csv.reader(f))) - 1,
+                )
 
         if synced_path.exists():
             try:
-                synced = json.loads(synced_path.read_text(encoding="utf-8"))
+                synced = json.loads(
+                    synced_path.read_text(encoding="utf-8")
+                )
                 synced_count = len(synced)
+
             except Exception:
                 synced_count = 0
 
@@ -620,18 +817,22 @@ def list_sessions():
             "frame_count": frame_count,
             "imu_count": imu_count,
             "synced_count": synced_count,
-            "summary_url": f"/session/{session_dir.name}/summary",
-            "download_url": f"/session/{session_dir.name}/download",
+            "summary_url": (
+                f"/session/{session_dir.name}/summary"
+            ),
+            "download_url": (
+                f"/session/{session_dir.name}/download"
+            ),
         })
 
     return {
         "ok": True,
-        "sessions": sessions
+        "sessions": sessions,
     }
 
 
 # =========================================================
-# Render 저장 세션 ZIP 다운로드
+# 저장 세션 ZIP 다운로드
 # =========================================================
 @app.get("/session/{session_id}/download")
 def download_session(session_id: str):
@@ -643,8 +844,10 @@ def download_session(session_id: str):
             status_code=404,
             content={
                 "ok": False,
-                "message": f"session not found: {session_id}"
-            }
+                "message": (
+                    f"session not found: {session_id}"
+                ),
+            },
         )
 
     zip_path = session_dir / f"{session_id}.zip"
@@ -652,19 +855,25 @@ def download_session(session_id: str):
     if zip_path.exists():
         zip_path.unlink()
 
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
+    with zipfile.ZipFile(
+        zip_path,
+        "w",
+        zipfile.ZIP_DEFLATED,
+    ) as zip_file:
         for file_path in session_dir.rglob("*"):
             if file_path == zip_path:
                 continue
 
             if file_path.is_file():
-                arcname = file_path.relative_to(session_dir.parent)
+                arcname = file_path.relative_to(
+                    session_dir.parent
+                )
                 zip_file.write(file_path, arcname)
 
     return FileResponse(
         zip_path,
         media_type="application/zip",
-        filename=f"{session_id}.zip"
+        filename=f"{session_id}.zip",
     )
 
 
@@ -677,6 +886,10 @@ async def trigger_slam_legacy():
         status_code=400,
         content={
             "ok": False,
-            "message": "이 버전에서는 /trigger-slam을 사용하지 않습니다. /ws/stream의 stop 메시지를 사용하세요.",
+            "message": (
+                "이 버전에서는 /trigger-slam을 사용하지 않습니다. "
+                "/ws/stream의 stop 메시지를 사용하세요."
+            ),
         },
     )
+```
