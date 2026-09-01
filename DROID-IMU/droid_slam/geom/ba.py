@@ -118,6 +118,73 @@ def _select_temporal_confidence(imu_confidence, dst, batch, num_frames, device, 
     )
 
 
+def _select_temporal_info_scale(
+    imu_info,
+    dst,
+    batch,
+    num_frames,
+    device,
+    dtype,
+    clip=4.0,
+    eps=1e-12,
+):
+    """
+    Select per-edge IMU information and convert it to residual scale factors.
+
+    `imu_info` is stored as `[rot_info, vel_info, pos_info]`, where each value
+    is proportional to inverse variance. The absolute scale can be extremely
+    dataset-dependent, so this uses a median-normalized relative information
+    ratio. If all active edges have the same covariance, the returned scale is
+    exactly one and the old BA weighting is preserved.
+    """
+
+    ones = torch.ones((batch, dst.numel(), 3), device=device, dtype=dtype)
+    if imu_info is None:
+        return ones
+
+    info = imu_info.to(device=device, dtype=dtype)
+    if info.ndim == 2:
+        if info.shape[0] < num_frames or info.shape[-1] < 3:
+            raise ValueError(
+                "imu_info must have shape [N, >=3] or [B, N, >=3], "
+                f"got {tuple(imu_info.shape)} for frames={num_frames}"
+            )
+        selected = info[dst, :3][None].expand(batch, -1, -1)
+
+    elif info.ndim == 3:
+        if info.shape[0] == 1 and batch > 1:
+            info = info.expand(batch, -1, -1)
+        if info.shape[0] != batch or info.shape[1] < num_frames or info.shape[-1] < 3:
+            raise ValueError(
+                "imu_info must have shape [N, >=3] or [B, N, >=3], "
+                f"got {tuple(imu_info.shape)} for batch={batch}, frames={num_frames}"
+            )
+        selected = info[:, dst, :3]
+
+    else:
+        raise ValueError(f"imu_info must be [N, >=3] or [B, N, >=3], got {tuple(imu_info.shape)}")
+
+    valid = torch.isfinite(selected) & (selected > float(eps))
+    if not bool(valid.any().detach().cpu().item()):
+        return ones
+
+    ref = torch.ones((batch, 1, 3), device=device, dtype=dtype)
+    for b in range(batch):
+        for c in range(3):
+            values = selected[b, :, c][valid[b, :, c]]
+            if values.numel() > 0:
+                ref[b, 0, c] = values.median().clamp_min(float(eps))
+
+    ratio = torch.where(valid, selected / ref.clamp_min(float(eps)), ones)
+    if clip is not None and float(clip) > 0.0:
+        clip_value = float(clip)
+        ratio = ratio.clamp(min=1.0 / clip_value, max=clip_value)
+    else:
+        ratio = ratio.clamp_min(0.0)
+
+    return ratio.sqrt()
+
+
 def _global_factor_weight(factor_weight, batch, device, dtype):
     if torch.is_tensor(factor_weight):
         global_weight = factor_weight.to(device=device, dtype=dtype)
@@ -308,6 +375,7 @@ def _build_full_imu_system(
     imu_motion,
     imu_delta,
     imu_valid=None,
+    imu_info=None,
     gyro_bias=None,
     accel_bias=None,
     fixedp=1,
@@ -323,6 +391,9 @@ def _build_full_imu_system(
     rot_weight=1.0,
     bias_weight=0.001,
     gravity=None,
+    use_imu_info_weighting=False,
+    imu_info_weight_clip=4.0,
+    imu_info_weight_eps=1e-12,
 ):
     """Build approximate full IMU normal-equation blocks.
 
@@ -453,13 +524,41 @@ def _build_full_imu_system(
     Ji[:, :, 12:15, 12:15] = I
     Jj[:, :, 12:15, 12:15] = -I
 
-    scale = pose_data.new_tensor(
+    base_scale = pose_data.new_tensor(
         [pos_weight] * 3 + [vel_weight] * 3 + [rot_weight] * 3 +
         [bias_weight] * 3 + [bias_weight] * 3
     ).clamp_min(0.0).sqrt()
-    residual = residual * scale.view(1, 1, 15)
-    Ji = Ji * scale.view(1, 1, 15, 1)
-    Jj = Jj * scale.view(1, 1, 15, 1)
+
+    if use_imu_info_weighting:
+        info_scale = _select_temporal_info_scale(
+            imu_info,
+            dst,
+            B,
+            num_frames,
+            pose_data.device,
+            pose_data.dtype,
+            clip=imu_info_weight_clip,
+            eps=imu_info_weight_eps,
+        )
+        rot_scale = info_scale[:, :, 0:1]
+        vel_scale = info_scale[:, :, 1:2]
+        pos_scale = info_scale[:, :, 2:3]
+        residual_info_scale = torch.cat(
+            [
+                pos_scale.expand(-1, -1, 3),
+                vel_scale.expand(-1, -1, 3),
+                rot_scale.expand(-1, -1, 3),
+                torch.ones((B, edge_count, 6), device=pose_data.device, dtype=pose_data.dtype),
+            ],
+            dim=-1,
+        )
+    else:
+        residual_info_scale = pose_data.new_ones((B, edge_count, 15))
+
+    scale = base_scale.view(1, 1, 15) * residual_info_scale
+    residual = residual * scale
+    Ji = Ji * scale.unsqueeze(-1)
+    Jj = Jj * scale.unsqueeze(-1)
 
     Hii = edge_weight[:, :, None, None] * torch.einsum("bead,beaf->bedf", Ji, Ji)
     Hij = edge_weight[:, :, None, None] * torch.einsum("bead,beaf->bedf", Ji, Jj)
@@ -562,6 +661,7 @@ def BA(
     rig=1,
     imu_delta=None,
     imu_valid=None,
+    imu_info=None,
     gyro_bias=None,
     imu_factor_weight=0.0,
     imu_confidence=None,
@@ -576,6 +676,9 @@ def BA(
     imu_motion_prior_weight=0.0,
     imu_local_bias_prior_weight=0.0,
     imu_gravity=None,
+    use_imu_info_weighting=False,
+    imu_info_weight_clip=4.0,
+    imu_info_weight_eps=1e-12,
 ):
     """ Full Bundle Adjustment """
 
@@ -651,6 +754,7 @@ def BA(
             imu_motion,
             imu_delta,
             imu_valid=imu_valid,
+            imu_info=imu_info,
             gyro_bias=gyro_bias,
             accel_bias=accel_bias,
             fixedp=fixedp,
@@ -666,6 +770,9 @@ def BA(
             rot_weight=1.0,
             bias_weight=imu_full_bias_weight,
             gravity=imu_gravity,
+            use_imu_info_weighting=use_imu_info_weighting,
+            imu_info_weight_clip=imu_info_weight_clip,
+            imu_info_weight_eps=imu_info_weight_eps,
         )
         if H_imu is not None and v_imu is not None:
             H = H + H_imu

@@ -199,6 +199,65 @@ def _select_temporal_mask(imu_valid, dst, batch, num_frames, device):
     raise ValueError(f"imu_valid must be [N] or [B, N], got {tuple(imu_valid.shape)}")
 
 
+def _select_temporal_info_scale(
+    imu_info,
+    dst,
+    batch,
+    num_frames,
+    device,
+    dtype,
+    clip=4.0,
+    eps=1e-12,
+):
+    """Return median-normalized sqrt information scales for IMU residual terms."""
+
+    ones = torch.ones((batch, dst.numel(), 3), device=device, dtype=dtype)
+    if imu_info is None:
+        return ones
+
+    info = imu_info.to(device=device, dtype=dtype)
+    if info.ndim == 2:
+        if info.shape[0] < num_frames or info.shape[-1] < 3:
+            raise ValueError(
+                "imu_info must have shape [N, >=3] or [B, N, >=3], "
+                f"got {tuple(imu_info.shape)} for frames={num_frames}"
+            )
+        selected = info[dst, :3][None].expand(batch, -1, -1)
+
+    elif info.ndim == 3:
+        if info.shape[0] == 1 and batch > 1:
+            info = info.expand(batch, -1, -1)
+        if info.shape[0] != batch or info.shape[1] < num_frames or info.shape[-1] < 3:
+            raise ValueError(
+                "imu_info must have shape [N, >=3] or [B, N, >=3], "
+                f"got {tuple(imu_info.shape)} for batch={batch}, frames={num_frames}"
+            )
+        selected = info[:, dst, :3]
+
+    else:
+        raise ValueError(f"imu_info must be [N, >=3] or [B, N, >=3], got {tuple(imu_info.shape)}")
+
+    valid = torch.isfinite(selected) & (selected > float(eps))
+    if not bool(valid.any().detach().cpu().item()):
+        return ones
+
+    ref = torch.ones((batch, 1, 3), device=device, dtype=dtype)
+    for b in range(batch):
+        for c in range(3):
+            values = selected[b, :, c][valid[b, :, c]]
+            if values.numel() > 0:
+                ref[b, 0, c] = values.median().clamp_min(float(eps))
+
+    ratio = torch.where(valid, selected / ref.clamp_min(float(eps)), ones)
+    if clip is not None and float(clip) > 0.0:
+        clip_value = float(clip)
+        ratio = ratio.clamp(min=1.0 / clip_value, max=clip_value)
+    else:
+        ratio = ratio.clamp_min(0.0)
+
+    return ratio.sqrt()
+
+
 def _pose_velocity_motion(poses, imu_delta):
     pose_data = _pose_data(poses)
     imu = _as_batched_imu_tensor("imu_delta", imu_delta, 10).to(
@@ -224,11 +283,15 @@ def full_preintegration_residual(
     poses,
     imu_delta,
     imu_valid=None,
+    imu_info=None,
     imu_motion=None,
     gyro_bias=None,
     accel_bias=None,
     gravity=None,
     max_residual=0.5,
+    use_imu_info_weighting=False,
+    imu_info_weight_clip=4.0,
+    imu_info_weight_eps=1e-12,
 ):
     """
     Compute full preintegration residuals for consecutive frame pairs.
@@ -317,6 +380,21 @@ def full_preintegration_residual(
     if max_residual is not None and max_residual > 0.0:
         mask = mask & (r_R.norm(dim=-1) <= float(max_residual))
 
+    if use_imu_info_weighting:
+        info_scale = _select_temporal_info_scale(
+            imu_info,
+            dst,
+            batch,
+            num_frames,
+            pose_data.device,
+            pose_data.dtype,
+            clip=imu_info_weight_clip,
+            eps=imu_info_weight_eps,
+        )
+        r_R = r_R * info_scale[:, :, 0:1]
+        r_v = r_v * info_scale[:, :, 1:2]
+        r_p = r_p * info_scale[:, :, 2:3]
+
     return r_p[mask], r_v[mask], r_R[mask], r_ba[mask], r_bg[mask]
 
 
@@ -324,6 +402,7 @@ def imu_full_preintegration_loss(
     poses_est,
     imu_delta,
     imu_valid=None,
+    imu_info=None,
     imu_motions=None,
     gyro_bias=None,
     accel_bias=None,
@@ -335,6 +414,9 @@ def imu_full_preintegration_loss(
     rot_weight=1.0,
     bias_weight=0.001,
     gravity=None,
+    use_imu_info_weighting=False,
+    imu_info_weight_clip=4.0,
+    imu_info_weight_eps=1e-12,
 ):
     """
     Full IMU preintegration loss over position, velocity, rotation, and bias.
@@ -357,6 +439,7 @@ def imu_full_preintegration_loss(
             "imu_rot_error": 0.0,
             "imu_bias_error": 0.0,
             "imu_edges": 0.0,
+            "imu_info_weighted": float(bool(use_imu_info_weighting)),
         }
 
     imu_loss = 0.0
@@ -382,11 +465,15 @@ def imu_full_preintegration_loss(
             poses_est[i],
             imu_delta,
             imu_valid=imu_valid,
+            imu_info=imu_info,
             imu_motion=motion_i,
             gyro_bias=gyro_bias,
             accel_bias=accel_bias,
             gravity=gravity,
             max_residual=max_residual,
+            use_imu_info_weighting=use_imu_info_weighting,
+            imu_info_weight_clip=imu_info_weight_clip,
+            imu_info_weight_eps=imu_info_weight_eps,
         )
 
         if r_R.numel() == 0:
@@ -448,6 +535,7 @@ def imu_full_preintegration_loss(
         "imu_rot_error": float((last_rot_error.detach() * 180.0 / np.pi).item()),
         "imu_bias_error": float(last_bias_error.detach().item()),
         "imu_edges": float(total_edges),
+        "imu_info_weighted": float(bool(use_imu_info_weighting)),
     }
 
     return imu_loss, metrics

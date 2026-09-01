@@ -103,6 +103,9 @@ class FactorGraph:
         imu_full_max_dt=0.5,
         imu_full_max_dv=5.0,
         imu_full_max_dp=1.0,
+        use_imu_info_weighting=False,
+        imu_info_weight_clip=4.0,
+        imu_info_weight_eps=1e-12,
         imu_gyro_bias=None,
         imu_acc_bias=None,
         imu_ba_debug=False,
@@ -184,6 +187,9 @@ class FactorGraph:
         self.imu_full_max_dt = float(imu_full_max_dt)
         self.imu_full_max_dv = float(imu_full_max_dv)
         self.imu_full_max_dp = float(imu_full_max_dp)
+        self.use_imu_info_weighting = bool(use_imu_info_weighting)
+        self.imu_info_weight_clip = float(imu_info_weight_clip)
+        self.imu_info_weight_eps = float(imu_info_weight_eps)
         self.imu_gyro_bias = imu_gyro_bias
         self.imu_acc_bias = imu_acc_bias
         self._reported_imu_ba_prior = False
@@ -597,6 +603,131 @@ class FactorGraph:
 
         return torch.as_tensor(float(scale), device=device, dtype=dtype)
 
+    def _imu_info_reference(self, t0, max_pose_ix, device, dtype):
+        if (
+            not self.use_imu_info_weighting
+            or getattr(self.video, "imu_info", None) is None
+            or max_pose_ix <= max(1, int(t0))
+        ):
+            return None
+
+        info = self.video.imu_info[max(1, int(t0)) : max_pose_ix].detach().to(
+            device=device,
+            dtype=dtype,
+        )
+        if info.numel() == 0 or info.shape[-1] < 3:
+            return None
+
+        valid = torch.isfinite(info) & (info > self.imu_info_weight_eps)
+        if not bool(valid.any().detach().cpu().item()):
+            return None
+
+        ref = torch.ones(3, device=device, dtype=dtype)
+        for k in range(3):
+            values = info[:, k][valid[:, k]]
+            if values.numel() > 0:
+                ref[k] = values.median().clamp_min(self.imu_info_weight_eps)
+
+        return ref
+
+    def _imu_info_term_scale(self, curr_ix, info_ref, device, dtype):
+        if (
+            info_ref is None
+            or getattr(self.video, "imu_info", None) is None
+            or curr_ix < 0
+            or curr_ix >= int(self.video.imu_info.shape[0])
+        ):
+            return torch.ones(15, device=device, dtype=dtype), (1.0, 1.0, 1.0)
+
+        info = self.video.imu_info[curr_ix].detach().to(device=device, dtype=dtype)
+        if info.numel() < 3:
+            return torch.ones(15, device=device, dtype=dtype), (1.0, 1.0, 1.0)
+
+        info = info.reshape(-1)[:3]
+        valid = torch.isfinite(info) & (info > self.imu_info_weight_eps)
+        ratio = torch.ones(3, device=device, dtype=dtype)
+        ratio[valid] = info[valid] / info_ref[valid].clamp_min(self.imu_info_weight_eps)
+
+        if self.imu_info_weight_clip > 0.0:
+            ratio = ratio.clamp(
+                min=1.0 / self.imu_info_weight_clip,
+                max=self.imu_info_weight_clip,
+            )
+        else:
+            ratio = ratio.clamp_min(0.0)
+
+        info_scale = ratio.sqrt()
+        rot_scale, vel_scale, pos_scale = info_scale[0], info_scale[1], info_scale[2]
+        term_scale = torch.cat(
+            [
+                pos_scale.expand(3),
+                vel_scale.expand(3),
+                rot_scale.expand(3),
+                torch.ones(6, device=device, dtype=dtype),
+            ],
+            dim=0,
+        )
+        return term_scale, (
+            float(rot_scale.detach().cpu().item()),
+            float(vel_scale.detach().cpu().item()),
+            float(pos_scale.detach().cpu().item()),
+        )
+
+    def _compose_adjacent_video_imu_delta(self, first_ix, second_ix):
+        """
+        Compose video IMU deltas when the middle keyframe is removed.
+
+        `imu_delta[k]` stores the preintegrated interval from keyframe k-1 to k.
+        If keyframe B at `first_ix` is removed from A-B-C, old rows
+        `first_ix` (A->B) and `second_ix` (B->C) must become one A->C row.
+        """
+
+        if (
+            getattr(self.video, "imu_delta", None) is None
+            or getattr(self.video, "imu_valid", None) is None
+            or first_ix <= 0
+            or second_ix >= int(self.video.counter.value)
+        ):
+            return None
+
+        delta_ab = self.video.imu_delta[first_ix].detach().clone()
+        delta_bc = self.video.imu_delta[second_ix].detach().clone()
+        if delta_ab.numel() < 10 or delta_bc.numel() < 10:
+            return None
+
+        q_ab = rotvec_to_quat(delta_ab[1:4])
+        q_bc = rotvec_to_quat(delta_bc[1:4])
+        q_ac = quat_multiply(q_ab, q_bc)
+
+        dt_bc = delta_bc[0].clamp_min(0.0)
+        dv_ab = delta_ab[4:7]
+        dv_bc = delta_bc[4:7]
+        dp_ab = delta_ab[7:10]
+        dp_bc = delta_bc[7:10]
+
+        delta_ac = delta_ab.clone()
+        delta_ac[0] = delta_ab[0].clamp_min(0.0) + dt_bc
+        delta_ac[1:4] = quat_to_rotvec(q_ac)
+        delta_ac[4:7] = dv_ab + quat_rotate(q_ab, dv_bc)
+        delta_ac[7:10] = dp_ab + dv_ab * dt_bc + quat_rotate(q_ab, dp_bc)
+
+        valid = self.video.imu_valid[first_ix] & self.video.imu_valid[second_ix]
+        weight = torch.minimum(
+            self.video.imu_weight[first_ix],
+            self.video.imu_weight[second_ix],
+        )
+        used_steps = self.video.imu_used_steps[first_ix] + self.video.imu_used_steps[second_ix]
+
+        info = torch.zeros_like(self.video.imu_info[first_ix])
+        info_ab = self.video.imu_info[first_ix].detach()
+        info_bc = self.video.imu_info[second_ix].detach()
+        has_info = (info_ab > 1e-18) & (info_bc > 1e-18)
+        var_sum = torch.zeros_like(info_ab)
+        var_sum[has_info] = 1.0 / info_ab[has_info] + 1.0 / info_bc[has_info]
+        info[has_info] = 1.0 / var_sum[has_info].clamp_min(1e-18)
+
+        return delta_ac, valid, weight, used_steps, info
+
     def _initialize_runtime_velocity(self, t0, t1):
         if (
             getattr(self.video, "velocities", None) is None
@@ -686,7 +817,7 @@ class FactorGraph:
         ba_global = self._global_imu_bias(self.imu_acc_bias, device, dtype) * metric_scale
         bg_global = self._global_imu_bias(self.imu_gyro_bias, device, dtype)
         gravity = self._global_imu_bias(self.imu_gravity, device, dtype) * metric_scale
-        scale = torch.as_tensor(
+        base_scale = torch.as_tensor(
             [self.imu_full_pos_weight] * 3
             + [self.imu_full_vel_weight] * 3
             + [1.0] * 3
@@ -695,6 +826,7 @@ class FactorGraph:
             device=device,
             dtype=dtype,
         ).clamp_min(0.0).sqrt()
+        info_ref = self._imu_info_reference(t0, max_pose_ix, device, dtype)
         rad_to_deg = 180.0 / np.pi
         used = 0
         confidence_sum = 0.0
@@ -727,6 +859,9 @@ class FactorGraph:
             rrot_deg=0.0,
             rba_norm=0.0,
             rbg_norm=0.0,
+            info_rot_scale=1.0,
+            info_vel_scale=1.0,
+            info_pos_scale=1.0,
         ):
             if reason != "used":
                 mark_skip(reason)
@@ -758,6 +893,9 @@ class FactorGraph:
                 "r_R_deg": float(rrot_deg),
                 "r_ba_norm": float(rba_norm),
                 "r_bg_norm": float(rbg_norm),
+                "info_rot_scale": float(info_rot_scale),
+                "info_vel_scale": float(info_vel_scale),
+                "info_pos_scale": float(info_pos_scale),
             })
 
         def debug_norm(value):
@@ -940,6 +1078,13 @@ class FactorGraph:
                 )
                 continue
 
+            info_term_scale, info_scales = self._imu_info_term_scale(
+                curr_ix,
+                info_ref,
+                device,
+                dtype,
+            )
+
             Ji = torch.zeros((15, state_dim), device=device, dtype=dtype)
             Jj = torch.zeros((15, state_dim), device=device, dtype=dtype)
 
@@ -962,6 +1107,7 @@ class FactorGraph:
             Ji[12:15, 12:15] = eye3
             Jj[12:15, 12:15] = -eye3
 
+            scale = base_scale * info_term_scale
             residual = residual * scale
             Ji = Ji * scale.view(15, 1)
             Jj = Jj * scale.view(15, 1)
@@ -1003,6 +1149,9 @@ class FactorGraph:
                 rrot_deg=residual_deg,
                 rba_norm=debug_norm(r_ba),
                 rbg_norm=debug_norm(r_bg),
+                info_rot_scale=info_scales[0],
+                info_vel_scale=info_scales[1],
+                info_pos_scale=info_scales[2],
             )
 
         if self.imu_motion_prior_weight > 0.0 or self.imu_local_bias_prior_weight > 0.0:
@@ -1058,6 +1207,8 @@ class FactorGraph:
                 f"weight={self.imu_ba_prior_weight}, conf_mean={conf_mean:.4f}, "
                 f"pos_w={self.imu_full_pos_weight}, vel_w={self.imu_full_vel_weight}, "
                 f"bias_w={self.imu_full_bias_weight}, max_dt={self.imu_full_max_dt}, "
+                f"info_weighting={self.use_imu_info_weighting}, "
+                f"info_clip={self.imu_info_weight_clip}, "
                 f"gravity={tuple(float(x) for x in gravity.detach().cpu().tolist())}, "
                 f"skipped={skipped}"
             )
@@ -1367,6 +1518,9 @@ class FactorGraph:
 
         # 현재 저장된 frame 수
         t = self.video.counter.value
+        composed_imu = None
+        if 0 < ix and ix + 1 < t:
+            composed_imu = self._compose_adjacent_video_imu_delta(ix, ix + 1)
 
         ############################################################
         # DepthVideo buffer에서 keyframe 제거
@@ -1383,6 +1537,13 @@ class FactorGraph:
         self.video.imu_weight[ix : t - 1] = self.video.imu_weight[ix + 1 : t].clone()
         self.video.imu_used_steps[ix : t - 1] = self.video.imu_used_steps[ix + 1 : t].clone()
         self.video.imu_info[ix : t - 1] = self.video.imu_info[ix + 1 : t].clone()
+        if composed_imu is not None:
+            delta_ac, valid_ac, weight_ac, used_steps_ac, info_ac = composed_imu
+            self.video.imu_delta[ix] = delta_ac
+            self.video.imu_valid[ix] = valid_ac
+            self.video.imu_weight[ix] = weight_ac
+            self.video.imu_used_steps[ix] = used_steps_ac
+            self.video.imu_info[ix] = info_ac
         self.video.disps[ix : t - 1] = self.video.disps[ix + 1 : t].clone()
         self.video.disps_sens[ix : t - 1] = self.video.disps_sens[ix + 1 : t].clone()
         self.video.intrinsics[ix : t - 1] = self.video.intrinsics[ix + 1 : t].clone()

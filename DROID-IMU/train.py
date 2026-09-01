@@ -540,6 +540,10 @@ def train(gpu, args):
             # IMU edge가 유효한지 나타내는 mask
             imu_valid = item[5] if len(item) > 5 else None
 
+            # IMU preintegration covariance/information
+            # column order: [rot_info, vel_info, pos_info]
+            imu_info = item[6] if len(item) > 6 else None
+
             ####################################################
             # 14-3. pose convention 변환
             ####################################################
@@ -628,6 +632,7 @@ def train(gpu, args):
                         # IMU BA를 사용할 때만 forward에 imu_delta/imu_valid 전달
                         imu_delta=imu_delta if args.use_imu_ba else None,
                         imu_valid=imu_valid if args.use_imu_ba else None,
+                        imu_info=imu_info if args.use_imu_ba else None,
 
                         # None이면 model 내부 learnable weight 사용 가능
                         # use_imu_ba가 아니면 0으로 꺼둠
@@ -647,6 +652,9 @@ def train(gpu, args):
                         imu_motion_prior_weight=args.imu_motion_prior_weight,
                         imu_local_bias_prior_weight=args.imu_local_bias_prior_weight,
                         imu_gravity=args.imu_gravity,
+                        use_imu_info_weighting=args.use_imu_info_weighting,
+                        imu_info_weight_clip=args.imu_info_weight_clip,
+                        imu_info_weight_eps=args.imu_info_weight_eps,
                         return_imu_motion=return_imu_motion,
                     )
 
@@ -745,6 +753,7 @@ def train(gpu, args):
                         poses_est,
                         imu_delta,
                         imu_valid=imu_valid,
+                        imu_info=imu_info,
                         imu_motions=imu_motions if len(imu_motions) > 0 else None,
                         gyro_bias=gyro_bias,
                         accel_bias=model.module.imu_acc_bias,
@@ -756,6 +765,9 @@ def train(gpu, args):
                         rot_weight=args.imu_loss_rot_weight,
                         bias_weight=args.imu_loss_bias_weight,
                         gravity=args.imu_gravity,
+                        use_imu_info_weighting=args.use_imu_info_weighting,
+                        imu_info_weight_clip=args.imu_info_weight_clip,
+                        imu_info_weight_eps=args.imu_info_weight_eps,
                     )
 
                 elif args.use_imu_loss:
@@ -1107,12 +1119,24 @@ if __name__ == '__main__':
     parser.add_argument('--imu_full_vel_weight', type=float, default=0.05)
     parser.add_argument('--imu_full_bias_weight', type=float, default=0.001)
     parser.add_argument(
+        '--use_imu_info_weighting',
+        action='store_true',
+        help='weight full IMU residuals by median-normalized preintegration information',
+    )
+    parser.add_argument('--imu_info_weight_clip', type=float, default=4.0)
+    parser.add_argument('--imu_info_weight_eps', type=float, default=1e-12)
+    parser.add_argument(
         '--imu_gravity',
         type=float,
         nargs=3,
         default=None,
         metavar=('GX', 'GY', 'GZ'),
         help='optional gravity vector in training pose units for full IMU residuals',
+    )
+    parser.add_argument(
+        '--allow_zero_imu_gravity',
+        action='store_true',
+        help='debug only: allow full IMU training residuals to use zero gravity',
     )
 
     # velocity 초기화 방식
@@ -1165,6 +1189,17 @@ if __name__ == '__main__':
     # full IMU BA를 켜면 일반 IMU BA flag도 자동으로 켬
     if args.use_full_imu_ba:
         args.use_imu_ba = True
+
+    if (
+        (args.use_full_imu_ba or args.use_full_imu_loss)
+        and args.imu_gravity is None
+        and not args.allow_zero_imu_gravity
+    ):
+        raise ValueError(
+            "Full IMU BA/loss requires gravity for position/velocity residuals. "
+            "Provide --imu_gravity GX GY GZ, or pass --allow_zero_imu_gravity "
+            "for a debug-only structure check."
+        )
 
     # DDP 전체 process 수
     args.world_size = args.gpus

@@ -16,6 +16,12 @@ import os.path as osp
 from .augmentation import RGBDAugmentor
 from .rgbd_utils import *
 
+try:
+    from imu_prior import compose_imu_prior_rows
+except ImportError:
+    from droid_slam.imu_prior import compose_imu_prior_rows
+
+
 def _to_float(value, default=0.0):
     try:
         if value is None or value == "":
@@ -147,6 +153,15 @@ class RGBDDataset(data.Dataset):
                     _to_int(row.get("frame_id"), len(priors)),
                 )
                 priors[frame_index] = {
+                    "frame_id": _to_int(row.get("frame_id"), frame_index),
+                    "frame_index": frame_index,
+                    "imu_count": _to_float(row.get("imu_count")),
+                    "imu_used_steps": _to_float(
+                        row.get("imu_used_steps"),
+                        _to_float(row.get("imu_count")),
+                    ),
+                    "imu_weight": _to_float(row.get("imu_weight"), 1.0),
+                    "imu_reason": row.get("imu_reason", ""),
                     "dt": _to_float(row.get("dt")),
                     "dr_x": _to_float(row.get("dr_x")),
                     "dr_y": _to_float(row.get("dr_y")),
@@ -202,44 +217,37 @@ class RGBDDataset(data.Dataset):
         if priors is None or end <= start:
             return np.zeros(10, dtype=np.float32), 0.0, np.zeros(3, dtype=np.float32)
 
-        q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-        delta = np.zeros(10, dtype=np.float32)
-        valid = 1.0
-        rot_var = 0.0
-        vel_var = 0.0
-        pos_var = 0.0
-
+        rows = []
         for frame_index in range(start + 1, end + 1):
             row = priors.get(frame_index)
             if row is None:
                 return np.zeros(10, dtype=np.float32), 0.0, np.zeros(3, dtype=np.float32)
+            rows.append(row)
 
-            q_step = [
-                row["dq_w"],
-                row["dq_x"],
-                row["dq_y"],
-                row["dq_z"],
-            ]
-            q = _quat_multiply_wxyz(q, q_step)
+        composed = compose_imu_prior_rows(
+            rows,
+            prev_frame_index=start,
+            frame_index=end,
+        )
+        if composed is None:
+            return np.zeros(10, dtype=np.float32), 0.0, np.zeros(3, dtype=np.float32)
 
-            delta[0] += row["dt"]
-            delta[4] += row["dv_x"]
-            delta[5] += row["dv_y"]
-            delta[6] += row["dv_z"]
-            delta[7] += row["dp_x"]
-            delta[8] += row["dp_y"]
-            delta[9] += row["dp_z"]
-            valid *= float(row["imu_valid"] != 0)
-
-            rot_var += max(float(row["rot_var"]), 0.0)
-            vel_var += max(float(row["vel_var"]), 0.0)
-            pos_var += max(float(row["pos_var"]), 0.0)
-
-        delta[1:4] = _quat_to_rotvec_wxyz(q)
+        delta = np.zeros(10, dtype=np.float32)
+        delta[0] = _to_float(composed.get("dt"))
+        delta[1] = _to_float(composed.get("dr_x"))
+        delta[2] = _to_float(composed.get("dr_y"))
+        delta[3] = _to_float(composed.get("dr_z"))
+        delta[4] = _to_float(composed.get("dv_x"))
+        delta[5] = _to_float(composed.get("dv_y"))
+        delta[6] = _to_float(composed.get("dv_z"))
+        delta[7] = _to_float(composed.get("dp_x"))
+        delta[8] = _to_float(composed.get("dp_y"))
+        delta[9] = _to_float(composed.get("dp_z"))
+        valid = float(_to_int(composed.get("imu_valid"), 1) != 0)
         imu_info = np.array([
-            1.0 / rot_var if rot_var > 1e-18 else 0.0,
-            1.0 / vel_var if vel_var > 1e-18 else 0.0,
-            1.0 / pos_var if pos_var > 1e-18 else 0.0,
+            _to_float(composed.get("rot_info")),
+            _to_float(composed.get("vel_info")),
+            _to_float(composed.get("pos_info")),
         ], dtype=np.float32)
 
         return delta, valid, imu_info

@@ -182,6 +182,63 @@ def get_imu_prior_for_frame(imu_priors, frame_index):
     return imu_priors.get(int(frame_index))
 
 
+def estimate_gravity_from_imu_priors(
+    imu_priors,
+    max_frames=80,
+    min_norm=6.0,
+    max_norm=12.5,
+):
+    """
+    Estimate an initial gravity vector from preintegrated delta-velocity rows.
+
+    This assumes the early trajectory is not undergoing extreme linear
+    acceleration. It is dataset-neutral and only uses the generic imu_prior.csv
+    columns:
+
+        g_world ~= -Delta v_imu / Delta t
+
+    The result is an initial guess for the full IMU residual. It is not a
+    replacement for a full visual-inertial initialization.
+    """
+
+    if not imu_priors:
+        return None
+
+    vectors = []
+    for frame_index in sorted(imu_priors.keys()):
+        row = imu_priors[frame_index]
+        if int(row.get("imu_valid", 1)) == 0:
+            continue
+
+        dt = float(row.get("dt", 0.0))
+        if dt <= 1e-6:
+            continue
+
+        dv = np.asarray([
+            float(row.get("dv_x", 0.0)),
+            float(row.get("dv_y", 0.0)),
+            float(row.get("dv_z", 0.0)),
+        ], dtype=np.float64)
+        acc_norm = float(np.linalg.norm(dv) / dt)
+        if min_norm > 0.0 and acc_norm < float(min_norm):
+            continue
+        if max_norm > 0.0 and acc_norm > float(max_norm):
+            continue
+
+        vectors.append(-dv / dt)
+        if len(vectors) >= int(max_frames):
+            break
+
+    if not vectors:
+        return None
+
+    gravity = np.mean(np.stack(vectors, axis=0), axis=0)
+    if not np.isfinite(gravity).all():
+        return None
+
+    return gravity.astype(np.float32).tolist()
+
+
 def maybe_build_imu_prior_from_raw(args):
     """
     Optional terminal workflow:
@@ -486,9 +543,8 @@ def save_reconstruction(droid, save_path):
         # pose
         "poses": video.poses[:t].cpu(),
 
-        # IMU state placeholders and preintegrated measurements.
-        # These are not optimized by the current CUDA DBA yet, but are kept so
-        # later inertial BA experiments can use the same reconstruction file.
+        # IMU motion state and preintegrated measurements.
+        # Full IMU BA updates velocities and local accel/gyro bias when enabled.
         "velocities": video.velocities[:t].cpu(),
         "bias_acc": video.bias_acc[:t].cpu(),
         "bias_gyro": video.bias_gyro[:t].cpu(),
@@ -497,6 +553,7 @@ def save_reconstruction(droid, save_path):
         "imu_weight": video.imu_weight[:t].cpu(),
         "imu_used_steps": video.imu_used_steps[:t].cpu(),
         "imu_info": video.imu_info[:t].cpu(),
+        "imu_unit_scale": video.imu_unit_scale.cpu(),
 
         # intrinsics
         "intrinsics": video.intrinsics[:t].cpu()
@@ -697,17 +754,40 @@ if __name__ == '__main__':
     parser.add_argument("--imu_translation_max", type=float, default=0.05, help="max translation delta from IMU prior")
     parser.add_argument("--use_imu_ba_prior", action="store_true", help="add rotation-only IMU normal-equation prior inside CUDA DBA")
     parser.add_argument("--imu_ba_prior_weight", type=float, default=0.002, help="base Hessian weight for rotation-only IMU DBA prior")
+    parser.add_argument(
+        "--use_learned_imu_ba_weight",
+        action="store_true",
+        help="replace --imu_ba_prior_weight with the checkpoint-learned global IMU BA weight",
+    )
+    parser.add_argument(
+        "--learned_imu_ba_weight_scale",
+        type=float,
+        default=1.0,
+        help="scale applied to the checkpoint-learned global IMU BA weight at runtime",
+    )
     parser.add_argument("--imu_ba_prior_max_deg", type=float, default=10.0, help="skip IMU DBA prior edges above this angular error")
     parser.add_argument("--use_full_imu_ba", action="store_true", help="extend runtime CUDA DBA state to pose+velocity+accel-bias+gyro-bias")
     parser.add_argument("--imu_full_frontend", action="store_true", help="also use full 15D IMU BA in frontend updates")
     parser.add_argument("--imu_full_pos_weight", type=float, default=0.05, help="position residual weight inside full IMU DBA prior")
     parser.add_argument("--imu_full_vel_weight", type=float, default=0.05, help="velocity residual weight inside full IMU DBA prior")
     parser.add_argument("--imu_full_bias_weight", type=float, default=0.001, help="bias smoothness residual weight inside full IMU DBA prior")
+    parser.add_argument("--use_imu_info_weighting", action="store_true", help="weight full IMU residuals by median-normalized preintegration information")
+    parser.add_argument("--imu_info_weight_clip", type=float, default=4.0, help="clip for relative IMU information residual scales")
+    parser.add_argument("--imu_info_weight_eps", type=float, default=1e-12, help="epsilon for IMU information weighting")
     parser.add_argument("--imu_motion_prior_weight", type=float, default=0.0, help="optional weak velocity prior weight for full runtime IMU BA")
     parser.add_argument("--imu_local_bias_prior_weight", type=float, default=0.0, help="optional weak local bias prior weight for full runtime IMU BA")
+    parser.add_argument("--imu_gravity", type=float, nargs=3, default=None, metavar=("GX", "GY", "GZ"), help="gravity vector in world/DROID units for full IMU residuals")
+    parser.add_argument("--estimate_imu_gravity", action="store_true", help="estimate initial gravity from imu_prior delta-velocity rows")
+    parser.add_argument("--allow_zero_imu_gravity", action="store_true", help="debug only: allow full IMU BA to run with zero gravity")
+    parser.add_argument("--imu_gravity_estimate_frames", type=int, default=80, help="max valid imu_prior rows used for gravity estimation")
+    parser.add_argument("--imu_gravity_estimate_min_norm", type=float, default=6.0, help="minimum |dv/dt| used for gravity estimation")
+    parser.add_argument("--imu_gravity_estimate_max_norm", type=float, default=12.5, help="maximum |dv/dt| used for gravity estimation")
     parser.add_argument("--imu_full_max_dt", type=float, default=0.5, help="skip full IMU BA edges above this preintegrated dt")
     parser.add_argument("--imu_full_max_dv", type=float, default=5.0, help="skip full IMU BA edges above this delta-velocity norm")
     parser.add_argument("--imu_full_max_dp", type=float, default=1.0, help="skip full IMU BA edges above this delta-position norm")
+    parser.add_argument("--imu_ba_debug", action="store_true", help="write full IMU BA prior debug csv")
+    parser.add_argument("--imu_ba_debug_path", type=str, default=None, help="optional path for full IMU BA prior debug csv")
+    parser.add_argument("--imu_ba_debug_max_rows", type=int, default=20000, help="max full IMU BA debug rows to keep in memory")
     parser.add_argument("--use_imu_residual", action="store_true", help="apply rotation-only inertial residual after visual DBA")
     parser.add_argument("--imu_residual_weight", type=float, default=0.02, help="base alpha for rotation-only inertial residual")
     parser.add_argument("--imu_residual_window", type=int, default=12, help="recent keyframe window for inertial residual")
@@ -768,6 +848,41 @@ if __name__ == '__main__':
 
     imu_priors = load_imu_priors(args.imu_prior)
     args.imu_priors = imu_priors
+
+    if args.estimate_imu_gravity:
+        if args.imu_gravity is None:
+            gravity = estimate_gravity_from_imu_priors(
+                imu_priors,
+                max_frames=args.imu_gravity_estimate_frames,
+                min_norm=args.imu_gravity_estimate_min_norm,
+                max_norm=args.imu_gravity_estimate_max_norm,
+            )
+            if gravity is None:
+                print("[IMU WARNING] failed to estimate gravity from imu_prior; using zero gravity.")
+            else:
+                args.imu_gravity = gravity
+                norm = float(np.linalg.norm(np.asarray(gravity, dtype=np.float64)))
+                print(
+                    "[IMU] estimated gravity="
+                    f"({gravity[0]:.6f}, {gravity[1]:.6f}, {gravity[2]:.6f}), "
+                    f"norm={norm:.6f}"
+                )
+        else:
+            print("[IMU] --imu_gravity was provided; skipping gravity estimation.")
+
+    if args.use_full_imu_ba and args.imu_prior is not None and args.imu_gravity is None:
+        if args.allow_zero_imu_gravity:
+            print("[IMU WARNING] full IMU BA is running with zero gravity; use only for debugging.")
+        else:
+            raise ValueError(
+                "--use_full_imu_ba requires gravity for position/velocity residuals. "
+                "Use --estimate_imu_gravity, provide --imu_gravity GX GY GZ, or pass "
+                "--allow_zero_imu_gravity for a debug-only run."
+            )
+
+    if args.use_full_imu_ba and args.use_imu_residual:
+        print("[IMU WARNING] --use_full_imu_ba already includes rotation residual; disabling --use_imu_residual.")
+        args.use_imu_residual = False
 
     if args.imu_prior is not None and args.stride != 1:
         print("[IMU WARNING] imu_prior frame matching is safest with --stride=1.")

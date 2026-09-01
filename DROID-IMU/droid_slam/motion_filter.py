@@ -11,6 +11,11 @@ from modules.corr import CorrBlock
 
 from functools import partial
 
+try:
+    from imu_prior import compose_imu_prior_rows
+except ImportError:
+    from droid_slam.imu_prior import compose_imu_prior_rows
+
 
 """
 MotionFilter의 원래 역할:
@@ -558,58 +563,13 @@ class MotionFilter:
                 return fallback_imu_prior
             rows.append(row)
 
-        q_total = [0.0, 0.0, 0.0, 1.0]
-        dt = 0.0
-        imu_count = 0
-        imu_used_steps = 0
-        valid = 1
-        imu_weight = 1.0
-        dv = [0.0, 0.0, 0.0]
-        dp = [0.0, 0.0, 0.0]
-        reasons = []
+        composed = compose_imu_prior_rows(
+            rows,
+            prev_frame_index=prev_index,
+            frame_index=curr_index,
+        )
 
-        for row in rows:
-            q_total = self.quat_multiply(q_total, self._prior_delta_quat(row))
-            dt += float(row.get("dt", 0.0))
-            imu_count += int(float(row.get("imu_count", 0)))
-            imu_used_steps += int(float(row.get("imu_used_steps", row.get("imu_count", 0))))
-            valid = valid and int(row.get("imu_valid", 1)) != 0
-            imu_weight = min(imu_weight, float(row.get("imu_weight", 1.0)))
-            reasons.append(str(row.get("imu_reason", "ok")))
-
-            for i, key in enumerate(("dv_x", "dv_y", "dv_z")):
-                dv[i] += float(row.get(key, 0.0))
-
-            for i, key in enumerate(("dp_x", "dp_y", "dp_z")):
-                dp[i] += float(row.get(key, 0.0))
-
-        dr_x, dr_y, dr_z = self._quat_to_rotvec(q_total)
-        out = dict(rows[-1])
-        out.update({
-            "prev_frame_index": prev_index,
-            "frame_index": curr_index,
-            "dt": dt,
-            "imu_count": imu_count,
-            "imu_used_steps": imu_used_steps,
-            "imu_valid": 1 if valid else 0,
-            "imu_weight": imu_weight,
-            "imu_reason": "ok" if all(r == "ok" for r in reasons) else "composed_with_invalid_reason",
-            "dr_x": dr_x,
-            "dr_y": dr_y,
-            "dr_z": dr_z,
-            "dq_x": q_total[0],
-            "dq_y": q_total[1],
-            "dq_z": q_total[2],
-            "dq_w": q_total[3],
-            "dv_x": dv[0],
-            "dv_y": dv[1],
-            "dv_z": dv[2],
-            "dp_x": dp[0],
-            "dp_y": dp[1],
-            "dp_z": dp[2],
-        })
-
-        return out
+        return composed if composed is not None else fallback_imu_prior
 
     def build_imu_pose_prior(self, imu_prior):
         """

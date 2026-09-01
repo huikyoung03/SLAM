@@ -229,6 +229,7 @@ class DroidNet(nn.Module):
         return_imu_bias=False,
         imu_delta=None,
         imu_valid=None,
+        imu_info=None,
         imu_ba_weight=None,
         imu_ba_max_residual=0.5,
         imu_confidence_floor=0.0,
@@ -241,6 +242,9 @@ class DroidNet(nn.Module):
         imu_motion_prior_weight=0.0,
         imu_local_bias_prior_weight=0.0,
         imu_gravity=None,
+        use_imu_info_weighting=False,
+        imu_info_weight_clip=4.0,
+        imu_info_weight_eps=1e-12,
         return_imu_motion=False,
     ):
         """ Estimates SE3 or Sim3 between pair of frames """
@@ -337,6 +341,7 @@ class DroidNet(nn.Module):
                     fixedp=2,
                     imu_delta=imu_delta,
                     imu_valid=imu_valid,
+                    imu_info=imu_info,
                     gyro_bias=self.imu_gyro_bias,
                     imu_factor_weight=imu_ba_weight_value,
                     imu_confidence=imu_confidence,
@@ -351,6 +356,9 @@ class DroidNet(nn.Module):
                     imu_motion_prior_weight=imu_motion_prior_weight,
                     imu_local_bias_prior_weight=imu_local_bias_prior_weight,
                     imu_gravity=imu_gravity,
+                    use_imu_info_weighting=use_imu_info_weighting,
+                    imu_info_weight_clip=imu_info_weight_clip,
+                    imu_info_weight_eps=imu_info_weight_eps,
                 )
                 if use_full_imu_ba:
                     Gs, disps, imu_motion = ba_out
