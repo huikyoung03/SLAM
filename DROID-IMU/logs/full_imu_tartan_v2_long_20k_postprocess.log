@@ -1,0 +1,9 @@
+[2026-08-21 22:44:23] waiting for training pid 573372
+[2026-08-22 05:36:42] training pid 573372 finished
+[2026-08-22 05:36:42] evaluating checkpoints/full_imu_tartan_v2_long_20k_final_020000.pth
+[2026-08-22 05:39:57] building comparison report
+wrote logs/imu_comparison_report.md
+wrote logs/imu_comparison_summary.csv
+[2026-08-22 05:39:57] done
+report: logs/imu_comparison_report.md
+csv: logs/imu_comparison_summary.csv

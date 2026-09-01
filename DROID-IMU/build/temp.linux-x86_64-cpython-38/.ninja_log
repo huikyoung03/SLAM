@@ -1,0 +1,11 @@
+# ninja log v7
+1	20912	1780989392940961907	/home/ubuntu/DROID-SLAM/build/temp.linux-x86_64-cpython-38/src/droid.o	9ba541dc8acdb741
+0	52896	1780989392940961907	/home/ubuntu/DROID-SLAM/build/temp.linux-x86_64-cpython-38/src/correlation_kernels.o	207b535bab5d4c58
+0	53766	1780989392940961907	/home/ubuntu/DROID-SLAM/build/temp.linux-x86_64-cpython-38/src/altcorr_kernel.o	b85544219572d
+1	58304	1780989392940961907	/home/ubuntu/DROID-SLAM/build/temp.linux-x86_64-cpython-38/src/droid_kernels.o	be02a16cad82b8b2
+8	35330	1787646533975932693	/home/ubuntu/DROID-SLAM/build/temp.linux-x86_64-cpython-38/src/droid.o	9ba541dc8acdb741
+8	65174	1787646533975777542	/home/ubuntu/DROID-SLAM/build/temp.linux-x86_64-cpython-38/src/correlation_kernels.o	207b535bab5d4c58
+8	65881	1787646533971878926	/home/ubuntu/DROID-SLAM/build/temp.linux-x86_64-cpython-38/src/altcorr_kernel.o	b85544219572d
+8	68468	1787646533976126878	/home/ubuntu/DROID-SLAM/build/temp.linux-x86_64-cpython-38/src/droid_kernels.o	be02a16cad82b8b2
+16	15596	1788244388491731083	/home/ubuntu/DROID-SLAM/build/temp.linux-x86_64-cpython-38/src/droid.o	9ba541dc8acdb741
+17	44129	1788244388497381407	/home/ubuntu/DROID-SLAM/build/temp.linux-x86_64-cpython-38/src/droid_kernels.o	be02a16cad82b8b2
