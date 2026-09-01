@@ -646,6 +646,7 @@ def train(gpu, args):
                         imu_velocity_init=args.imu_velocity_init,
                         imu_motion_prior_weight=args.imu_motion_prior_weight,
                         imu_local_bias_prior_weight=args.imu_local_bias_prior_weight,
+                        imu_gravity=args.imu_gravity,
                         return_imu_motion=return_imu_motion,
                     )
 
@@ -754,6 +755,7 @@ def train(gpu, args):
                         vel_weight=args.imu_loss_vel_weight,
                         rot_weight=args.imu_loss_rot_weight,
                         bias_weight=args.imu_loss_bias_weight,
+                        gravity=args.imu_gravity,
                     )
 
                 elif args.use_imu_loss:
@@ -1104,6 +1106,14 @@ if __name__ == '__main__':
     parser.add_argument('--imu_full_pos_weight', type=float, default=0.05)
     parser.add_argument('--imu_full_vel_weight', type=float, default=0.05)
     parser.add_argument('--imu_full_bias_weight', type=float, default=0.001)
+    parser.add_argument(
+        '--imu_gravity',
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=('GX', 'GY', 'GZ'),
+        help='optional gravity vector in training pose units for full IMU residuals',
+    )
 
     # velocity 초기화 방식
     #

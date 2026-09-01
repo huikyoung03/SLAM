@@ -25,16 +25,13 @@ class DepthVideo:
         self.red = torch.zeros(buffer, device=device, dtype=torch.bool).share_memory_()
         self.poses = torch.zeros(buffer, 7, device=device, dtype=torch.float).share_memory_()
 
-        # IMU motion state placeholders for future inertial BA.
-        #
-        # DROID's CUDA BA does not optimize these tensors yet. They are kept here
-        # because DepthVideo is the shared frame-state container used by frontend,
-        # backend, and visualization code.
-        #
-        # M_i = (v_i, ba_i, bg_i)
+        # IMU motion state for full inertial BA:
+        # M_i = (v_i, ba_i, bg_i). These tensors are updated by the full 15D
+        # CUDA BA path when an IMU prior is provided.
         self.velocities = torch.zeros(buffer, 3, device=device, dtype=torch.float).share_memory_()
         self.bias_acc = torch.zeros(buffer, 3, device=device, dtype=torch.float).share_memory_()
         self.bias_gyro = torch.zeros(buffer, 3, device=device, dtype=torch.float).share_memory_()
+        self.imu_unit_scale = torch.ones(1, device=device, dtype=torch.float).share_memory_()
 
         # Per-frame preintegrated IMU measurement from previous selected/input
         # frame to this frame.
@@ -72,6 +69,7 @@ class DepthVideo:
         self.velocities = self.velocities.to(device=device)
         self.bias_acc = self.bias_acc.to(device=device)
         self.bias_gyro = self.bias_gyro.to(device=device)
+        self.imu_unit_scale = self.imu_unit_scale.to(device=device)
         self.imu_delta = self.imu_delta.to(device=device)
         self.imu_valid = self.imu_valid.to(device=device)
         self.imu_weight = self.imu_weight.to(device=device)
@@ -98,6 +96,7 @@ class DepthVideo:
         del self.velocities
         del self.bias_acc
         del self.bias_gyro
+        del self.imu_unit_scale
         del self.imu_delta
         del self.imu_valid
         del self.imu_weight
@@ -156,6 +155,10 @@ class DepthVideo:
             self.__imu_value(imu_prior, "dp_y", 0.0),
             self.__imu_value(imu_prior, "dp_z", 0.0),
         ], device=self.imu_delta.device, dtype=self.imu_delta.dtype)
+
+        # DROID normalizes monocular pose/depth scale during backend updates.
+        # Keep IMU translation/velocity deltas in the same internal unit.
+        delta[4:10] *= self.imu_unit_scale[0].to(device=delta.device, dtype=delta.dtype)
 
         self.imu_delta[index] = delta
         self.imu_valid[index] = valid
@@ -266,6 +269,10 @@ class DepthVideo:
             self.disps[:self.counter.value] /= s
             self.poses[:self.counter.value,:3] *= s
             self.velocities[:self.counter.value] *= s
+            self.bias_acc[:self.counter.value] *= s
+            self.imu_delta[:self.counter.value, 4:10] *= s
+            self.imu_info[:self.counter.value, 1:3] /= (s * s).clamp_min(1e-12)
+            self.imu_unit_scale *= s
             self.dirty[:self.counter.value] = True
 
 

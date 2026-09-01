@@ -240,6 +240,7 @@ class DroidNet(nn.Module):
         imu_velocity_init="pose",
         imu_motion_prior_weight=0.0,
         imu_local_bias_prior_weight=0.0,
+        imu_gravity=None,
         return_imu_motion=False,
     ):
         """ Estimates SE3 or Sim3 between pair of frames """
@@ -349,6 +350,7 @@ class DroidNet(nn.Module):
                     imu_full_bias_weight=imu_full_bias_weight,
                     imu_motion_prior_weight=imu_motion_prior_weight,
                     imu_local_bias_prior_weight=imu_local_bias_prior_weight,
+                    imu_gravity=imu_gravity,
                 )
                 if use_full_imu_ba:
                     Gs, disps, imu_motion = ba_out

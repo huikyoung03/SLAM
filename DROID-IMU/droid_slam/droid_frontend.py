@@ -40,11 +40,16 @@ class DroidFrontend:
             imu_full_bias_weight=getattr(args, "imu_full_bias_weight", 0.001),
             imu_motion_prior_weight=getattr(args, "imu_motion_prior_weight", 0.0),
             imu_local_bias_prior_weight=getattr(args, "imu_local_bias_prior_weight", 0.0),
+            imu_gravity=getattr(args, "imu_gravity", None),
             imu_full_max_dt=getattr(args, "imu_full_max_dt", 0.5),
             imu_full_max_dv=getattr(args, "imu_full_max_dv", 5.0),
             imu_full_max_dp=getattr(args, "imu_full_max_dp", 1.0),
             imu_gyro_bias=getattr(net, "imu_gyro_bias", None),
             imu_acc_bias=getattr(net, "imu_acc_bias", None),
+            imu_ba_debug=getattr(args, "imu_ba_debug", False),
+            imu_ba_debug_path=getattr(args, "imu_ba_debug_path", None),
+            imu_ba_debug_max_rows=getattr(args, "imu_ba_debug_max_rows", 20000),
+            imu_ba_debug_stage="frontend",
         )
 
         # local optimization window

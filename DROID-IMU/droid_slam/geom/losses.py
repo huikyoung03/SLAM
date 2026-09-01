@@ -148,7 +148,10 @@ def _expand_vector_param(param, src, batch, num_frames, device, dtype, name):
     if param is None:
         return torch.zeros((batch, src.numel(), 3), device=device, dtype=dtype)
 
-    value = param.to(device=device, dtype=dtype)
+    if torch.is_tensor(param):
+        value = param.to(device=device, dtype=dtype)
+    else:
+        value = torch.as_tensor(param, device=device, dtype=dtype)
     if value.ndim == 1:
         if value.shape[0] != 3:
             raise ValueError(f"{name} [3] expected, got {tuple(value.shape)}")
@@ -224,6 +227,7 @@ def full_preintegration_residual(
     imu_motion=None,
     gyro_bias=None,
     accel_bias=None,
+    gravity=None,
     max_residual=0.5,
 ):
     """
@@ -288,6 +292,9 @@ def full_preintegration_residual(
     bg_global = _expand_vector_param(
         gyro_bias, src, batch, num_frames, pose_data.device, pose_data.dtype, "gyro_bias"
     )
+    g_world = _expand_vector_param(
+        gravity, src, batch, num_frames, pose_data.device, pose_data.dtype, "gravity"
+    )
 
     ba_total = ba_i + ba_global
     bg_total = bg_i + bg_global
@@ -301,8 +308,8 @@ def full_preintegration_residual(
     r_R = quat_to_rotvec(quat_multiply(quat_inverse(q_pred), q_j))
 
     q_i_inv = quat_inverse(q_i)
-    r_p = quat_rotate(q_i_inv, p_j - p_i - v_i * dt) - dp_imu
-    r_v = quat_rotate(q_i_inv, v_j - v_i) - dv_imu
+    r_p = quat_rotate(q_i_inv, p_j - p_i - v_i * dt - 0.5 * g_world * dt * dt) - dp_imu
+    r_v = quat_rotate(q_i_inv, v_j - v_i - g_world * dt) - dv_imu
     r_ba = ba_j - ba_i
     r_bg = bg_j - bg_i
 
@@ -327,6 +334,7 @@ def imu_full_preintegration_loss(
     vel_weight=0.05,
     rot_weight=1.0,
     bias_weight=0.001,
+    gravity=None,
 ):
     """
     Full IMU preintegration loss over position, velocity, rotation, and bias.
@@ -377,6 +385,7 @@ def imu_full_preintegration_loss(
             imu_motion=motion_i,
             gyro_bias=gyro_bias,
             accel_bias=accel_bias,
+            gravity=gravity,
             max_residual=max_residual,
         )
 

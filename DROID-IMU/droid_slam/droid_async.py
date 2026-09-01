@@ -105,15 +105,15 @@ def backend_process(args, depth_video1, depth_video2, device="cuda"):
                     depth_video2.velocities[t0:t1] = (
                         depth_video1.velocities[t0:t1].to(device=device) * s
                     )
-                    depth_video2.bias_acc[t0:t1] = depth_video1.bias_acc[t0:t1].to(
-                        device=device
+                    depth_video2.bias_acc[t0:t1] = (
+                        depth_video1.bias_acc[t0:t1].to(device=device) * s
                     )
                     depth_video2.bias_gyro[t0:t1] = depth_video1.bias_gyro[t0:t1].to(
                         device=device
                     )
-                    depth_video2.imu_delta[t0:t1] = depth_video1.imu_delta[t0:t1].to(
-                        device=device
-                    )
+                    imu_delta = depth_video1.imu_delta[t0:t1].to(device=device).clone()
+                    imu_delta[:, 4:10] *= s
+                    depth_video2.imu_delta[t0:t1] = imu_delta
                     depth_video2.imu_valid[t0:t1] = depth_video1.imu_valid[t0:t1].to(
                         device=device
                     )
@@ -125,6 +125,11 @@ def backend_process(args, depth_video1, depth_video2, device="cuda"):
                     ].to(device=device)
                     depth_video2.imu_info[t0:t1] = depth_video1.imu_info[t0:t1].to(
                         device=device
+                    )
+                    scale_t = torch.as_tensor(s, device=device, dtype=depth_video2.imu_info.dtype)
+                    depth_video2.imu_info[t0:t1, 1:3] /= (scale_t * scale_t).clamp_min(1e-12)
+                    depth_video2.imu_unit_scale[:] = (
+                        depth_video1.imu_unit_scale.to(device=device) * s
                     )
 
                     depth_video2.disps_sens[t0:t1] = depth_video1.disps_sens[t0:t1].to(

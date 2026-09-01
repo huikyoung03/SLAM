@@ -1,8 +1,10 @@
 import torch
 import lietorch
 import numpy as np
+import csv
 
 import matplotlib.pyplot as plt
+from pathlib import Path
 from lietorch import SE3
 from modules.corr import CorrBlock, AltCorrBlock
 import geom.projective_ops as pops
@@ -19,29 +21,29 @@ from functools import partial
 
 
 '''
-프레임 간 edge/factor를 만들고, 
-neural update로 correspondence target과 weight를 예측한 뒤, 
+프레임 간 edge/factor를 만들고,
+neural update로 correspondence target과 weight를 예측한 뒤,
 DepthVideo.ba()를 호출해서 pose와 disparity를 최적화하는 핵심 그래프 관리 코드
 
-add_factors(ii, jj)	
+add_factors(ii, jj)
 프레임 ii → jj edge를 factor graph에 추가
 
-add_neighborhood_factors()	
+add_neighborhood_factors()
 초기화 때 시간적으로 가까운 프레임들을 연결
 
-add_proximity_factors()	
+add_proximity_factors()
 pose/depth 기반 거리로 가까운 프레임들을 찾아 edge 추가
 
-update()	
+update()
 frontend용 graph update + dense BA
 
-update_lowmem()	
+update_lowmem()
 backend용 low-memory graph update + dense BA
 
-rm_factors()	
+rm_factors()
 오래되거나 불필요한 edge 제거
 
-rm_keyframe()	
+rm_keyframe()
 중복 keyframe 제거 및 index 재정렬
 
 DepthVideo에 keyframe 저장
@@ -97,11 +99,16 @@ class FactorGraph:
         imu_full_bias_weight=0.001,
         imu_motion_prior_weight=0.0,
         imu_local_bias_prior_weight=0.0,
+        imu_gravity=None,
         imu_full_max_dt=0.5,
         imu_full_max_dv=5.0,
         imu_full_max_dp=1.0,
         imu_gyro_bias=None,
         imu_acc_bias=None,
+        imu_ba_debug=False,
+        imu_ba_debug_path=None,
+        imu_ba_debug_max_rows=20000,
+        imu_ba_debug_stage="graph",
     ):
         """
         DROID-SLAM의 factor graph를 관리하는 클래스.
@@ -173,6 +180,7 @@ class FactorGraph:
         self.imu_full_bias_weight = float(imu_full_bias_weight)
         self.imu_motion_prior_weight = float(imu_motion_prior_weight)
         self.imu_local_bias_prior_weight = float(imu_local_bias_prior_weight)
+        self.imu_gravity = imu_gravity
         self.imu_full_max_dt = float(imu_full_max_dt)
         self.imu_full_max_dv = float(imu_full_max_dv)
         self.imu_full_max_dp = float(imu_full_max_dp)
@@ -180,6 +188,12 @@ class FactorGraph:
         self.imu_acc_bias = imu_acc_bias
         self._reported_imu_ba_prior = False
         self.last_imu_confidence = None
+        self.imu_ba_debug = bool(imu_ba_debug)
+        self.imu_ba_debug_path = imu_ba_debug_path
+        self.imu_ba_debug_max_rows = int(imu_ba_debug_max_rows)
+        self.imu_ba_debug_stage = str(imu_ba_debug_stage)
+        self._imu_ba_debug_rows = []
+        self._imu_ba_debug_seen = 0
 
         # IMU state aliases.
         #
@@ -391,6 +405,46 @@ class FactorGraph:
 
         return float(np.clip(out, 0.0, 1.0))
 
+    def _record_imu_ba_debug(self, row):
+        if not self.imu_ba_debug:
+            return
+
+        self._imu_ba_debug_seen += 1
+        if len(self._imu_ba_debug_rows) >= self.imu_ba_debug_max_rows:
+            return
+
+        clean = {"stage": self.imu_ba_debug_stage}
+        for key, value in row.items():
+            if torch.is_tensor(value):
+                value = value.detach().cpu().item() if value.numel() == 1 else value.detach().cpu().tolist()
+            clean[key] = value
+        self._imu_ba_debug_rows.append(clean)
+
+    def _flush_imu_ba_debug(self):
+        if not self.imu_ba_debug or len(self._imu_ba_debug_rows) == 0:
+            return
+
+        if self.imu_ba_debug_path in (None, ""):
+            path = Path("outputs") / "imu_ba_debug.csv"
+        else:
+            path = Path(self.imu_ba_debug_path)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = sorted({key for row in self._imu_ba_debug_rows for key in row.keys()})
+        write_header = not path.exists()
+
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerows(self._imu_ba_debug_rows)
+
+        print(
+            f"[IMU-BA] wrote {len(self._imu_ba_debug_rows)} debug rows "
+            f"to {path} (seen={self._imu_ba_debug_seen})"
+        )
+        self._imu_ba_debug_rows.clear()
+
     def _build_imu_ba_pose_prior(self, t0, t1):
         """
         Build an external 6D pose-prior normal equation from preintegrated IMU.
@@ -533,21 +587,47 @@ class FactorGraph:
 
         return tensor.reshape(-1)[:3]
 
+    def _imu_metric_scale(self, device, dtype):
+        scale = getattr(self.video, "imu_unit_scale", None)
+        if scale is None:
+            return torch.ones((), device=device, dtype=dtype)
+
+        if torch.is_tensor(scale):
+            return scale.detach().to(device=device, dtype=dtype).reshape(-1)[0]
+
+        return torch.as_tensor(float(scale), device=device, dtype=dtype)
+
     def _initialize_runtime_velocity(self, t0, t1):
-        if getattr(self.video, "velocities", None) is None:
+        if (
+            getattr(self.video, "velocities", None) is None
+            or getattr(self.video, "imu_delta", None) is None
+        ):
             return
 
         n = int(self.video.counter.value)
         max_pose_ix = min(int(t1), n)
         poses = self.video.poses
         velocities = self.video.velocities
+        gravity = self._global_imu_bias(self.imu_gravity, poses.device, poses.dtype)
+        gravity = gravity * self._imu_metric_scale(poses.device, poses.dtype)
 
         for pose_ix in range(max(1, int(t0)), max_pose_ix):
+            if (
+                getattr(self.video, "imu_valid", None) is not None
+                and not bool(self.video.imu_valid[pose_ix].detach().cpu().item())
+            ):
+                continue
+
             dt = float(self.video.imu_delta[pose_ix, 0].detach().cpu().item())
             if dt <= 1e-4 or not np.isfinite(dt):
                 continue
 
-            v = (poses[pose_ix, 0:3] - poses[pose_ix - 1, 0:3]) / dt
+            if self.imu_full_max_dt > 0.0 and dt > self.imu_full_max_dt:
+                continue
+
+            dt_t = torch.as_tensor(dt, device=poses.device, dtype=poses.dtype)
+            dp = poses[pose_ix, 0:3] - poses[pose_ix - 1, 0:3]
+            v = (dp - 0.5 * gravity * dt_t * dt_t) / dt_t
             if torch.linalg.norm(velocities[pose_ix - 1]).item() < 1e-9:
                 velocities[pose_ix - 1] = v
             if torch.linalg.norm(velocities[pose_ix]).item() < 1e-9:
@@ -602,8 +682,10 @@ class FactorGraph:
         H_jj = []
         v_prior = torch.zeros((P, state_dim), device=device, dtype=dtype)
         eye3 = torch.eye(3, device=device, dtype=dtype)
-        ba_global = self._global_imu_bias(self.imu_acc_bias, device, dtype)
+        metric_scale = self._imu_metric_scale(device, dtype)
+        ba_global = self._global_imu_bias(self.imu_acc_bias, device, dtype) * metric_scale
         bg_global = self._global_imu_bias(self.imu_gyro_bias, device, dtype)
+        gravity = self._global_imu_bias(self.imu_gravity, device, dtype) * metric_scale
         scale = torch.as_tensor(
             [self.imu_full_pos_weight] * 3
             + [self.imu_full_vel_weight] * 3
@@ -616,11 +698,72 @@ class FactorGraph:
         rad_to_deg = 180.0 / np.pi
         used = 0
         confidence_sum = 0.0
+        skipped = {}
+
+        def mark_skip(reason):
+            skipped[reason] = skipped.get(reason, 0) + 1
 
         def add_block(i_local, j_local, block):
             H_blocks.append(block)
             H_ii.append(int(i_local))
             H_jj.append(int(j_local))
+
+        def record_edge(
+            reason,
+            prev_ix,
+            curr_ix,
+            dt_value=0.0,
+            row_weight=0.0,
+            row_scale=0.0,
+            confidence=0.0,
+            weight=0.0,
+            dr_norm=0.0,
+            dv_norm=0.0,
+            dp_norm=0.0,
+            dv_norm_internal=0.0,
+            dp_norm_internal=0.0,
+            rp_norm=0.0,
+            rv_norm=0.0,
+            rrot_deg=0.0,
+            rba_norm=0.0,
+            rbg_norm=0.0,
+        ):
+            if reason != "used":
+                mark_skip(reason)
+            if not self.imu_ba_debug:
+                return
+
+            self._record_imu_ba_debug({
+                "window_t0": t0,
+                "window_t1": t1,
+                "prev_ix": int(prev_ix),
+                "curr_ix": int(curr_ix),
+                "reason": reason,
+                "dt": float(dt_value),
+                "row_weight": float(row_weight),
+                "row_scale": float(row_scale),
+                "confidence": float(confidence),
+                "weight": float(weight),
+                "metric_scale": float(metric_scale.detach().cpu().item()),
+                "gravity_x": float(gravity[0].detach().cpu().item()),
+                "gravity_y": float(gravity[1].detach().cpu().item()),
+                "gravity_z": float(gravity[2].detach().cpu().item()),
+                "dr_norm": float(dr_norm),
+                "dv_norm": float(dv_norm),
+                "dp_norm": float(dp_norm),
+                "dv_norm_internal": float(dv_norm_internal),
+                "dp_norm_internal": float(dp_norm_internal),
+                "r_p_norm": float(rp_norm),
+                "r_v_norm": float(rv_norm),
+                "r_R_deg": float(rrot_deg),
+                "r_ba_norm": float(rba_norm),
+                "r_bg_norm": float(rbg_norm),
+            })
+
+        def debug_norm(value):
+            if not self.imu_ba_debug:
+                return 0.0
+            return float(torch.linalg.norm(value).detach().cpu().item())
 
         for pose_ix in range(max(1, t0), max_pose_ix):
             prev_ix = pose_ix - 1
@@ -629,35 +772,79 @@ class FactorGraph:
             curr_local = curr_ix - t0
 
             if curr_local < 0 or curr_local >= P:
+                record_edge("outside_window", prev_ix, curr_ix)
                 continue
 
             if not bool(imu_valid[curr_ix].detach().cpu().item()):
+                record_edge("invalid", prev_ix, curr_ix)
                 continue
 
             row = imu_delta[curr_ix]
             dt = row[0].clamp_min(0.0)
             dt_value = float(dt.detach().cpu().item())
             if dt_value <= 1e-6:
+                record_edge("bad_dt", prev_ix, curr_ix, dt_value=dt_value)
                 continue
 
             if self.imu_full_max_dt > 0.0 and dt_value > self.imu_full_max_dt:
+                record_edge("skip_dt", prev_ix, curr_ix, dt_value=dt_value)
                 continue
 
             row_weight = float(imu_weight[curr_ix].detach().cpu().item())
             row_scale = float(np.clip(row_weight / 0.001, 0.0, 1.0))
             if row_scale <= 0.0:
+                record_edge(
+                    "skip_row_weight",
+                    prev_ix,
+                    curr_ix,
+                    dt_value=dt_value,
+                    row_weight=row_weight,
+                    row_scale=row_scale,
+                )
                 continue
 
+            dr_norm = float(torch.linalg.norm(row[1:4]).detach().cpu().item())
+            dv_norm_internal = float(torch.linalg.norm(row[4:7]).detach().cpu().item())
+            dp_norm_internal = float(torch.linalg.norm(row[7:10]).detach().cpu().item())
+            metric_scale_value = max(float(metric_scale.detach().cpu().item()), 1e-12)
+            dv_norm = dv_norm_internal / metric_scale_value
+            dp_norm = dp_norm_internal / metric_scale_value
             if (
                 self.imu_full_max_dv > 0.0
-                and float(torch.linalg.norm(row[4:7]).detach().cpu().item()) > self.imu_full_max_dv
+                and dv_norm > self.imu_full_max_dv
             ):
+                record_edge(
+                    "skip_dv",
+                    prev_ix,
+                    curr_ix,
+                    dt_value=dt_value,
+                    row_weight=row_weight,
+                    row_scale=row_scale,
+                    dr_norm=dr_norm,
+                    dv_norm=dv_norm,
+                    dp_norm=dp_norm,
+                    dv_norm_internal=dv_norm_internal,
+                    dp_norm_internal=dp_norm_internal,
+                )
                 continue
 
             if (
                 self.imu_full_max_dp > 0.0
-                and float(torch.linalg.norm(row[7:10]).detach().cpu().item()) > self.imu_full_max_dp
+                and dp_norm > self.imu_full_max_dp
             ):
+                record_edge(
+                    "skip_dp",
+                    prev_ix,
+                    curr_ix,
+                    dt_value=dt_value,
+                    row_weight=row_weight,
+                    row_scale=row_scale,
+                    dr_norm=dr_norm,
+                    dv_norm=dv_norm,
+                    dp_norm=dp_norm,
+                    dv_norm_internal=dv_norm_internal,
+                    dp_norm_internal=dp_norm_internal,
+                )
                 continue
 
             p_i = poses[prev_ix, 0:3].detach()
@@ -684,22 +871,73 @@ class FactorGraph:
             r_R = quat_to_rotvec(quat_multiply(quat_inverse(q_pred), q_j))
 
             q_i_inv = quat_inverse(q_i)
-            r_p = quat_rotate(q_i_inv, p_j - p_i - v_i * dt) - dp_imu
-            r_v = quat_rotate(q_i_inv, v_j - v_i) - dv_imu
+            r_p = quat_rotate(q_i_inv, p_j - p_i - v_i * dt - 0.5 * gravity * dt * dt) - dp_imu
+            r_v = quat_rotate(q_i_inv, v_j - v_i - gravity * dt) - dv_imu
             r_ba = ba_j - ba_i
             r_bg = bg_j - bg_i
             residual = torch.cat([r_p, r_v, r_R, r_ba, r_bg], dim=0)
 
             if not torch.isfinite(residual).all():
+                record_edge(
+                    "nonfinite_residual",
+                    prev_ix,
+                    curr_ix,
+                    dt_value=dt_value,
+                    row_weight=row_weight,
+                    row_scale=row_scale,
+                    dr_norm=dr_norm,
+                    dv_norm=dv_norm,
+                    dp_norm=dp_norm,
+                    dv_norm_internal=dv_norm_internal,
+                    dp_norm_internal=dp_norm_internal,
+                )
                 continue
 
             residual_deg = float(torch.linalg.norm(r_R).detach().cpu().item() * rad_to_deg)
             if residual_deg > self.imu_ba_prior_max_deg:
+                record_edge(
+                    "skip_rot",
+                    prev_ix,
+                    curr_ix,
+                    dt_value=dt_value,
+                    row_weight=row_weight,
+                    row_scale=row_scale,
+                    dr_norm=dr_norm,
+                    dv_norm=dv_norm,
+                    dp_norm=dp_norm,
+                    dv_norm_internal=dv_norm_internal,
+                    dp_norm_internal=dp_norm_internal,
+                    rp_norm=debug_norm(r_p),
+                    rv_norm=debug_norm(r_v),
+                    rrot_deg=residual_deg,
+                    rba_norm=debug_norm(r_ba),
+                    rbg_norm=debug_norm(r_bg),
+                )
                 continue
 
             confidence = self._confidence_for_pose_index(curr_ix)
             weight = float(self.imu_ba_prior_weight) * row_scale * confidence
             if weight <= 0.0 or not np.isfinite(weight):
+                record_edge(
+                    "skip_weight",
+                    prev_ix,
+                    curr_ix,
+                    dt_value=dt_value,
+                    row_weight=row_weight,
+                    row_scale=row_scale,
+                    confidence=confidence,
+                    weight=weight,
+                    dr_norm=dr_norm,
+                    dv_norm=dv_norm,
+                    dp_norm=dp_norm,
+                    dv_norm_internal=dv_norm_internal,
+                    dp_norm_internal=dp_norm_internal,
+                    rp_norm=debug_norm(r_p),
+                    rv_norm=debug_norm(r_v),
+                    rrot_deg=residual_deg,
+                    rba_norm=debug_norm(r_ba),
+                    rbg_norm=debug_norm(r_bg),
+                )
                 continue
 
             Ji = torch.zeros((15, state_dim), device=device, dtype=dtype)
@@ -746,6 +984,26 @@ class FactorGraph:
             v_prior[curr_local] += vj
             used += 1
             confidence_sum += confidence
+            record_edge(
+                "used",
+                prev_ix,
+                curr_ix,
+                dt_value=dt_value,
+                row_weight=row_weight,
+                row_scale=row_scale,
+                confidence=confidence,
+                weight=weight,
+                dr_norm=dr_norm,
+                dv_norm=dv_norm,
+                dp_norm=dp_norm,
+                dv_norm_internal=dv_norm_internal,
+                dp_norm_internal=dp_norm_internal,
+                rp_norm=debug_norm(r_p),
+                rv_norm=debug_norm(r_v),
+                rrot_deg=residual_deg,
+                rba_norm=debug_norm(r_ba),
+                rbg_norm=debug_norm(r_bg),
+            )
 
         if self.imu_motion_prior_weight > 0.0 or self.imu_local_bias_prior_weight > 0.0:
             for pose_ix in range(t0, min(t1, n)):
@@ -799,7 +1057,9 @@ class FactorGraph:
                 f"edges={used}, blocks={len(H_blocks)}, "
                 f"weight={self.imu_ba_prior_weight}, conf_mean={conf_mean:.4f}, "
                 f"pos_w={self.imu_full_pos_weight}, vel_w={self.imu_full_vel_weight}, "
-                f"bias_w={self.imu_full_bias_weight}, max_dt={self.imu_full_max_dt}"
+                f"bias_w={self.imu_full_bias_weight}, max_dt={self.imu_full_max_dt}, "
+                f"gravity={tuple(float(x) for x in gravity.detach().cpu().tolist())}, "
+                f"skipped={skipped}"
             )
             self._reported_imu_ba_prior = True
 
@@ -809,13 +1069,16 @@ class FactorGraph:
         return state_prior_H, v_prior.contiguous(), state_prior_ii, state_prior_jj
 
     def flush_imu_debug(self):
-        if self.imu_regularizer is None:
-            return
+        if self.imu_regularizer is not None:
+            try:
+                self.imu_regularizer.flush_debug()
+            except Exception as e:
+                print(f"[IMU-RESIDUAL WARNING] debug flush failed: {e}")
 
         try:
-            self.imu_regularizer.flush_debug()
+            self._flush_imu_ba_debug()
         except Exception as e:
-            print(f"[IMU-RESIDUAL WARNING] debug flush failed: {e}")
+            print(f"[IMU-BA WARNING] debug flush failed: {e}")
 
     def __filter_repeated_edges(self, ii, jj):
         """
