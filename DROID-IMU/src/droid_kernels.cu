@@ -3,8 +3,8 @@
 #include <cuda_runtime.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <vector>
-#include <iostream>
 
 #include <ATen/ATen.h>
 #include <ATen/NativeFunctions.h>
@@ -12,6 +12,7 @@
 
 // #include "utils.cuh"
 
+#include <Eigen/Dense>
 #include <Eigen/Sparse>
 #include <Eigen/SparseCore>
 #include <Eigen/SparseCholesky>
@@ -868,7 +869,7 @@ __global__ void accum_kernel(
 {
   
   const int block_id = blockIdx.x;
-  const int D = inps.size(2);
+  const int D = inps.size(1);
 
   const int start = ptrs[block_id];
   const int end = ptrs[block_id+1];
@@ -1170,7 +1171,7 @@ class SparseBlock {
         const int i = ii_acc[n];
         const int j = jj_acc[n];
 
-        if (i >= 0 && j >= 0) {
+        if (i >= 0 && i < N && j >= 0 && j < N) {
           for (int k=0; k<M; k++) {
             for (int l=0; l<M; l++) {
               double val = As_acc[n][k][l];
@@ -1197,7 +1198,7 @@ class SparseBlock {
         const int i = ii_acc[n];
         const int j = jj_acc[n];
 
-        if (i >= 0 && j >= 0) {
+        if (i >= 0 && i < N && j >= 0 && j < N) {
           for (int k=0; k<M; k++) {
             for (int l=0; l<M; l++) {
               double val = As_acc[n][k][l];
@@ -1228,7 +1229,7 @@ class SparseBlock {
         const int i = ii_acc[n];
         const int j = jj_acc[n];
 
-        if (i >= 0 && j >= 0) {
+        if (i >= 0 && i < N && j >= 0 && j < N) {
           for (int k=0; k<Kc; k++) {
             for (int l=0; l<Kc; l++) {
               double val = As_acc[n][k][l];
@@ -1256,7 +1257,7 @@ class SparseBlock {
         const int i = ii_acc[n];
         const int j = jj_acc[n];
 
-        if (i >= 0 && j >= 0) {
+        if (i >= 0 && i < N && j >= 0 && j < N) {
           for (int k=0; k<Kc; k++) {
             for (int l=0; l<Kc; l++) {
               double val = As_acc[n][k][l];
@@ -1280,7 +1281,7 @@ class SparseBlock {
 
       for (int n=0; n<ii.size(0); n++) {
         const int i = ii_acc[n];
-        if (i >= 0) {
+        if (i >= 0 && i < N) {
           for (int j=0; j<M; j++) {
             b(i*M + j) += bs_acc[n][j];
           }
@@ -1302,7 +1303,7 @@ class SparseBlock {
 
       for (int n=0; n<ii.size(0); n++) {
         const int i = ii_acc[n];
-        if (i >= 0) {
+        if (i >= 0 && i < N) {
           for (int j=0; j<Kc; j++) {
             b(i*M + j) += bs_acc[n][j];
           }
@@ -1315,17 +1316,22 @@ class SparseBlock {
     }
 
     SparseBlock operator-(const SparseBlock& S) {
-      return SparseBlock(A - S.A, b - S.b, N, M);
+      Eigen::SparseMatrix<double> lhs = A - S.A;
+      Eigen::VectorX<double> rhs = b - S.b;
+      lhs.makeCompressed();
+      return SparseBlock(lhs, rhs, N, M);
     }
 
     std::tuple<torch::Tensor, torch::Tensor> get_dense() {
       Eigen::MatrixXd Ad = Eigen::MatrixXd(A);
 
-      torch::Tensor H = torch::from_blob(Ad.data(), {N*M, N*M}, torch::TensorOptions()
-        .dtype(torch::kFloat64)).to(torch::kCUDA).to(torch::kFloat32);
+      torch::Tensor H_cpu = torch::from_blob(
+        Ad.data(), {N*M, N*M}, torch::TensorOptions().dtype(torch::kFloat64)).clone();
+      torch::Tensor H = H_cpu.to(torch::kCUDA).to(torch::kFloat32);
 
-      torch::Tensor v = torch::from_blob(b.data(), {N*M, 1}, torch::TensorOptions()
-        .dtype(torch::kFloat64)).to(torch::kCUDA).to(torch::kFloat32);
+      torch::Tensor v_cpu = torch::from_blob(
+        b.data(), {N*M, 1}, torch::TensorOptions().dtype(torch::kFloat64)).clone();
+      torch::Tensor v = v_cpu.to(torch::kCUDA).to(torch::kFloat32);
 
       return std::make_tuple(H, v);
 
@@ -1335,16 +1341,52 @@ class SparseBlock {
 
       torch::Tensor dx;
 
-      Eigen::SparseMatrix<double> L(A);
-      L.diagonal().array() += ep + lm * L.diagonal().array();
+      Eigen::VectorXd x;
+      bool solved = false;
 
-      Eigen::SimplicialLLT<Eigen::SparseMatrix<double>> solver;
-      solver.compute(L);
+      if (b.array().isFinite().all()) {
+        if (M > 6) {
+          Eigen::MatrixXd D(A);
+          D = 0.5 * (D + D.transpose());
+          for (int i=0; i<D.rows(); i++) {
+            D(i, i) += ep + lm * std::abs(D(i, i));
+          }
 
-      if (solver.info() == Eigen::Success) {
-        Eigen::VectorXd x = solver.solve(b);
-        dx = torch::from_blob(x.data(), {N, M}, torch::TensorOptions()
-          .dtype(torch::kFloat64)).to(torch::kCUDA).to(torch::kFloat32);
+          if (D.array().isFinite().all()) {
+            Eigen::LDLT<Eigen::MatrixXd> solver;
+            solver.compute(D);
+            if (solver.info() == Eigen::Success) {
+              x = solver.solve(b);
+              solved = x.array().isFinite().all();
+            }
+
+            if (!solved) {
+              Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> solver_qr(D);
+              x = solver_qr.solve(b);
+              solved = x.array().isFinite().all();
+            }
+          }
+        }
+        else {
+          Eigen::SparseMatrix<double> L(A);
+          Eigen::SparseMatrix<double> Lt = L.transpose();
+          L = 0.5 * (L + Lt);
+          L.diagonal().array() += ep + lm * L.diagonal().array().abs();
+          L.makeCompressed();
+
+          Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+          solver.compute(L);
+          if (solver.info() == Eigen::Success) {
+            x = solver.solve(b);
+            solved = (solver.info() == Eigen::Success && x.array().isFinite().all());
+          }
+        }
+      }
+
+      if (solved) {
+        torch::Tensor dx_cpu = torch::from_blob(
+          x.data(), {N, M}, torch::TensorOptions().dtype(torch::kFloat64)).clone();
+        dx = dx_cpu.to(torch::kCUDA).to(torch::kFloat32);
       }
       else {
         dx = torch::zeros({N, M}, torch::TensorOptions()
@@ -1387,7 +1429,7 @@ SparseBlock schur_block(torch::Tensor E,
     const int j = jj_data[n];
     const int k = kk_data[n];
 
-    if (j >= t0 && j <= t1) {
+    if (j >= t0 && j < t1) {
       const int t = j - t0;
       graph[t].push_back(k);
       index[t].push_back(n);
@@ -1413,17 +1455,18 @@ SparseBlock schur_block(torch::Tensor E,
     }
   }
 
-  torch::Tensor ix_cuda = torch::from_blob(idx.data(), {LongType(idx.size())}, 
-    torch::TensorOptions().dtype(torch::kInt64)).to(torch::kCUDA).view({-1, 3});
+  torch::Tensor ix_cpu = torch::from_blob(
+    idx.data(), {LongType(idx.size())}, torch::TensorOptions().dtype(torch::kInt64)).clone();
+  torch::Tensor ix_cuda = ix_cpu.to(torch::kCUDA).view({-1, 3});
 
   torch::Tensor jx_cuda = torch::stack({kk_cpu}, -1)
     .to(torch::kCUDA).to(torch::kInt64);
 
-  torch::Tensor ii2_cpu = torch::from_blob(ii_list.data(), {LongType(ii_list.size())}, 
-    torch::TensorOptions().dtype(torch::kInt64)).view({-1});
+  torch::Tensor ii2_cpu = torch::from_blob(
+    ii_list.data(), {LongType(ii_list.size())}, torch::TensorOptions().dtype(torch::kInt64)).clone().view({-1});
 
-  torch::Tensor jj2_cpu = torch::from_blob(jj_list.data(), {LongType(jj_list.size())}, 
-    torch::TensorOptions().dtype(torch::kInt64)).view({-1});
+  torch::Tensor jj2_cpu = torch::from_blob(
+    jj_list.data(), {LongType(jj_list.size())}, torch::TensorOptions().dtype(torch::kInt64)).clone().view({-1});
 
   torch::Tensor S = torch::zeros({ix_cuda.size(0), 6, 6}, 
     torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
@@ -1477,7 +1520,7 @@ SparseBlock schur_block_state(torch::Tensor E,
   graph_t index(P);
 
   for (int n=0; n<ii.size(0); n++) {
-    const int t = ii_accessor[n] - t0;
+    const int t = jj_accessor[n] - t0;
     if (t >= 0 && t < P) {
       graph[t].push_back(kk_accessor[n]);
       index[t].push_back(n);
@@ -1503,17 +1546,18 @@ SparseBlock schur_block_state(torch::Tensor E,
     }
   }
 
-  torch::Tensor ix_cuda = torch::from_blob(idx.data(), {LongType(idx.size())},
-    torch::TensorOptions().dtype(torch::kInt64)).to(torch::kCUDA).view({-1, 3});
+  torch::Tensor ix_cpu = torch::from_blob(
+    idx.data(), {LongType(idx.size())}, torch::TensorOptions().dtype(torch::kInt64)).clone();
+  torch::Tensor ix_cuda = ix_cpu.to(torch::kCUDA).view({-1, 3});
 
   torch::Tensor jx_cuda = torch::stack({kk_cpu}, -1)
     .to(torch::kCUDA).to(torch::kInt64);
 
-  torch::Tensor ii2_cpu = torch::from_blob(ii_list.data(), {LongType(ii_list.size())},
-    torch::TensorOptions().dtype(torch::kInt64)).view({-1});
+  torch::Tensor ii2_cpu = torch::from_blob(
+    ii_list.data(), {LongType(ii_list.size())}, torch::TensorOptions().dtype(torch::kInt64)).clone().view({-1});
 
-  torch::Tensor jj2_cpu = torch::from_blob(jj_list.data(), {LongType(jj_list.size())},
-    torch::TensorOptions().dtype(torch::kInt64)).view({-1});
+  torch::Tensor jj2_cpu = torch::from_blob(
+    jj_list.data(), {LongType(jj_list.size())}, torch::TensorOptions().dtype(torch::kInt64)).clone().view({-1});
 
   torch::Tensor S = torch::zeros({ix_cuda.size(0), 6, 6},
     torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
@@ -1969,3 +2013,4 @@ torch::Tensor iproj_cuda(
   return points;
 
 }
+ㄴ
