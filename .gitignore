@@ -15,6 +15,7 @@
 **/cache/
 
 DROID-SLAM/data/
+DROID-SLAM/outputs/**/*.ply
 
 !DROID-SLAM/checkpoints/**/*.pth
 !DROID-SLAM/outputs/**/*.pth
