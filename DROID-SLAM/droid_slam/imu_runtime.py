@@ -1,0 +1,150 @@
+import math
+
+
+def configure_imu_noise_model(args, source="runtime"):
+    """Select covariance-relative weighting without an arbitrary info clip.
+
+    Preintegration provides diagonal uncertainty metadata.  Its absolute scale
+    cannot be directly combined with DROID's visual covariance, but the
+    relative change between intervals is meaningful.  This mode keeps that
+    relative information and lets the learned global/category weights set the
+    cross-modal scale. The GRU confidence remains the only adaptive multiplier;
+    this mode deliberately removes the legacy threshold-based heuristic gate
+    and a hand-set confidence floor.
+    """
+
+    if not getattr(args, "use_imu_noise_model", False):
+        return False
+    if getattr(args, "_imu_noise_model_configured", False):
+        return True
+
+    args.use_imu_info_weighting = True
+    args.imu_info_weight_clip = 0.0
+
+    # Under the covariance-relative path, these old limits are not quality
+    # measurements. A long interval can be valid when MotionFilter skipped
+    # visually redundant frames; its propagated covariance should reduce the
+    # factor contribution continuously instead of dropping it at a fixed
+    # duration/motion/angle threshold. Invalid timestamps and non-finite values
+    # are still rejected by the preintegration and factor-graph integrity checks.
+    args.imu_ba_prior_max_deg = 0.0
+    args.imu_full_max_dt = 0.0
+    args.imu_full_max_dv = 0.0
+    args.imu_full_max_dp = 0.0
+    # Training-side PyTorch DBA/full loss used this as a hard rotational
+    # residual gate. A residual magnitude is not an IMU quality measurement;
+    # in covariance mode it must remain available to the learned confidence and
+    # visual objective instead of being removed at a hand-tuned angle.
+    if hasattr(args, "imu_max_residual"):
+        args.imu_max_residual = 0.0
+
+    # These settings belong to the old heuristic gate rather than to the
+    # preintegration noise model. Keeping either one active would mix a learned
+    # confidence with a second, hand-tuned confidence mechanism.
+    legacy_gate_enabled = bool(getattr(args, "use_adaptive_imu_gate", False))
+    confidence_floor = float(getattr(args, "imu_confidence_floor", 0.0))
+    args.use_adaptive_imu_gate = False
+    if hasattr(args, "imu_confidence_floor"):
+        args.imu_confidence_floor = 0.0
+    if hasattr(args, "imu_conf_floor"):
+        args.imu_conf_floor = 0.0
+
+    args._imu_noise_model_configured = True
+    print(
+        "[IMU] using covariance-relative IMU information "
+        f"source={source}, info_clip=disabled, legacy_limits=disabled, "
+        "residual_gate=disabled, adaptive_gate=disabled, "
+        "confidence_floor=disabled"
+    )
+    if legacy_gate_enabled:
+        print(
+            "[IMU] disabled legacy adaptive IMU gate because "
+            "--use_imu_noise_model uses GRU confidence directly."
+        )
+    if confidence_floor > 0.0:
+        print(
+            "[IMU] disabled --imu_confidence_floor because covariance mode "
+            "must preserve the learned confidence value."
+        )
+    return True
+
+
+def apply_learned_imu_ba_weight(args, net, source="runtime"):
+    """Apply the checkpoint-learned global IMU BA weight to runtime args."""
+
+    if not getattr(args, "use_learned_imu_ba_weight", False):
+        return None
+
+    loaded_keys = getattr(net, "_loaded_state_keys", None)
+    if loaded_keys is not None and "imu_ba_log_weight" not in loaded_keys:
+        raise ValueError(
+            "--use_learned_imu_ba_weight was requested, but this checkpoint "
+            "does not contain imu_ba_log_weight. Use an IMU-trained checkpoint."
+        )
+
+    if not hasattr(net, "get_imu_ba_weight"):
+        raise ValueError(
+            "--use_learned_imu_ba_weight requires a DroidNet with get_imu_ba_weight()."
+        )
+
+    learned = float(net.get_imu_ba_weight().detach().cpu().item())
+    scale = float(getattr(args, "learned_imu_ba_weight_scale", 1.0))
+
+    if not math.isfinite(learned) or learned < 0.0:
+        raise ValueError(f"invalid learned IMU BA weight: {learned}")
+    if not math.isfinite(scale) or scale < 0.0:
+        raise ValueError(f"invalid learned IMU BA weight scale: {scale}")
+
+    old_weight = float(getattr(args, "imu_ba_prior_weight", 0.0))
+    runtime_weight = learned * scale
+    args.imu_ba_prior_weight = runtime_weight
+
+    print(
+        "[IMU] using learned global IMU BA weight "
+        f"source={source}, learned={learned:.6g}, scale={scale:.6g}, "
+        f"runtime={runtime_weight:.6g}, previous_cli={old_weight:.6g}"
+    )
+
+    if not getattr(args, "use_imu_ba_prior", False):
+        print(
+            "[IMU WARNING] learned IMU BA weight has no effect without "
+            "--use_imu_ba_prior or --use_full_imu_ba."
+        )
+
+    return runtime_weight
+
+
+def apply_learned_imu_residual_weights(args, net, source="runtime"):
+    """Apply checkpoint-learned relative position/velocity IMU weights."""
+
+    if not getattr(args, "use_learned_imu_residual_weights", False):
+        return None
+
+    loaded_keys = getattr(net, "_loaded_state_keys", None)
+    required = {"imu_pos_log_weight", "imu_vel_log_weight"}
+    if loaded_keys is not None and not required.issubset(loaded_keys):
+        missing = ", ".join(sorted(required - set(loaded_keys)))
+        raise ValueError(
+            "--use_learned_imu_residual_weights was requested, but this checkpoint "
+            f"does not contain {missing}. Fine-tune with learned residual weights first."
+        )
+    if not hasattr(net, "get_imu_full_residual_weights"):
+        raise ValueError(
+            "--use_learned_imu_residual_weights requires a DroidNet with "
+            "get_imu_full_residual_weights()."
+        )
+
+    learned = net.get_imu_full_residual_weights().detach().cpu().tolist()
+    if len(learned) != 2 or not all(math.isfinite(float(value)) and value >= 0.0 for value in learned):
+        raise ValueError(f"invalid learned IMU residual weights: {learned}")
+
+    old_pos = float(getattr(args, "imu_full_pos_weight", 0.0))
+    old_vel = float(getattr(args, "imu_full_vel_weight", 0.0))
+    args.imu_full_pos_weight = float(learned[0])
+    args.imu_full_vel_weight = float(learned[1])
+    print(
+        "[IMU] using learned relative IMU residual weights "
+        f"source={source}, pos={learned[0]:.6g}, vel={learned[1]:.6g}, "
+        f"previous_cli=({old_pos:.6g}, {old_vel:.6g})"
+    )
+    return tuple(float(value) for value in learned)
