@@ -1,0 +1,28 @@
+[IMU] --use_pose_velocity_imu_ba enables frontend local pose-velocity DBA.
+[IMU] loaded 1922 imu priors from /home/ubuntu/SLAM/datasets/euroc_heldout/prepared/V2_03_difficult_droid_cam0/imu_prior.csv
+[IMU] camera/IMU lever arm t_CI=(0.000000, 0.000000, 0.000000) m, source=zero_lever_arm_fallback, applied=0
+[IMU WARNING] pose-velocity IMU BA is using a zero camera/IMU lever arm. Provide sensor YAML or --imu_to_cam_translation for acceleration-based motion.
+[IMU] raw-camera information reference=(6.94652e+08, 4.99999e+06, 5.99995e+09)
+0it [00:00, ?it/s]/home/ubuntu/DROID-SLAM/droid_slam/droid.py:250: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  (k.replace("module.", ""), v) for (k, v) in torch.load(weights).items()
+1it [00:01,  1.19s/it]2it [00:01,  1.61it/s]7it [00:01,  7.33it/s]10it [00:03,  3.14it/s]12it [00:04,  3.00it/s]14it [00:04,  2.71it/s]15it [00:05,  2.61it/s]16it [00:05,  2.53it/s]17it [00:06,  2.44it/s]18it [00:06,  2.36it/s]19it [00:07,  2.30it/s]20it [00:07,  2.26it/s]21it [00:08,  2.21it/s]22it [00:08,  2.17it/s]23it [00:09,  2.14it/s]24it [00:09,  2.10it/s]25it [00:10,  2.05it/s]26it [00:10,  2.01it/s]27it [00:11,  1.99it/s]28it [00:11,  1.97it/s]29it [00:12,  1.97it/s]30it [00:12,  1.94it/s]31it [00:13,  1.93it/s]32it [00:13,  1.92it/s]33it [00:14,  1.90it/s]34it [00:15,  1.71it/s]35it [00:15,  1.77it/s]36it [00:16,  1.79it/s]37it [00:16,  1.84it/s]38it [00:17,  1.85it/s]39it [00:17,  1.78it/s]40it [00:18,  1.79it/s]41it [00:18,  1.79it/s]42it [00:19,  1.82it/s]43it [00:19,  1.83it/s]44it [00:20,  1.76it/s]45it [00:21,  1.78it/s]46it [00:21,  1.79it/s]47it [00:22,  1.81it/s]48it [00:22,  1.82it/s]49it [00:23,  1.74it/s]50it [00:23,  1.77it/s]51it [00:24,  1.79it/s]52it [00:24,  1.81it/s]53it [00:25,  1.81it/s]54it [00:26,  1.77it/s]55it [00:26,  1.80it/s]56it [00:27,  1.80it/s]57it [00:27,  1.79it/s]58it [00:28,  1.79it/s]59it [00:28,  1.72it/s]60it [00:29,  1.89it/s]66it [00:29,  6.24it/s]72it [00:29, 11.35it/s]78it [00:29, 16.84it/s]84it [00:29, 22.58it/s]89it [00:29, 26.96it/s]94it [00:30, 30.96it/s]99it [00:30, 34.32it/s]104it [00:30, 37.80it/s]109it [00:30, 39.25it/s]114it [00:30, 40.10it/s]119it [00:30, 40.68it/s]120it [00:30,  3.92it/s]
+checkpoints/pose_velocity_9dof_axisfix_hospital_wimu0.05_006000.pth
+[IMU-RESIDUAL] loaded 1920 priors from /home/ubuntu/SLAM/datasets/euroc_heldout/prepared/V2_03_difficult_droid_cam0/imu_prior.csv
+[IMU-RESIDUAL] weight=0.02, window=12, compose_order=prev_dq, inverse_imu=False
+[IMU-RESIDUAL] loaded 1920 priors from /home/ubuntu/SLAM/datasets/euroc_heldout/prepared/V2_03_difficult_droid_cam0/imu_prior.csv
+[IMU-RESIDUAL] weight=0.02, window=12, compose_order=prev_dq, inverse_imu=False
+[IMU->demo] frame=0, valid=0, dt=0.000000, dr=(0.000000, 0.000000, 0.000000), dp=(0.000000, 0.000000, 0.000000), imu_count=0
+[IMU->demo] frame=1, valid=0, dt=0.050000, dr=(0.000000, 0.000000, 0.000000), dp=(0.000000, 0.000000, 0.000000), imu_count=0
+[VI-INIT] MotionFilter retaining startup keyframes (limit=60)
+[IMU->demo] frame=2, valid=1, dt=0.050000, dr=(0.001048, -0.000051, 0.004222), dp=(0.000374, -0.011744, -0.003336), imu_count=11
+[IMU->demo] frame=3, valid=1, dt=0.050000, dr=(0.001140, -0.000318, 0.003875), dp=(0.000226, -0.011740, -0.003293), imu_count=11
+[IMU->demo] frame=4, valid=1, dt=0.050000, dr=(0.001153, 0.000014, 0.003940), dp=(0.000810, -0.011709, -0.003322), imu_count=11
+[VI-INIT] delaying 9D IMU DBA until visual-inertial alignment succeeds
+[VI-INIT] temporarily disabling frontend keyframe removal until 60 startup keyframes
+[VI-INIT] alignment deferred: insufficient_frames, edges=0, duration=0.000s, rotation=0.00deg, span_ratio=0.00
+[VI-INIT] alignment deferred: insufficient_visual_excitation, edges=32, duration=1.600s, rotation=7.83deg, span_ratio=1.22
+################################
+[VI-INIT] delaying 9D IMU DBA until visual-inertial alignment succeeds
+################################
+[VI-INIT] delaying 9D IMU DBA until visual-inertial alignment succeeds
+[VI-INIT WARNING] final status=not_aligned; full 9DoF IMU factors were intentionally withheld, so this reconstruction must be treated as visual-only rather than a metric VI result.

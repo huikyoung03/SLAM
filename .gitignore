@@ -9,11 +9,12 @@
 **/*.egg-info/
 **/datasets/
 **/uploads/
-**/checkpoints/
-**/outputs/
 **/runs/
 **/build/
 **/logs/
 **/cache/
 
 DROID-SLAM/data/
+
+!DROID-SLAM/checkpoints/**/*.pth
+!DROID-SLAM/outputs/**/*.pth

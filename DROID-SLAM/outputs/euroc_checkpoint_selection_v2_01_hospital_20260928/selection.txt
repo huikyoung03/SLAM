@@ -1,0 +1,10 @@
+selection_metric=common-frame Sim(3) ATE RMSE
+baseline_ate_rmse_m=0.030051716
+best_candidate_label=imu_pose_velocity_9dof_hospital_v1_008000
+best_candidate_checkpoint=checkpoints/pose_velocity_9dof_hospital_v1_008000.pth
+best_candidate_ate_rmse_m=0.030028530
+relative_change_percent=-0.0772
+candidate_beats_baseline_on_validation=true
+decision=ranking_only
+cross_sequence_validation_required=true
+note=Candidate ranking is fixed before cross-sequence evaluation; no runtime weight or threshold was tuned here.

@@ -1,0 +1,13 @@
+selection_metric=common-frame metric SE(3) ATE RMSE (IMU candidates only)
+baseline_sim3_ate_rmse_m=0.016052981
+best_candidate_label=imu_pose_velocity_9dof_axisfix_hospital_wimu0.05_006000
+best_candidate_checkpoint=checkpoints/pose_velocity_9dof_axisfix_hospital_wimu0.05_006000.pth
+best_candidate_metric_se3_ate_rmse_m=0.079225956
+best_candidate_metric_origin_ate_rmse_m=0.095230744
+best_candidate_metric_rpe_1s_trans_rmse_m=0.013667902
+best_candidate_sim3_ate_rmse_m=0.016108630
+shape_relative_change_vs_baseline_percent=0.3467
+decision=ranking_only
+cross_sequence_validation_required=true
+note=Visual-only DROID has unobservable metric scale, so it is compared only by Sim(3) shape metrics.
+note=Candidate ranking is fixed before cross-sequence evaluation; no runtime weight or threshold was tuned here.

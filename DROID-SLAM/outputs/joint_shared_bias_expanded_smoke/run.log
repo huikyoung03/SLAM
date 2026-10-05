@@ -1,0 +1,43 @@
+[IMU] --use_pose_velocity_imu_ba enables frontend local pose-velocity DBA.
+[IMU] loaded 1922 imu priors from /home/ubuntu/SLAM/datasets/euroc_heldout/prepared/V2_03_difficult_droid_cam0/imu_prior.csv
+[IMU] camera/IMU lever arm t_CI=(0.065223, -0.020706, -0.008055) m, source=/home/ubuntu/SLAM/datasets/euroc_heldout/prepared/V2_03_difficult_droid_cam0/cam0_sensor.yaml:/home/ubuntu/SLAM/datasets/euroc_heldout/prepared/V2_03_difficult_droid_cam0/imu0_sensor.yaml, applied=1
+[IMU] raw-camera information reference=(6.94652e+08, 4.99999e+06, 5.99995e+09)
+[IMU] --stride > 1: using original sorted-image indices as timestamps so skipped IMU rows can be composed between selected frames.
+0it [00:00, ?it/s]/home/ubuntu/DROID-SLAM/droid_slam/droid.py:250: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  (k.replace("module.", ""), v) for (k, v) in torch.load(weights).items()
+1it [00:00,  1.46it/s]2it [00:00,  2.89it/s]8it [00:01,  4.60it/s]9it [00:02,  4.32it/s]10it [00:02,  4.25it/s]11it [00:02,  3.88it/s]12it [00:03,  3.39it/s]13it [00:03,  3.02it/s]14it [00:04,  2.78it/s]15it [00:04,  2.65it/s]16it [00:04,  2.54it/s]17it [00:05,  2.44it/s]18it [00:05,  2.34it/s]19it [00:06,  2.30it/s]20it [00:06,  2.26it/s]21it [00:07,  2.22it/s]22it [00:07,  2.19it/s]23it [00:08,  2.15it/s]24it [00:08,  2.12it/s]25it [00:09,  2.10it/s]26it [00:09,  2.05it/s]27it [00:10,  1.99it/s]28it [00:10,  1.98it/s]29it [00:11,  1.98it/s]30it [00:11,  1.94it/s]31it [00:12,  1.93it/s]32it [00:12,  1.92it/s]33it [00:13,  1.91it/s]34it [00:14,  1.81it/s]35it [00:14,  1.86it/s]36it [00:15,  1.87it/s]37it [00:15,  1.86it/s]38it [00:16,  1.88it/s]39it [00:16,  1.79it/s]40it [00:17,  1.82it/s]41it [00:17,  1.84it/s]42it [00:18,  1.86it/s]43it [00:18,  1.86it/s]44it [00:19,  1.81it/s]45it [00:19,  1.84it/s]46it [00:20,  1.85it/s]47it [00:21,  1.84it/s]48it [00:21,  1.85it/s]49it [00:22,  1.77it/s]50it [00:22,  1.77it/s]51it [00:23,  1.79it/s]52it [00:23,  1.79it/s]53it [00:24,  1.81it/s]54it [00:25,  1.71it/s]55it [00:25,  1.74it/s]56it [00:26,  1.78it/s]57it [00:26,  1.78it/s]58it [00:27,  1.79it/s]59it [00:27,  1.71it/s]60it [00:28,  1.91it/s]67it [00:28,  5.51it/s]70it [00:29,  5.90it/s]73it [00:29,  6.31it/s]75it [00:30,  4.94it/s]78it [00:30,  5.45it/s]79it [00:31,  4.71it/s]80it [00:31,  4.21it/s]82it [00:32,  3.97it/s]83it [00:32,  3.46it/s]84it [00:32,  3.24it/s]85it [00:33,  3.09it/s]86it [00:33,  2.99it/s]88it [00:34,  3.65it/s]89it [00:34,  3.19it/s]90it [00:34,  3.03it/s]91it [00:35,  2.90it/s]92it [00:35,  2.92it/s]94it [00:35,  3.81it/s]95it [00:36,  3.47it/s]96it [00:36,  3.24it/s]97it [00:37,  3.09it/s]98it [00:37,  2.96it/s]100it [00:37,  3.65it/s]101it [00:38,  3.13it/s]102it [00:38,  3.00it/s]103it [00:38,  2.93it/s]105it [00:39,  3.65it/s]106it [00:39,  3.39it/s]107it [00:40,  3.22it/s]107it [00:40,  2.66it/s]
+checkpoints/pose_velocity_9dof_axisfix_hospital_wimu0.05_006000.pth
+[IMU] using covariance-relative IMU information source=droid, info_clip=disabled, legacy_limits=disabled, residual_gate=disabled, adaptive_gate=disabled, confidence_floor=disabled
+[IMU] using learned global IMU BA weight source=droid, learned=0.0593388, scale=1, runtime=0.0593388, previous_cli=0.002
+[IMU] using learned relative IMU residual weights source=droid, pos=0.0538152, vel=0.0432468, previous_cli=(0.05, 0.05)
+[IMU-RESIDUAL] loaded 1920 priors from /home/ubuntu/SLAM/datasets/euroc_heldout/prepared/V2_03_difficult_droid_cam0/imu_prior.csv
+[IMU-RESIDUAL] weight=0.02, window=12, compose_order=prev_dq, inverse_imu=False
+[IMU-RESIDUAL] loaded 1920 priors from /home/ubuntu/SLAM/datasets/euroc_heldout/prepared/V2_03_difficult_droid_cam0/imu_prior.csv
+[IMU-RESIDUAL] weight=0.02, window=12, compose_order=prev_dq, inverse_imu=False
+[IMU->demo] frame=0, valid=0, dt=0.000000, dr=(0.000000, 0.000000, 0.000000), dp=(0.000000, 0.000000, 0.000000), imu_count=0
+[IMU->demo] frame=2, valid=1, dt=0.050000, dr=(0.001048, -0.000051, 0.004222), dp=(0.000374, -0.011744, -0.003336), imu_count=11
+[VI-INIT] MotionFilter retaining startup keyframes (limit=60)
+[IMU->demo] frame=4, valid=1, dt=0.050000, dr=(0.001153, 0.000014, 0.003940), dp=(0.000810, -0.011709, -0.003322), imu_count=11
+[VI-INIT] delaying 9D IMU DBA until visual-inertial alignment succeeds
+[VI-INIT] temporarily disabling frontend keyframe removal until 60 startup keyframes
+[VI-INIT] alignment deferred: insufficient_frames, edges=0, duration=0.000s, rotation=0.00deg, span_ratio=0.00
+[VI-INIT] alignment deferred: insufficient_visual_excitation, edges=32, duration=3.200s, rotation=15.60deg, span_ratio=1.37
+[VI-INIT] alignment deferred: scale_out_of_range, edges=44, duration=4.400s, rotation=21.54deg, span_ratio=15.86
+[VI-INIT] alignment deferred: accel_bias_out_of_range, edges=0, duration=0.000s, rotation=0.00deg, span_ratio=0.00
+[VI-INIT] alignment deferred: scale_out_of_range, edges=41, duration=4.100s, rotation=26.70deg, span_ratio=738.15
+Traceback (most recent call last):
+  File "demo.py", line 1314, in <module>
+    droid.track(
+  File "/home/ubuntu/DROID-SLAM/droid_slam/droid.py", line 329, in track
+    self.frontend()
+  File "/home/ubuntu/DROID-SLAM/droid_slam/droid_frontend.py", line 407, in __call__
+    self._update()
+  File "/home/ubuntu/DROID-SLAM/droid_slam/droid_frontend.py", line 312, in _update
+    self.graph.update(None, None, use_inactive=True)
+  File "/home/ubuntu/miniconda3/envs/droid_env/lib/python3.8/site-packages/torch/amp/autocast_mode.py", line 43, in decorate_autocast
+    return func(*args, **kwargs)
+  File "/home/ubuntu/DROID-SLAM/droid_slam/factor_graph.py", line 2737, in update
+    ba_result = self.video.ba(
+  File "/home/ubuntu/DROID-SLAM/droid_slam/depth_video.py", line 528, in ba
+    ba_result = droid_backends.ba(
+RuntimeError: The size of tensor a (20) must match the size of tensor b (8) at non-singleton dimension 0

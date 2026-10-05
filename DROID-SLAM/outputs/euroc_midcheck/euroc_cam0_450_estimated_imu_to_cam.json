@@ -1,0 +1,28 @@
+{
+  "R_imu_to_cam": [
+    [
+      -0.02094548103666615,
+      0.9997257866550153,
+      -0.010470831922713978
+    ],
+    [
+      -0.9973357296241331,
+      -0.021625100986232618,
+      -0.06966919995545975
+    ],
+    [
+      -0.06987652852883583,
+      0.00898367988890429,
+      0.9975151950002635
+    ]
+  ],
+  "det": 1.000000000000001,
+  "selected_pairs": 45,
+  "cam_key": "rv_cam_a",
+  "sign": -1.0,
+  "median_error_deg": 0.9504949224770413,
+  "mean_error_deg": 1.551404805622825,
+  "max_error_deg": 13.767733217705636,
+  "source_reconstruction": "outputs/euroc_midcheck/baseline_droid_euroc_cam0_450_recon.pth",
+  "source_imu_prior": "/home/ubuntu/SLAM/uploads/mav0/droid_cam0/imu_prior.csv"
+}
