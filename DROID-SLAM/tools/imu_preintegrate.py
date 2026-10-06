@@ -41,9 +41,20 @@ import bisect
 import csv
 import math
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+
+# Keep preintegration and runtime on one timestamp-to-frame-index contract even
+# when this file is invoked directly from the capture server rather than from
+# the repository root.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from droid_slam.imu_contract import load_frame_manifest
 
 
 Matrix3 = Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]
@@ -693,31 +704,7 @@ def load_frames(frames_csv: Path) -> List[Dict[str, Any]]:
     `imu_prior.csv`의 frame_index를 맞춰서 prior를 찾는다.
     """
 
-    frames: List[Dict[str, Any]] = []
-
-    with open(frames_csv, "r", newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            frame_index = len(frames)
-            frame_id = int(float(row.get("frame_id", frame_index)))
-            timestamp_ns = to_int_ns(row)
-            timestamp_sec = to_float(row.get("timestamp_sec"), timestamp_ns / 1e9)
-
-            # filename이 없는 오래된 CSV도 처리할 수 있게 기본 파일명을 만든다.
-            frames.append({
-                "frame_id": frame_id,
-                "frame_index": frame_index,
-                "timestamp_sec": timestamp_sec,
-                "timestamp_ns": timestamp_ns,
-                "filename": row.get("filename", f"{frame_id:06d}.jpg"),
-            })
-
-    frames.sort(key=lambda x: x["timestamp_ns"])
-
-    # timestamp 정렬 이후의 순번을 frame_index로 사용한다.
-    for frame_index, frame in enumerate(frames):
-        frame["frame_index"] = frame_index
-
-    return frames
+    return load_frame_manifest(frames_csv)
 
 
 def load_imu(

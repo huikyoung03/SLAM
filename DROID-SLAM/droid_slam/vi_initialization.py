@@ -126,6 +126,109 @@ def _set_alignment_ready(video, value: bool) -> None:
         ready.fill_(int(bool(value)))
 
 
+def _finite_scalar_or_none(value) -> Optional[float]:
+    """Convert a scalar tensor/value into JSON-safe diagnostic metadata."""
+
+    try:
+        scalar = float(torch.as_tensor(value).detach().reshape(-1)[0].cpu().item())
+    except (IndexError, RuntimeError, TypeError, ValueError):
+        return None
+    return scalar if np.isfinite(scalar) else None
+
+
+def _vector_or_none(value):
+    try:
+        vector = torch.as_tensor(value).detach().reshape(-1).cpu().tolist()
+    except (RuntimeError, TypeError, ValueError):
+        return None
+    if len(vector) < 3:
+        return None
+    vector = [float(component) for component in vector[:3]]
+    return vector if all(np.isfinite(component) for component in vector) else None
+
+
+@torch.no_grad()
+def capture_imu_state_diagnostics(video) -> Dict[str, object]:
+    """Capture a small metric-state snapshot without changing optimization."""
+
+    count = max(0, int(getattr(video.counter, "value", 0)))
+    unit_scale = _finite_scalar_or_none(getattr(video, "imu_unit_scale", None))
+    positive_scale = unit_scale is not None and unit_scale > 1e-12
+
+    gravity_internal = _vector_or_none(getattr(video, "imu_gravity", None))
+    gravity_metric = (
+        [component / unit_scale for component in gravity_internal]
+        if positive_scale and gravity_internal is not None
+        else None
+    )
+
+    velocities = getattr(video, "velocities", None)
+    velocity_mean_norm = None
+    velocity_max_norm = None
+    if velocities is not None and count > 0 and positive_scale:
+        velocity_norms = (
+            velocities[:count].detach().norm(dim=-1) / unit_scale
+        )
+        if velocity_norms.numel() > 0 and bool(torch.isfinite(velocity_norms).all()):
+            velocity_mean_norm = float(velocity_norms.mean().cpu().item())
+            velocity_max_norm = float(velocity_norms.max().cpu().item())
+
+    valid_edges = 0
+    valid_duration_sec = 0.0
+    imu_valid = getattr(video, "imu_valid", None)
+    imu_delta = getattr(video, "imu_delta", None)
+    if imu_valid is not None and imu_delta is not None and count > 1:
+        edge_mask = imu_valid[1:count].bool()
+        valid_edges = int(edge_mask.sum().detach().cpu().item())
+        if valid_edges:
+            valid_duration_sec = float(
+                imu_delta[1:count, 0][edge_mask]
+                .clamp_min(0.0)
+                .sum()
+                .detach()
+                .cpu()
+                .item()
+            )
+
+    gravity_norm = (
+        float(np.linalg.norm(gravity_metric)) if gravity_metric is not None else None
+    )
+    return {
+        "selected_keyframes": count,
+        "alignment_ready": int(_alignment_ready(video)),
+        "imu_unit_scale": unit_scale,
+        "vi_alignment_scale": _finite_scalar_or_none(
+            getattr(video, "imu_alignment_scale", None)
+        ),
+        "gravity_internal_xyz": gravity_internal,
+        "gravity_metric_xyz": gravity_metric,
+        "gravity_metric_norm": gravity_norm,
+        "global_accel_bias": _vector_or_none(
+            getattr(video, "imu_global_bias_acc", None)
+        ),
+        "global_gyro_bias": _vector_or_none(
+            getattr(video, "imu_global_bias_gyro", None)
+        ),
+        "velocity_metric_mean_norm": velocity_mean_norm,
+        "velocity_metric_max_norm": velocity_max_norm,
+        "valid_imu_edges": valid_edges,
+        "valid_imu_duration_sec": valid_duration_sec,
+    }
+
+
+def record_imu_state_diagnostics(video, stage: str) -> Dict[str, object]:
+    """Persist one named scale/bias snapshot on the live video object."""
+
+    history = getattr(video, "imu_state_diagnostics", None)
+    if not isinstance(history, dict):
+        history = {}
+        video.imu_state_diagnostics = history
+
+    snapshot = capture_imu_state_diagnostics(video)
+    history[str(stage)] = snapshot
+    return snapshot
+
+
 @torch.no_grad()
 def capture_vi_initialization_snapshot(video, window: int) -> Optional[VIInitializationSnapshot]:
     """Copy the latest pre-alignment window before frontend keyframe removal.
@@ -985,6 +1088,19 @@ def apply_visual_inertial_alignment(video, result: VIAlignmentResult) -> bool:
         video.dirty[:count] = True
 
     video.imu_alignment_metrics = dict(result.metrics or {})
+    diagnostics = record_imu_state_diagnostics(video, "vi_init_committed")
+    video.imu_alignment_metrics.update(
+        {
+            "vi_init_unit_scale": diagnostics.get("imu_unit_scale"),
+            "vi_init_gravity_metric_norm": diagnostics.get("gravity_metric_norm"),
+            "vi_init_velocity_metric_mean_norm": diagnostics.get(
+                "velocity_metric_mean_norm"
+            ),
+            "vi_init_velocity_metric_max_norm": diagnostics.get(
+                "velocity_metric_max_norm"
+            ),
+        }
+    )
     return True
 
 

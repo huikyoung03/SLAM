@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import torch
 import lietorch
@@ -49,6 +51,10 @@ class DepthVideo:
         self.imu_alignment_scale = torch.zeros(1, device=device, dtype=torch.float).share_memory_()
         self.imu_alignment_ready = Value('i', 0)
         self.imu_alignment_metrics = {}
+        # Sparse state snapshots are diagnostic metadata only. They distinguish
+        # an incorrect VI initialization from scale drift introduced by a later
+        # frontend/backend optimization pass.
+        self.imu_state_diagnostics = {}
         # Scalar records from accepted/rejected low-rate shared-bias updates.
         # Kept on the Python side because it is diagnostic metadata, not a
         # tensor needed by the CUDA DBA process.
@@ -195,7 +201,8 @@ class DepthVideo:
         try:
             if value is None or value == "":
                 return default
-            return float(value)
+            value = float(value)
+            return value if math.isfinite(value) else default
         except Exception:
             return default
 

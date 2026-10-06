@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "droid_slam"))
 
 from vi_initialization import (
     VIAlignmentResult,
+    capture_imu_state_diagnostics,
     capture_vi_initialization_snapshot,
     rebase_vi_alignment_result,
 )
@@ -29,11 +30,20 @@ def make_video():
     valid[0] = False
     return SimpleNamespace(
         poses=poses,
+        velocities=torch.tensor(
+            [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [4.0, 0.0, 0.0],
+             [6.0, 0.0, 0.0], [8.0, 0.0, 0.0]]
+        ),
         imu_delta=delta,
         imu_valid=valid,
         imu_bias_jacobian=torch.ones(count, 5, 3, 3),
         imu_unit_scale=torch.tensor([2.0]),
         imu_camera_translation=torch.tensor([0.1, 0.0, 0.0]),
+        imu_gravity=torch.tensor([0.0, -19.62, 0.0]),
+        imu_global_bias_acc=torch.tensor([0.01, 0.02, 0.03]),
+        imu_global_bias_gyro=torch.tensor([0.001, 0.002, 0.003]),
+        imu_alignment_scale=torch.tensor([2.0]),
+        imu_alignment_ready=SimpleNamespace(value=1),
         tstamp=torch.tensor([0.0, 2.0, 3.0, 4.0, 5.0]),
         counter=SimpleNamespace(value=count),
     )
@@ -41,6 +51,15 @@ def make_video():
 
 def main():
     video = make_video()
+    diagnostics = capture_imu_state_diagnostics(video)
+    assert diagnostics["selected_keyframes"] == 5
+    assert abs(diagnostics["gravity_metric_norm"] - 9.81) < 1e-6
+    assert torch.allclose(
+        torch.tensor(diagnostics["global_accel_bias"]),
+        torch.tensor([0.01, 0.02, 0.03]),
+    )
+    assert abs(diagnostics["velocity_metric_max_norm"] - 4.0) < 1e-6
+
     snapshot = capture_vi_initialization_snapshot(video, window=3)
     assert snapshot is not None
     assert snapshot.counter.value == 3

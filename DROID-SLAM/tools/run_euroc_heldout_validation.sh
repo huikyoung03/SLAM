@@ -38,6 +38,12 @@ ORIGINAL_WEIGHTS="${ORIGINAL_WEIGHTS:-droid.pth}"
 ORIGINAL_RECON="${ORIGINAL_RECON:-}"
 FIXED_RECON="${FIXED_RECON:-}"
 MATCHED_VISUAL_ONLY_RECON="${MATCHED_VISUAL_ONLY_RECON:-}"
+LOW_RATE_BIAS_RECON="${LOW_RATE_BIAS_RECON:-}"
+LOW_RATE_BIAS_DEBUG="${LOW_RATE_BIAS_DEBUG:-}"
+# Older tensor bundles did not record their source sequence. Reusing one is
+# disabled by default because a stale V2 reconstruction must never be mixed
+# into a V1 held-out report. Set this only after manual provenance review.
+ALLOW_LEGACY_RECON_REUSE="${ALLOW_LEGACY_RECON_REUSE:-0}"
 RUN_MATCHED_VISUAL_ONLY="${RUN_MATCHED_VISUAL_ONLY:-1}"
 # Pass the frozen checkpoint explicitly. A stale default can silently
 # evaluate a different IMU formulation from the one selected on V2_01.
@@ -69,7 +75,9 @@ VI_INIT_SNAPSHOT_MAX_CANDIDATES="${VI_INIT_SNAPSHOT_MAX_CANDIDATES:-6}"
 # relaxation of scale/bias/RMS acceptance thresholds.
 VI_INIT_WINDOW="${VI_INIT_WINDOW:-90}"
 VI_INIT_BOOTSTRAP_FRAMES="${VI_INIT_BOOTSTRAP_FRAMES:-60}"
-VI_INIT_BACKEND_FALLBACK="${VI_INIT_BACKEND_FALLBACK:-1}"
+# Final held-out results must reflect the online frontend path.  The backend
+# fallback remains available for diagnosis, but must be explicitly requested.
+VI_INIT_BACKEND_FALLBACK="${VI_INIT_BACKEND_FALLBACK:-0}"
 VI_INIT_BACKEND_WINDOW="${VI_INIT_BACKEND_WINDOW:-120}"
 OUT_DIR="${OUT_DIR:-outputs/euroc_heldout_$(basename "${DATA_ROOT}")_$(date +%Y%m%d_%H%M%S)}"
 
@@ -94,6 +102,115 @@ if [[ "$MAX_FRAMES" != "0" ]]; then
 fi
 
 RUN_ARGS=()
+
+validate_reconstruction_reuse() {
+  local label="$1"
+  local recon="$2"
+  local require_imu="$3"
+
+  "$PYTHON" - "$label" "$recon" "$IMAGEDIR" "$CALIB" "$IMU_PRIOR" \
+    "$FRAMES_CSV" "$CAMERA_SENSOR_YAML" "$IMU_SENSOR_YAML" "$STRIDE" \
+    "$MAX_FRAMES" "$require_imu" "$ALLOW_LEGACY_RECON_REUSE" <<'PY'
+import hashlib
+import os
+import sys
+
+import torch
+
+
+def normalized_max_frames(value):
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def digest(path):
+    path = os.path.realpath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        return None
+    value = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+(
+    label,
+    recon,
+    image_dir,
+    calib,
+    imu_prior,
+    frames_csv,
+    camera_sensor_yaml,
+    imu_sensor_yaml,
+    stride,
+    max_frames,
+    require_imu,
+    allow_legacy,
+) = sys.argv[1:]
+blob = torch.load(recon, map_location="cpu")
+provenance = blob.get("input_provenance")
+if not isinstance(provenance, dict):
+    if allow_legacy == "1":
+        print(
+            f"[REUSE WARNING] {label}: accepting legacy reconstruction without "
+            "input provenance because ALLOW_LEGACY_RECON_REUSE=1",
+            file=sys.stderr,
+        )
+        raise SystemExit(0)
+    print(
+        f"[REUSE ERROR] {label}: reconstruction has no input_provenance. "
+        "Regenerate it, or set ALLOW_LEGACY_RECON_REUSE=1 only after manual review.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+expected = {
+    "image_directory": os.path.realpath(os.path.expanduser(image_dir)),
+    "calibration_sha256": digest(calib),
+    "stride": int(stride),
+    "max_frames": normalized_max_frames(max_frames),
+}
+errors = []
+for key, expected_value in expected.items():
+    actual_value = provenance.get(key)
+    if actual_value != expected_value:
+        errors.append(f"{key}: expected={expected_value!r}, got={actual_value!r}")
+
+if require_imu == "1":
+    expected_imu_inputs = {
+        "imu_prior_sha256": digest(imu_prior),
+        "frames_csv_sha256": digest(frames_csv),
+        "cam_sensor_yaml_sha256": digest(camera_sensor_yaml),
+        "imu_sensor_yaml_sha256": digest(imu_sensor_yaml),
+    }
+    for key, expected_value in expected_imu_inputs.items():
+        actual_value = provenance.get(key)
+        if actual_value is None and allow_legacy == "1":
+            print(
+                f"[REUSE WARNING] {label}: accepting legacy IMU reconstruction "
+                f"without {key} because ALLOW_LEGACY_RECON_REUSE=1",
+                file=sys.stderr,
+            )
+            continue
+        if actual_value != expected_value:
+            errors.append(
+                f"{key}: expected current IMU input, got={actual_value!r}"
+            )
+
+if errors:
+    print(
+        f"[REUSE ERROR] {label}: reconstruction does not match the active held-out input:\n"
+        + "\n".join(f"  - {error}" for error in errors),
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+print(f"[REUSE] {label}: provenance matches current sequence", file=sys.stderr)
+PY
+}
 
 run_case() {
   local label="$1"
@@ -130,6 +247,7 @@ if [[ -n "$ORIGINAL_RECON" ]]; then
     echo "ORIGINAL_RECON does not exist: $ORIGINAL_RECON" >&2
     exit 2
   fi
+  validate_reconstruction_reuse "original_droid" "$ORIGINAL_RECON" 0
   echo "[REUSE] original_droid reconstruction=$ORIGINAL_RECON"
   RUN_ARGS+=(--run "original_droid=$ORIGINAL_RECON")
 else
@@ -145,6 +263,7 @@ if [[ "$RUN_MATCHED_VISUAL_ONLY" == "1" ]]; then
       echo "MATCHED_VISUAL_ONLY_RECON does not exist: $MATCHED_VISUAL_ONLY_RECON" >&2
       exit 2
     fi
+    validate_reconstruction_reuse "finetuned_visual_only" "$MATCHED_VISUAL_ONLY_RECON" 0
     echo "[REUSE] finetuned_visual_only reconstruction=$MATCHED_VISUAL_ONLY_RECON"
     RUN_ARGS+=(--run "finetuned_visual_only=$MATCHED_VISUAL_ONLY_RECON")
   else
@@ -157,6 +276,7 @@ fi
 
 IMU_ARGS=(
   --imu_prior "$IMU_PRIOR"
+  --imu_frame_manifest "$FRAMES_CSV"
   --cam_sensor_yaml "$CAMERA_SENSOR_YAML"
   --imu_sensor_yaml "$IMU_SENSOR_YAML"
   --use_pose_velocity_imu_ba
@@ -204,6 +324,7 @@ if [[ -n "$FIXED_RECON" ]]; then
     echo "FIXED_RECON does not exist: $FIXED_RECON" >&2
     exit 2
   fi
+  validate_reconstruction_reuse "imu_9dof_fixed" "$FIXED_RECON" 1
   echo "[REUSE] imu_9dof_fixed reconstruction=$FIXED_RECON"
   RUN_ARGS+=(--run "imu_9dof_fixed=$FIXED_RECON")
 else
@@ -232,7 +353,25 @@ if [[ "$RUN_SHARED_BIAS" == "1" ]]; then
     echo "BIAS_REFINE_BACKEND must be 0 or 1, got: $BIAS_REFINE_BACKEND" >&2
     exit 2
   fi
-  run_case imu_9dof_lowrate_bias "$IMU_WEIGHTS" "${LOW_RATE_BIAS_ARGS[@]}"
+  if [[ -n "$LOW_RATE_BIAS_RECON" ]]; then
+    if [[ ! -f "$LOW_RATE_BIAS_RECON" ]]; then
+      echo "LOW_RATE_BIAS_RECON does not exist: $LOW_RATE_BIAS_RECON" >&2
+      exit 2
+    fi
+    if [[ -n "$LOW_RATE_BIAS_DEBUG" && ! -f "$LOW_RATE_BIAS_DEBUG" ]]; then
+      echo "LOW_RATE_BIAS_DEBUG does not exist: $LOW_RATE_BIAS_DEBUG" >&2
+      exit 2
+    fi
+    validate_reconstruction_reuse "imu_9dof_lowrate_bias" "$LOW_RATE_BIAS_RECON" 1
+    echo "[REUSE] imu_9dof_lowrate_bias reconstruction=$LOW_RATE_BIAS_RECON"
+    if [[ -n "$LOW_RATE_BIAS_DEBUG" ]]; then
+      RUN_ARGS+=(--run "imu_9dof_lowrate_bias=$LOW_RATE_BIAS_RECON,$LOW_RATE_BIAS_DEBUG")
+    else
+      RUN_ARGS+=(--run "imu_9dof_lowrate_bias=$LOW_RATE_BIAS_RECON")
+    fi
+  else
+    run_case imu_9dof_lowrate_bias "$IMU_WEIGHTS" "${LOW_RATE_BIAS_ARGS[@]}"
+  fi
 elif [[ "$RUN_SHARED_BIAS" != "0" ]]; then
   echo "RUN_SHARED_BIAS must be 0 or 1, got: $RUN_SHARED_BIAS" >&2
   exit 2

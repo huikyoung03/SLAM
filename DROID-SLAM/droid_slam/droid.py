@@ -10,6 +10,7 @@ from droid_backend import DroidBackend
 from trajectory_filler import PoseTrajectoryFiller
 from vi_initialization import (
     apply_visual_inertial_alignment,
+    record_imu_state_diagnostics,
     try_visual_inertial_initialization,
 )
 from imu_runtime import (
@@ -450,6 +451,10 @@ class Droid:
         if hasattr(self.frontend, "flush_imu_debug"):
             self.frontend.flush_imu_debug()
 
+        # Preserve scale/bias state before either global backend pass. This
+        # makes it possible to tell a bad VI initialization from later drift.
+        record_imu_state_diagnostics(self.video, "post_frontend")
+
         # 더 이상 실시간 local tracking이 필요 없으므로 frontend 삭제
         del self.frontend
 
@@ -467,12 +472,14 @@ class Droid:
         #
         # 첫 번째 backend pass로 전체 trajectory를 한 번 정리한다.
         self.backend(7)
+        record_imu_state_diagnostics(self.video, "post_backend_visual")
 
         # A difficult sequence can lack enough early parallax for online VI
         # initialization even though the first visual global pass makes it
         # observable.  This optional fallback keeps the next backend pass a
         # real 9DoF visual-inertial refinement rather than silently visual-only.
         self._maybe_backend_visual_inertial_initialization()
+        record_imu_state_diagnostics(self.video, "post_backend_vi_init")
 
         ############################################################
         # 3. backend refinement 2차
@@ -488,6 +495,7 @@ class Droid:
         #
         # 더 많은 iteration으로 추가 refinement를 수행한다.
         self.backend(12)
+        record_imu_state_diagnostics(self.video, "post_backend_final")
 
         ############################################################
         # 4. trajectory filling

@@ -13,7 +13,8 @@ import os
 import glob 
 import time
 import argparse
-import csv
+import hashlib
+import math
 from pathlib import Path
 
 from torch.multiprocessing import Process
@@ -34,10 +35,29 @@ except Exception:
     build_imu_prior_csv = None
     resolve_imu_calibration = None
 
+try:
+    from imu_contract import (
+        frame_manifest_digest,
+        load_frame_manifest,
+        selected_frame_records,
+        validate_frame_manifest_images,
+        validate_frame_prior_mapping,
+    )
+except ImportError:
+    from droid_slam.imu_contract import (
+        frame_manifest_digest,
+        load_frame_manifest,
+        selected_frame_records,
+        validate_frame_manifest_images,
+        validate_frame_prior_mapping,
+    )
+
+try:
+    from imu_prior import load_imu_prior_csv
+except ImportError:
+    from droid_slam.imu_prior import load_imu_prior_csv
+
 import torch.nn.functional as F
-
-
-IMU_BIAS_JACOBIAN_ORDER = ("J_R_bg", "J_v_ba", "J_v_bg", "J_p_ba", "J_p_bg")
 
 
 '''
@@ -100,28 +120,8 @@ def show_image(image):
     cv2.waitKey(1)
 
 
-def _to_float(value, default=0.0):
-    try:
-        if value is None or value == "":
-            return default
-        return float(value)
-    except Exception:
-        return default
-
-
-def _to_int(value, default=0):
-    try:
-        if value is None or value == "":
-            return default
-        return int(float(value))
-    except Exception:
-        return default
-
-
 def load_imu_priors(imu_prior_path):
-    """
-    imu_prior.csv를 frame_index 기준 dictionary로 읽는다.
-    """
+    """Load the same checked IMU-prior schema used by dataset readers."""
 
     if imu_prior_path is None:
         return {}
@@ -131,73 +131,246 @@ def load_imu_priors(imu_prior_path):
         print(f"[IMU] imu_prior.csv not found: {imu_prior_path}")
         return {}
 
-    priors = {}
+    return load_imu_prior_csv(imu_prior_path, report=True)
 
-    with open(imu_prior_path, "r", newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            frame_index = _to_int(
-                row.get("frame_index"),
-                _to_int(row.get("frame_id"), len(priors)),
+
+def resolve_runtime_frame_records(args, imu_priors):
+    """Use the preintegration manifest as the runtime image/IMU contract."""
+
+    if not imu_priors:
+        return None, None
+
+    explicit = getattr(args, "imu_frame_manifest", None)
+    build_manifest = getattr(args, "imu_frames", None)
+    inferred = None
+    if getattr(args, "imu_prior", None):
+        inferred = Path(args.imu_prior).expanduser().resolve().parent / "frames.csv"
+
+    candidates = [
+        ("--imu_frame_manifest", explicit),
+        ("--imu_frames", build_manifest),
+        ("imu_prior sibling frames.csv", inferred),
+    ]
+    manifest_path = None
+    source = None
+    for candidate_source, candidate in candidates:
+        if candidate in (None, ""):
+            continue
+        candidate_path = Path(candidate).expanduser()
+        if candidate_path.is_file():
+            manifest_path = candidate_path.resolve()
+            source = candidate_source
+            break
+        if candidate_source != "imu_prior sibling frames.csv":
+            raise FileNotFoundError(
+                f"{candidate_source} does not exist: {candidate_path}"
             )
 
-            parsed = {
-                "frame_id": _to_int(row.get("frame_id"), frame_index),
-                "frame_index": frame_index,
-                "timestamp_sec": _to_float(row.get("timestamp_sec")),
-                "timestamp_ns": _to_int(row.get("timestamp_ns")),
-                "prev_timestamp_sec": _to_float(row.get("prev_timestamp_sec")),
-                "dt": _to_float(row.get("dt")),
-                "imu_count": _to_int(row.get("imu_count")),
-                "imu_used_steps": _to_int(
-                    row.get("imu_used_steps"),
-                    _to_int(row.get("imu_count")),
-                ),
-                "imu_valid": _to_int(row.get("imu_valid"), 1),
-                "imu_weight": _to_float(row.get("imu_weight"), 1.0),
-                "imu_reason": row.get("imu_reason", ""),
-                "dr_x": _to_float(row.get("dr_x")),
-                "dr_y": _to_float(row.get("dr_y")),
-                "dr_z": _to_float(row.get("dr_z")),
-                "dq_w": _to_float(row.get("dq_w"), 1.0),
-                "dq_x": _to_float(row.get("dq_x")),
-                "dq_y": _to_float(row.get("dq_y")),
-                "dq_z": _to_float(row.get("dq_z")),
-                "dv_x": _to_float(row.get("dv_x")),
-                "dv_y": _to_float(row.get("dv_y")),
-                "dv_z": _to_float(row.get("dv_z")),
-                "dp_x": _to_float(row.get("dp_x")),
-                "dp_y": _to_float(row.get("dp_y")),
-                "dp_z": _to_float(row.get("dp_z")),
-                "rot_var": _to_float(row.get("rot_var")),
-                "vel_var": _to_float(row.get("vel_var")),
-                "pos_var": _to_float(row.get("pos_var")),
-                "rot_info": _to_float(row.get("rot_info")),
-                "vel_info": _to_float(row.get("vel_info")),
-                "pos_info": _to_float(row.get("pos_info")),
-                "imu_extrinsic_applied": _to_int(row.get("imu_extrinsic_applied")),
-                "imu_translation_extrinsic_applied": _to_int(
-                    row.get("imu_translation_extrinsic_applied")
-                ),
-                "imu_to_cam_tx": _to_float(row.get("imu_to_cam_tx")),
-                "imu_to_cam_ty": _to_float(row.get("imu_to_cam_ty")),
-                "imu_to_cam_tz": _to_float(row.get("imu_to_cam_tz")),
-                "imu_calibration_source": row.get("imu_calibration_source", ""),
-            }
-            for prefix in IMU_BIAS_JACOBIAN_ORDER:
-                for i in range(3):
-                    for j in range(3):
-                        parsed[f"{prefix}_{i}{j}"] = _to_float(
-                            row.get(f"{prefix}_{i}{j}"),
-                            0.0,
-                        )
+    if manifest_path is None:
+        if getattr(args, "allow_legacy_imu_frame_mapping", False):
+            print(
+                "[IMU WARNING] no frames.csv mapping is available; using legacy "
+                "sorted-directory indices because --allow_legacy_imu_frame_mapping was set"
+            )
+            return None, None
+        raise FileNotFoundError(
+            "IMU runtime requires the frames.csv used to create imu_prior.csv. "
+            "Pass --imu_frame_manifest, retain frames.csv next to imu_prior.csv, "
+            "or explicitly opt in to the unsafe legacy mapping with "
+            "--allow_legacy_imu_frame_mapping."
+        )
 
-            priors[frame_index] = parsed
-
-    print(f"[IMU] loaded {len(priors)} imu priors from {imu_prior_path}")
-    return priors
+    frame_records = load_frame_manifest(manifest_path)
+    validate_frame_manifest_images(frame_records, Path(args.imagedir))
+    validate_frame_prior_mapping(frame_records, imu_priors)
+    print(
+        f"[IMU] frame mapping verified: source={source}, frames={len(frame_records)}, "
+        f"manifest={manifest_path}"
+    )
+    return str(manifest_path), frame_records
 
 
-def resolve_imu_camera_translation(args, imu_priors):
+def resolve_runtime_imu_calibration(args):
+    """Resolve the calibration the runtime believes was used for preintegration."""
+
+    if resolve_imu_calibration is None:
+        return None
+
+    has_runtime_calibration = any(
+        value is not None
+        for value in (
+            args.cam_sensor_yaml,
+            args.imu_sensor_yaml,
+            args.imu_to_cam_rotation,
+            args.imu_to_cam_translation,
+        )
+    )
+    if not has_runtime_calibration:
+        return None
+
+    try:
+        return resolve_imu_calibration(
+            cam_sensor_yaml=args.cam_sensor_yaml,
+            imu_sensor_yaml=args.imu_sensor_yaml,
+            imu_to_cam_rotation=args.imu_to_cam_rotation,
+            imu_to_cam_translation=args.imu_to_cam_translation,
+        )
+    except Exception as exc:
+        print(f"[IMU WARNING] failed to resolve runtime calibration: {exc}")
+        return None
+
+
+def _prior_calibration_fingerprint(imu_priors, runtime_calibration=None):
+    """Return a stable provenance digest for calibration-sensitive IMU inputs."""
+
+    if runtime_calibration is not None:
+        rotation = np.asarray(runtime_calibration.R_imu_to_camera, dtype=np.float64)
+        translation = np.asarray(
+            runtime_calibration.t_imu_to_camera,
+            dtype=np.float64,
+        )
+        values = [
+            *rotation.reshape(-1).tolist(),
+            *translation.tolist(),
+            float(runtime_calibration.gyro_noise_density),
+            float(runtime_calibration.gyro_random_walk),
+            float(runtime_calibration.accel_noise_density),
+            float(runtime_calibration.accel_random_walk),
+            float(runtime_calibration.extrinsic_applied),
+            float(runtime_calibration.translation_extrinsic_applied),
+        ]
+    elif imu_priors:
+        row = next(iter(imu_priors.values()))
+        values = [
+            *[
+                float(row.get(f"R_cam_imu_{i}{j}", 0.0))
+                for i in range(3)
+                for j in range(3)
+            ],
+            *[
+                float(row.get(key, 0.0))
+                for key in ("imu_to_cam_tx", "imu_to_cam_ty", "imu_to_cam_tz")
+            ],
+            *[
+                float(row.get(key, 0.0))
+                for key in (
+                    "gyro_noise_density",
+                    "gyro_random_walk",
+                    "accel_noise_density",
+                    "accel_random_walk",
+                )
+            ],
+            float(row.get("imu_extrinsic_applied", 0)),
+            float(row.get("imu_translation_extrinsic_applied", 0)),
+        ]
+    else:
+        return None
+
+    digest = hashlib.sha256()
+    digest.update(b"droid-imu-calibration-v1\0")
+    digest.update(
+        ",".join(f"{value:.12e}" for value in values).encode("ascii")
+    )
+    return digest.hexdigest()
+
+
+def validate_imu_calibration_contract(args, imu_priors, runtime_calibration):
+    """Reject a preintegrated CSV generated with a different IMU calibration."""
+
+    fingerprint = _prior_calibration_fingerprint(
+        imu_priors,
+        runtime_calibration,
+    )
+    if not imu_priors or runtime_calibration is None:
+        return fingerprint
+
+    row = next(iter(imu_priors.values()))
+    errors = []
+    tolerance = 1e-6
+
+    if bool(row.get("imu_extrinsic_applied", 0)) != bool(
+        runtime_calibration.extrinsic_applied
+    ):
+        errors.append("R_CI calibration-applied flag differs from imu_prior.csv")
+    if bool(row.get("imu_translation_extrinsic_applied", 0)) != bool(
+        runtime_calibration.translation_extrinsic_applied
+    ):
+        errors.append("t_CI calibration-applied flag differs from imu_prior.csv")
+
+    if int(row.get("imu_calibration_rotation_present", 0)):
+        prior_rotation = np.asarray(
+            [
+                row.get(f"R_cam_imu_{i}{j}", 0.0)
+                for i in range(3)
+                for j in range(3)
+            ],
+            dtype=np.float64,
+        ).reshape(3, 3)
+        runtime_rotation = np.asarray(
+            runtime_calibration.R_imu_to_camera,
+            dtype=np.float64,
+        )
+        if not np.allclose(prior_rotation, runtime_rotation, atol=tolerance, rtol=0.0):
+            errors.append("R_CI rotation differs from the calibration used by imu_prior.csv")
+
+    if int(row.get("imu_calibration_translation_present", 0)):
+        prior_translation = np.asarray(
+            [
+                row.get("imu_to_cam_tx", 0.0),
+                row.get("imu_to_cam_ty", 0.0),
+                row.get("imu_to_cam_tz", 0.0),
+            ],
+            dtype=np.float64,
+        )
+        runtime_translation = np.asarray(
+            runtime_calibration.t_imu_to_camera,
+            dtype=np.float64,
+        )
+        if not np.allclose(
+            prior_translation,
+            runtime_translation,
+            atol=tolerance,
+            rtol=0.0,
+        ):
+            errors.append("t_CI lever arm differs from the calibration used by imu_prior.csv")
+
+    if int(row.get("imu_calibration_noise_present", 0)):
+        prior_noise = np.asarray(
+            [
+                row.get("gyro_noise_density", 0.0),
+                row.get("gyro_random_walk", 0.0),
+                row.get("accel_noise_density", 0.0),
+                row.get("accel_random_walk", 0.0),
+            ],
+            dtype=np.float64,
+        )
+        runtime_noise = np.asarray(
+            [
+                runtime_calibration.gyro_noise_density,
+                runtime_calibration.gyro_random_walk,
+                runtime_calibration.accel_noise_density,
+                runtime_calibration.accel_random_walk,
+            ],
+            dtype=np.float64,
+        )
+        if not np.allclose(prior_noise, runtime_noise, atol=1e-12, rtol=1e-6):
+            errors.append("IMU noise/random-walk values differ from imu_prior.csv")
+
+    if errors:
+        message = (
+            "IMU calibration mismatch. Rebuild imu_prior.csv with the active "
+            "sensor calibration instead of mixing preintegration and runtime settings:\n  - "
+            + "\n  - ".join(errors)
+        )
+        if getattr(args, "allow_imu_calibration_mismatch", False):
+            print(f"[IMU WARNING] {message}")
+        else:
+            raise ValueError(message)
+
+    return fingerprint
+
+
+def resolve_imu_camera_translation(args, imu_priors, runtime_calibration=None):
     """Resolve the IMU-origin lever arm used by full position/velocity factors.
 
     The prior CSV stores this calibration when it was generated by the current
@@ -206,31 +379,17 @@ def resolve_imu_camera_translation(args, imu_priors):
     camera-centre model.
     """
 
-    if args.imu_to_cam_translation is not None:
-        translation = np.asarray(args.imu_to_cam_translation, dtype=np.float32)
-        return translation.tolist(), "cli_imu_to_cam_translation", True
-
-    if resolve_imu_calibration is not None and (
-        args.cam_sensor_yaml is not None or args.imu_sensor_yaml is not None
-    ):
-        try:
-            calibration = resolve_imu_calibration(
-                cam_sensor_yaml=args.cam_sensor_yaml,
-                imu_sensor_yaml=args.imu_sensor_yaml,
-                imu_to_cam_rotation=args.imu_to_cam_rotation,
+    if runtime_calibration is not None:
+        translation = np.asarray(
+            runtime_calibration.t_imu_to_camera,
+            dtype=np.float32,
+        )
+        if np.isfinite(translation).all():
+            return (
+                translation.tolist(),
+                str(runtime_calibration.source),
+                bool(runtime_calibration.translation_extrinsic_applied),
             )
-            translation = np.asarray(
-                calibration.t_imu_to_camera,
-                dtype=np.float32,
-            )
-            if np.isfinite(translation).all():
-                return (
-                    translation.tolist(),
-                    str(calibration.source),
-                    bool(calibration.translation_extrinsic_applied),
-                )
-        except Exception as exc:
-            print(f"[IMU WARNING] failed to resolve camera/IMU translation: {exc}")
 
     for row in imu_priors.values():
         translation = np.asarray(
@@ -381,7 +540,7 @@ def maybe_build_imu_prior_from_raw(args):
     return output
 
 
-def image_stream(imagedir, calib, stride, max_frames=None):
+def image_stream(imagedir, calib, stride, max_frames=None, frame_records=None):
     """
     image generator
 
@@ -448,40 +607,47 @@ def image_stream(imagedir, calib, stride, max_frames=None):
     # 3. 이미지 목록 구성
     ############################################################
 
-    # imagedir 안의 실제로 읽을 수 있는 이미지 파일명만 정렬한 뒤 stride 간격으로 선택
-    #
-    # sorted를 쓰는 이유:
-    #   프레임 순서가 중요하기 때문.
-    #
-    # [::stride]:
-    #   일정 간격으로 프레임을 샘플링.
-    valid_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-    imagedir_path = Path(imagedir)
-    skipped_missing = 0
-    image_list = []
-    for name in sorted(os.listdir(imagedir)):
-        if ":" in name or Path(name).suffix.lower() not in valid_exts:
-            continue
-
-        image_path = imagedir_path / name
-        if not image_path.is_file():
-            skipped_missing += 1
-            continue
-
-        image_list.append(name)
-
-    if skipped_missing > 0:
-        print(
-            f"[IMAGE_STREAM WARNING] skipped {skipped_missing} missing or broken image links in {imagedir}"
+    # With IMU, frames.csv is the source of truth. It carries the timestamp
+    # order used by preintegration and keeps a missing/corrupt image from
+    # silently renumbering all later IMU rows. Legacy visual-only runs retain
+    # the original sorted-directory behavior.
+    manifest_mode = frame_records is not None
+    if manifest_mode:
+        selected_records = selected_frame_records(
+            frame_records,
+            stride,
+            max_frames,
         )
+        image_records = [
+            (int(record["frame_index"]), str(record["filename"]))
+            for record in selected_records
+        ]
+    else:
+        valid_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+        imagedir_path = Path(imagedir)
+        skipped_missing = 0
+        image_list = []
+        for name in sorted(os.listdir(imagedir)):
+            if ":" in name or Path(name).suffix.lower() not in valid_exts:
+                continue
 
-    # Keep the original sorted-image index as the DROID timestamp. This matters
-    # when --stride > 1 and imu_prior.csv was built at the original camera rate:
-    # frame 0,2,4,... should look up IMU rows 0,2,4,... and MotionFilter can
-    # compose the skipped 0->2, 2->4 intervals into one preintegrated prior.
-    image_records = list(enumerate(image_list))[::stride]
-    if max_frames is not None and max_frames > 0:
-        image_records = image_records[:int(max_frames)]
+            image_path = imagedir_path / name
+            if not image_path.is_file():
+                skipped_missing += 1
+                continue
+
+            image_list.append(name)
+
+        if skipped_missing > 0:
+            print(
+                f"[IMAGE_STREAM WARNING] skipped {skipped_missing} missing or broken image links in {imagedir}"
+            )
+
+        # Legacy mode has no timestamp manifest. Preserve the historical index
+        # behavior only when the caller explicitly has no usable IMU contract.
+        image_records = list(enumerate(image_list))[::max(1, int(stride))]
+        if max_frames is not None and max_frames > 0:
+            image_records = image_records[:int(max_frames)]
 
     if len(image_records) == 0:
         raise RuntimeError(
@@ -501,6 +667,11 @@ def image_stream(imagedir, calib, stride, max_frames=None):
         image = cv2.imread(image_path)
 
         if image is None:
+            if manifest_mode:
+                raise RuntimeError(
+                    "frames.csv selected an unreadable image; refusing to skip it "
+                    f"and change the visual/IMU timeline: {image_path}"
+                )
             print(f"[IMAGE_STREAM WARNING] failed to read image: {image_path}")
             continue
 
@@ -583,6 +754,122 @@ def image_stream(imagedir, calib, stride, max_frames=None):
         yield t, image[None], intrinsics
 
 
+def _sha256_file(path):
+    """Return a content digest for a small run-input file, if it exists."""
+
+    if not path:
+        return None
+
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        return None
+
+    digest = hashlib.sha256()
+    with resolved.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _reconstruction_input_provenance(args):
+    """Describe the exact image and calibration input used by one run.
+
+    A reconstruction is otherwise only a tensor bundle.  Persisting this
+    compact fingerprint makes it possible for validation scripts to reject a
+    trajectory from another EuRoC sequence before it is accidentally reused.
+    """
+
+    if args is None or not getattr(args, "imagedir", None):
+        return None
+
+    image_dir = Path(args.imagedir).expanduser().resolve()
+    calibration = Path(getattr(args, "calib", "")).expanduser().resolve()
+    stride = max(1, int(getattr(args, "stride", 1) or 1))
+    max_frames = max(0, int(getattr(args, "max_frames", 0) or 0))
+    frame_records = getattr(args, "frame_records", None)
+    frame_manifest_path = getattr(args, "imu_frame_manifest_path", None)
+
+    if frame_records is not None:
+        selected_records = selected_frame_records(frame_records, stride, max_frames)
+        selected = [
+            (int(record["frame_index"]), str(record["filename"]))
+            for record in selected_records
+        ]
+        mapping_source = "frames_csv"
+        mapping_digest = frame_manifest_digest(frame_records)
+    else:
+        valid_extensions = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+        image_names = []
+        if image_dir.is_dir():
+            for name in sorted(os.listdir(image_dir)):
+                candidate = image_dir / name
+                if ":" in name or candidate.suffix.lower() not in valid_extensions:
+                    continue
+                if candidate.is_file():
+                    image_names.append(name)
+
+        selected = list(enumerate(image_names))[::stride]
+        if max_frames > 0:
+            selected = selected[:max_frames]
+        mapping_source = "legacy_sorted_directory"
+        mapping_digest = None
+
+    manifest = hashlib.sha256()
+    manifest.update(b"droid-reconstruction-input-v2\0")
+    manifest.update(str(image_dir).encode("utf-8", "surrogateescape"))
+    manifest.update(b"\0")
+    manifest.update(str(stride).encode("ascii"))
+    manifest.update(b"\0")
+    manifest.update(str(max_frames).encode("ascii"))
+    manifest.update(b"\0")
+    for original_index, name in selected:
+        manifest.update(f"{original_index}:{name}\n".encode("utf-8", "surrogateescape"))
+
+    imu_prior = getattr(args, "imu_prior", None)
+    imu_prior_path = (
+        str(Path(imu_prior).expanduser().resolve()) if imu_prior else None
+    )
+    cam_sensor_yaml = getattr(args, "cam_sensor_yaml", None)
+    imu_sensor_yaml = getattr(args, "imu_sensor_yaml", None)
+    cam_sensor_path = (
+        str(Path(cam_sensor_yaml).expanduser().resolve()) if cam_sensor_yaml else None
+    )
+    imu_sensor_path = (
+        str(Path(imu_sensor_yaml).expanduser().resolve()) if imu_sensor_yaml else None
+    )
+    return {
+        "version": 2,
+        "image_directory": str(image_dir),
+        "calibration_path": str(calibration),
+        "calibration_sha256": _sha256_file(calibration),
+        "stride": stride,
+        "max_frames": max_frames,
+        "selected_image_count": len(selected),
+        "first_selected_image": (
+            f"{selected[0][0]}:{selected[0][1]}" if selected else None
+        ),
+        "last_selected_image": (
+            f"{selected[-1][0]}:{selected[-1][1]}" if selected else None
+        ),
+        "sequence_sha256": manifest.hexdigest(),
+        "imu_prior_path": imu_prior_path,
+        "imu_prior_sha256": _sha256_file(imu_prior_path),
+        "frame_mapping_source": mapping_source,
+        "frames_csv_path": frame_manifest_path,
+        "frames_csv_sha256": _sha256_file(frame_manifest_path),
+        "frame_manifest_sha256": mapping_digest,
+        "imu_calibration_fingerprint": getattr(
+            args,
+            "imu_calibration_fingerprint",
+            None,
+        ),
+        "cam_sensor_yaml_path": cam_sensor_path,
+        "cam_sensor_yaml_sha256": _sha256_file(cam_sensor_path),
+        "imu_sensor_yaml_path": imu_sensor_path,
+        "imu_sensor_yaml_sha256": _sha256_file(imu_sensor_path),
+    }
+
+
 def save_reconstruction(droid, save_path):
     """
     DROID-SLAM 결과를 .pth 파일로 저장하는 함수.
@@ -635,6 +922,9 @@ def save_reconstruction(droid, save_path):
     ############################################################
 
     alignment_metrics = dict(getattr(video, "imu_alignment_metrics", {}) or {})
+    state_diagnostics = dict(
+        getattr(video, "imu_state_diagnostics", {}) or {}
+    )
     bias_refinement_history = list(
         getattr(video, "imu_bias_refinement_history", []) or []
     )
@@ -657,6 +947,9 @@ def save_reconstruction(droid, save_path):
         int(float(entry.get("updated", 0.0)) > 0.5)
         for entry in bias_refinement_history
         if isinstance(entry, dict)
+    )
+    input_provenance = _reconstruction_input_provenance(
+        getattr(droid, "args", None)
     )
 
     save_data = {
@@ -721,6 +1014,12 @@ def save_reconstruction(droid, save_path):
         "imu_vi_initialization_requested": vi_initialization_requested,
         "imu_alignment_source": alignment_source,
         "imu_alignment_metrics": alignment_metrics,
+        # Named snapshots isolate scale changes caused by VI initialization,
+        # local tracking, and the two offline backend passes.
+        "imu_state_diagnostics": state_diagnostics,
+        # Input provenance lets a later held-out evaluation prove that every
+        # reused reconstruction came from the requested sequence and sampling.
+        "input_provenance": input_provenance,
 
         # intrinsics
         "intrinsics": video.intrinsics[:t].cpu()
@@ -888,7 +1187,28 @@ if __name__ == '__main__':
     ############################################################
 
     parser.add_argument("--imu_prior", type=str, default=None, help="path to imu_prior.csv")
-    parser.add_argument("--imu_frames", type=str, default=None, help="path to frames.csv for building imu_prior.csv")
+    parser.add_argument(
+        "--imu_frames",
+        type=str,
+        default=None,
+        help="path to frames.csv for IMU preintegration and runtime frame mapping",
+    )
+    parser.add_argument(
+        "--imu_frame_manifest",
+        type=str,
+        default=None,
+        help="explicit frames.csv used to build --imu_prior; defaults to its sibling frames.csv",
+    )
+    parser.add_argument(
+        "--allow_legacy_imu_frame_mapping",
+        action="store_true",
+        help="unsafe compatibility mode: use sorted image-directory indices when frames.csv is unavailable",
+    )
+    parser.add_argument(
+        "--allow_imu_calibration_mismatch",
+        action="store_true",
+        help="unsafe compatibility mode: run even when runtime calibration differs from imu_prior.csv",
+    )
     parser.add_argument("--imu_csv", type=str, default=None, help="path to raw imu.csv for building imu_prior.csv")
     parser.add_argument("--imu_prior_output", type=str, default=None, help="output path when building imu_prior.csv")
     parser.add_argument("--build_imu_prior", action="store_true", help="build imu_prior.csv before running demo")
@@ -924,7 +1244,11 @@ if __name__ == '__main__':
     parser.add_argument("--imu_axis_sign_y", type=float, default=1.0)
     parser.add_argument("--imu_axis_sign_z", type=float, default=1.0)
     parser.add_argument("--imu_pose_inverse", action="store_true", help="invert IMU delta rotation before applying")
-    parser.add_argument("--use_imu_translation_prior", action="store_true", help="experimental: initialize pose translation from IMU dp")
+    parser.add_argument(
+        "--use_imu_translation_prior",
+        action="store_true",
+        help="deprecated unsafe direct dp pose prior; rejected in favor of the 9DoF position residual",
+    )
     parser.add_argument("--imu_translation_weight", type=float, default=0.0, help="scale for experimental IMU translation prior")
     parser.add_argument("--imu_translation_max", type=float, default=0.05, help="max translation delta from IMU prior")
     parser.add_argument("--use_imu_ba_prior", action="store_true", help="add rotation-only IMU normal-equation prior inside CUDA DBA")
@@ -1179,6 +1503,30 @@ if __name__ == '__main__':
     # demo.py는 monocular 입력을 기준으로 사용
     args.stereo = False
 
+    if args.use_imu_translation_prior:
+        raise ValueError(
+            "--use_imu_translation_prior is disabled for this visual-inertial "
+            "pipeline. A raw dp cannot be added directly to DROID's world-to-camera "
+            "translation; use the 9DoF position residual instead."
+        )
+
+    if args.use_imu_pose_prior and (
+        any(
+            abs(float(value) - 1.0) > 1e-12
+            for value in (
+                args.imu_axis_sign_x,
+                args.imu_axis_sign_y,
+                args.imu_axis_sign_z,
+            )
+        )
+        or args.imu_pose_inverse
+    ):
+        raise ValueError(
+            "legacy --imu_axis_sign_* and --imu_pose_inverse are disabled for "
+            "--use_imu_pose_prior. Apply R_CI during preintegration; pose prior "
+            "now follows --imu_full_compose_order/--imu_full_inverse exactly."
+        )
+
     if args.use_pose_velocity_imu_ba:
         args.use_full_imu_ba = True
         # A pose-velocity mode is intended to run the 9DoF factor inside the
@@ -1282,10 +1630,24 @@ if __name__ == '__main__':
     imu_priors = load_imu_priors(args.imu_prior)
     args.imu_priors = imu_priors
     (
+        args.imu_frame_manifest_path,
+        args.frame_records,
+    ) = resolve_runtime_frame_records(args, imu_priors)
+    runtime_imu_calibration = resolve_runtime_imu_calibration(args)
+    args.imu_calibration_fingerprint = validate_imu_calibration_contract(
+        args,
+        imu_priors,
+        runtime_imu_calibration,
+    )
+    (
         args.imu_camera_translation,
         args.imu_camera_translation_source,
         args.imu_translation_extrinsic_applied,
-    ) = resolve_imu_camera_translation(args, imu_priors)
+    ) = resolve_imu_camera_translation(
+        args,
+        imu_priors,
+        runtime_calibration=runtime_imu_calibration,
+    )
     translation = np.asarray(args.imu_camera_translation, dtype=np.float64)
     print(
         "[IMU] camera/IMU lever arm t_CI="
@@ -1375,7 +1737,13 @@ if __name__ == '__main__':
 
     # image_stream에서 frame을 하나씩 받아 DROID에 넣음
     for (t, image, intrinsics) in tqdm(
-        image_stream(args.imagedir, args.calib, args.stride, args.max_frames)
+        image_stream(
+            args.imagedir,
+            args.calib,
+            args.stride,
+            args.max_frames,
+            frame_records=args.frame_records,
+        )
     ):
 
         ########################################################
@@ -1464,7 +1832,13 @@ if __name__ == '__main__':
     #   PoseTrajectoryFiller가 원본 stream의 전체 frame에 대한 pose를 채울 때
     #   다시 이미지 stream을 참고할 수 있기 때문.
     traj_est = droid.terminate(
-        image_stream(args.imagedir, args.calib, args.stride, args.max_frames)
+        image_stream(
+            args.imagedir,
+            args.calib,
+            args.stride,
+            args.max_frames,
+            frame_records=args.frame_records,
+        )
     )
 
     if args.use_vi_initialization:

@@ -5,6 +5,23 @@ import torch
 
 IMU_BIAS_JACOBIAN_ORDER = ("J_R_bg", "J_v_ba", "J_v_bg", "J_p_ba", "J_p_bg")
 
+# Keep runtime, training, and validation on the same CSV contract. A malformed
+# value must not become a valid IMU factor just because another caller uses a
+# more permissive parser.
+IMU_PRIOR_NUMERIC_FIELDS = (
+    "frame_index", "frame_id", "timestamp_sec", "timestamp_ns",
+    "prev_frame_index", "prev_timestamp_sec", "prev_timestamp_ns", "dt",
+    "imu_count", "imu_used_steps", "imu_valid", "imu_weight",
+    "dr_x", "dr_y", "dr_z", "dq_w", "dq_x", "dq_y", "dq_z",
+    "dv_x", "dv_y", "dv_z", "dp_x", "dp_y", "dp_z",
+    "rot_var", "vel_var", "pos_var", "rot_info", "vel_info", "pos_info",
+    "imu_to_cam_tx", "imu_to_cam_ty", "imu_to_cam_tz",
+    "gyro_bias_x", "gyro_bias_y", "gyro_bias_z",
+    "acc_bias_x", "acc_bias_y", "acc_bias_z",
+    "gyro_noise_density", "gyro_random_walk",
+    "accel_noise_density", "accel_random_walk",
+)
+
 
 def _safe_float(value, default=0.0):
     try:
@@ -22,9 +39,37 @@ def _safe_int(value, default=0):
     try:
         if value is None or value == "":
             return default
-        return int(float(value))
+        out = float(value)
+        if math.isnan(out) or math.isinf(out):
+            return default
+        return int(out)
     except Exception:
         return default
+
+
+def _nonfinite_imu_fields(row):
+    """Return supplied numeric columns that are malformed, NaN, or Inf."""
+
+    fields = list(IMU_PRIOR_NUMERIC_FIELDS)
+    fields.extend(f"R_cam_imu_{i}{j}" for i in range(3) for j in range(3))
+    fields.extend(
+        f"{prefix}_{i}{j}"
+        for prefix in IMU_BIAS_JACOBIAN_ORDER
+        for i in range(3)
+        for j in range(3)
+    )
+
+    invalid = []
+    for field in fields:
+        value = row.get(field)
+        if value in (None, ""):
+            continue
+        try:
+            if not math.isfinite(float(value)):
+                invalid.append(field)
+        except (TypeError, ValueError, OverflowError):
+            invalid.append(field)
+    return invalid
 
 
 def _quat_normalize_xyzw(q):
@@ -403,7 +448,7 @@ def compose_imu_prior_rows(rows, prev_frame_index=None, frame_index=None):
     return out
 
 
-def load_imu_prior_csv(path):
+def load_imu_prior_csv(path, report=False):
     """
     imu_prior.csv를 frame_index 기준 dictionary로 로드한다.
 
@@ -418,28 +463,20 @@ def load_imu_prior_csv(path):
     """
 
     imu_priors = {}
+    invalid_rows = 0
 
     if path is None:
-        return None
+        return imu_priors
 
-    with open(path, "r", newline="") as f:
+    with open(path, "r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
 
-        for row in reader:
+        for row_number, row in enumerate(reader, start=2):
             def get_float(key, default=0.0):
-                value = row.get(key, default)
-                if value is None or value == "":
-                    return default
-                try:
-                    return float(value)
-                except Exception:
-                    return default
+                return _safe_float(row.get(key, default), default)
 
             def get_int(key, default=0):
-                try:
-                    return int(float(row.get(key, default)))
-                except Exception:
-                    return default
+                return _safe_int(row.get(key, default), default)
 
             if row.get("frame_index") not in (None, ""):
                 frame_index = get_int("frame_index", -1)
@@ -449,16 +486,23 @@ def load_imu_prior_csv(path):
                 frame_index = len(imu_priors)
 
             if frame_index < 0:
-                continue
+                raise ValueError(f"invalid frame_index in {path} at CSV row {row_number}")
+            if frame_index in imu_priors:
+                raise ValueError(
+                    f"duplicate frame_index={frame_index} in {path} at CSV row {row_number}"
+                )
 
             frame_id = get_int("frame_id", frame_index)
 
             parsed = {
                 "frame_id": frame_id,
                 "frame_index": frame_index,
+                "prev_frame_index": get_int("prev_frame_index", frame_index - 1),
+                "filename": str(row.get("filename", "")).strip().replace("\\", "/"),
                 "timestamp_sec": get_float("timestamp_sec", 0.0),
                 "timestamp_ns": get_int("timestamp_ns", 0),
                 "prev_timestamp_sec": get_float("prev_timestamp_sec", 0.0),
+                "prev_timestamp_ns": get_int("prev_timestamp_ns", 0),
                 "dt": get_float("dt", 0.0),
 
                 "dr_x": get_float("dr_x", 0.0),
@@ -478,10 +522,10 @@ def load_imu_prior_csv(path):
                 "dp_y": get_float("dp_y", 0.0),
                 "dp_z": get_float("dp_z", 0.0),
 
-                "imu_count": get_float("imu_count", 0.0),
-                "imu_used_steps": get_float(
+                "imu_count": get_int("imu_count", 0),
+                "imu_used_steps": get_int(
                     "imu_used_steps",
-                    get_float("imu_count", 0.0),
+                    get_int("imu_count", 0),
                 ),
                 "imu_valid": get_int("imu_valid", 1),
                 "imu_weight": get_float("imu_weight", 1.0),
@@ -499,8 +543,51 @@ def load_imu_prior_csv(path):
                 "gyro_random_walk": get_float("gyro_random_walk", 0.0),
                 "accel_random_walk": get_float("accel_random_walk", 0.0),
                 "imu_extrinsic_applied": get_int("imu_extrinsic_applied", 0),
+                "imu_translation_extrinsic_applied": get_int(
+                    "imu_translation_extrinsic_applied", 0
+                ),
+                "imu_to_cam_tx": get_float("imu_to_cam_tx", 0.0),
+                "imu_to_cam_ty": get_float("imu_to_cam_ty", 0.0),
+                "imu_to_cam_tz": get_float("imu_to_cam_tz", 0.0),
                 "imu_calibration_source": row.get("imu_calibration_source", ""),
+                "imu_calibration_rotation_present": int(
+                    all(
+                        row.get(f"R_cam_imu_{i}{j}") not in (None, "")
+                        for i in range(3)
+                        for j in range(3)
+                    )
+                ),
+                "imu_calibration_translation_present": int(
+                    all(
+                        row.get(key) not in (None, "")
+                        for key in ("imu_to_cam_tx", "imu_to_cam_ty", "imu_to_cam_tz")
+                    )
+                ),
+                "imu_calibration_noise_present": int(
+                    all(
+                        row.get(key) not in (None, "")
+                        for key in (
+                            "gyro_noise_density",
+                            "gyro_random_walk",
+                            "accel_noise_density",
+                            "accel_random_walk",
+                        )
+                    )
+                ),
+                "gyro_bias_x": get_float("gyro_bias_x", 0.0),
+                "gyro_bias_y": get_float("gyro_bias_y", 0.0),
+                "gyro_bias_z": get_float("gyro_bias_z", 0.0),
+                "acc_bias_x": get_float("acc_bias_x", 0.0),
+                "acc_bias_y": get_float("acc_bias_y", 0.0),
+                "acc_bias_z": get_float("acc_bias_z", 0.0),
+                "gyro_noise_density": get_float("gyro_noise_density", 0.0),
+                "accel_noise_density": get_float("accel_noise_density", 0.0),
             }
+            for i in range(3):
+                for j in range(3):
+                    parsed[f"R_cam_imu_{i}{j}"] = get_float(
+                        f"R_cam_imu_{i}{j}", 0.0
+                    )
             fallback_jac = _fallback_bias_jacobians(parsed["dt"])
             for prefix in IMU_BIAS_JACOBIAN_ORDER:
                 parsed.update(
@@ -510,8 +597,26 @@ def load_imu_prior_csv(path):
                     )
                 )
 
+            nonfinite = _nonfinite_imu_fields(row)
+            if nonfinite:
+                parsed["imu_valid"] = 0
+                parsed["imu_weight"] = 0.0
+                previous_reason = str(parsed.get("imu_reason", "")).strip()
+                suffix = f"nonfinite:{','.join(nonfinite[:3])}"
+                parsed["imu_reason"] = (
+                    f"{previous_reason}|{suffix}" if previous_reason else suffix
+                )
+                invalid_rows += 1
+
             imu_priors[frame_index] = parsed
 
+    if report:
+        print(f"[IMU] loaded {len(imu_priors)} imu priors from {path}")
+        if invalid_rows:
+            print(
+                f"[IMU WARNING] marked {invalid_rows} IMU prior rows invalid because "
+                "they contain malformed, NaN, or Inf numeric values"
+            )
     return imu_priors
 
 

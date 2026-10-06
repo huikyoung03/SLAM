@@ -4,7 +4,6 @@ import lietorch
 import math
 
 from collections import OrderedDict
-from droid_net import DroidNet
 
 import geom.projective_ops as pops
 from modules.corr import CorrBlock
@@ -15,6 +14,13 @@ try:
     from imu_prior import compose_imu_prior_rows
 except ImportError:
     from droid_slam.imu_prior import compose_imu_prior_rows
+
+try:
+    from imu_contract import make_invalid_imu_prior
+except ImportError:
+    from droid_slam.imu_contract import make_invalid_imu_prior
+
+from geom.imu_factor import predict_imu_rotation, rotvec_to_quat
 
 
 """
@@ -182,21 +188,36 @@ class MotionFilter:
         # 기본값 0.35 rad는 약 20도 정도다.
         self.imu_pose_max_rot = getattr(args, "imu_pose_max_rot", 0.35)
 
-        # IMU 좌표계와 카메라/DROID 좌표계 축 방향이 다를 수 있으므로
-        # x, y, z 축별 sign을 조정할 수 있게 한 옵션
-        #
-        # 예:
-        #   IMU x축이 카메라 x축과 반대라면 imu_axis_sign_x = -1
+        # These legacy pose-prior overrides are retained only to reject an
+        # unsafe invocation. Sensor-axis conversion belongs to preintegration,
+        # and pose-prior composition must use the same convention as 9DoF BA.
         self.imu_axis_sign_x = getattr(args, "imu_axis_sign_x", 1.0)
         self.imu_axis_sign_y = getattr(args, "imu_axis_sign_y", 1.0)
         self.imu_axis_sign_z = getattr(args, "imu_axis_sign_z", 1.0)
-
-        # IMU delta rotation을 inverse해서 사용할지 여부
-        #
-        # IMU preintegration 방향이 DROID pose convention과 반대일 경우 사용한다.
-        # 예:
-        #   dq가 prev->curr이 아니라 curr->prev 기준이면 inverse가 필요할 수 있다.
         self.imu_pose_inverse = getattr(args, "imu_pose_inverse", False)
+        self.imu_pose_compose_order = getattr(
+            args, "imu_full_compose_order", "dq_prev"
+        )
+        self.imu_pose_full_inverse = bool(
+            getattr(args, "imu_full_inverse", True)
+        )
+
+        if self.use_imu_pose_prior and (
+            any(
+                abs(float(value) - 1.0) > 1e-12
+                for value in (
+                    self.imu_axis_sign_x,
+                    self.imu_axis_sign_y,
+                    self.imu_axis_sign_z,
+                )
+            )
+            or self.imu_pose_inverse
+        ):
+            raise ValueError(
+                "legacy IMU pose axis/inverse overrides are incompatible with "
+                "the 9DoF BA convention; calibrate R_CI during preintegration "
+                "and use --imu_full_compose_order/--imu_full_inverse instead"
+            )
 
         ############################################################
         # 5. IMU translation prior 관련 옵션
@@ -224,6 +245,7 @@ class MotionFilter:
         # 사이가 여러 입력 frame을 건너뛸 수 있다. 이 dict가 있으면 마지막 selected
         # frame부터 현재 frame까지의 IMU prior를 합성해서 저장/pose prior에 사용한다.
         self.imu_priors = getattr(args, "imu_priors", None)
+        self._reported_imu_interval_failures = set()
 
         # Visual-inertial alignment is ill-conditioned when MotionFilter drops
         # most of the short startup motion.  Retain a bounded number of early
@@ -314,23 +336,37 @@ class MotionFilter:
         if imu_prior is None:
             return False
 
-        # imu_valid=0이면 preintegration 실패 또는 유효하지 않은 구간
-        if int(imu_prior.get("imu_valid", 1)) == 0:
+        try:
+            # imu_valid=0이면 preintegration 실패 또는 유효하지 않은 구간
+            if int(imu_prior.get("imu_valid", 1)) == 0:
+                return False
+
+            dt = float(imu_prior.get("dt", 0.0))
+            imu_count = int(imu_prior.get("imu_count", 0))
+            used_steps = int(
+                imu_prior.get("imu_used_steps", imu_prior.get("imu_count", 0))
+            )
+            motion_values = [
+                float(imu_prior.get(key, 0.0))
+                for key in (
+                    "dr_x",
+                    "dr_y",
+                    "dr_z",
+                    "dv_x",
+                    "dv_y",
+                    "dv_z",
+                    "dp_x",
+                    "dp_y",
+                    "dp_z",
+                )
+            ]
+        except (TypeError, ValueError, OverflowError):
             return False
 
-        # dt가 0 이하이면 시간 간격이 비정상적이므로 사용 불가
-        if float(imu_prior.get("dt", 0.0)) <= 0.0:
+        if not math.isfinite(dt) or not all(math.isfinite(value) for value in motion_values):
             return False
-
-        # IMU sample 수가 너무 적으면 적분값 신뢰도가 낮음
-        if int(imu_prior.get("imu_count", 0)) < 2:
+        if dt <= 0.0 or imu_count < 2 or used_steps < 1:
             return False
-
-        # imu_used_steps가 있으면 이를 사용하고,
-        # 없으면 imu_count를 fallback으로 사용
-        if int(imu_prior.get("imu_used_steps", imu_prior.get("imu_count", 0))) < 1:
-            return False
-
         return True
 
     def compute_imu_rotation_norm(self, imu_prior):
@@ -568,13 +604,23 @@ class MotionFilter:
         curr_index = self._frame_index_from_tstamp(curr_tstamp)
 
         if prev_index is None or curr_index is None or curr_index <= prev_index:
-            return fallback_imu_prior
+            return self._invalid_selected_imu_interval(
+                "invalid_selected_frame_interval",
+                prev_index,
+                curr_index,
+                fallback_imu_prior,
+            )
 
         rows = []
         for frame_index in range(prev_index + 1, curr_index + 1):
             row = self.imu_priors.get(frame_index)
             if row is None:
-                return fallback_imu_prior
+                return self._invalid_selected_imu_interval(
+                    "missing_interval_row",
+                    prev_index,
+                    curr_index,
+                    fallback_imu_prior,
+                )
             rows.append(row)
 
         composed = compose_imu_prior_rows(
@@ -583,7 +629,40 @@ class MotionFilter:
             frame_index=curr_index,
         )
 
-        return composed if composed is not None else fallback_imu_prior
+        if composed is None:
+            return self._invalid_selected_imu_interval(
+                "failed_interval_composition",
+                prev_index,
+                curr_index,
+                fallback_imu_prior,
+            )
+        return composed
+
+    def _invalid_selected_imu_interval(
+        self,
+        reason,
+        prev_index,
+        curr_index,
+        fallback_imu_prior,
+    ):
+        """Never reinterpret a short raw edge as a longer selected-frame edge."""
+
+        key = (str(reason), prev_index, curr_index)
+        reported = getattr(self, "_reported_imu_interval_failures", set())
+        if key not in reported:
+            print(
+                "[IMU WARNING] disabling selected-keyframe IMU edge: "
+                f"reason={reason}, previous={prev_index}, current={curr_index}"
+            )
+            reported.add(key)
+            self._reported_imu_interval_failures = reported
+
+        return make_invalid_imu_prior(
+            reason,
+            prev_frame_index=prev_index,
+            frame_index=curr_index,
+            fallback=fallback_imu_prior,
+        )
 
     def build_imu_pose_prior(self, imu_prior):
         """
@@ -646,11 +725,14 @@ class MotionFilter:
             ########################################################
 
             if self.use_imu_pose_prior:
-                # IMU axis-angle 누적 회전량 읽기
-                # 축 방향 보정을 위해 axis_sign을 곱함
-                dr_x = float(imu_prior.get("dr_x", 0.0)) * float(self.imu_axis_sign_x)
-                dr_y = float(imu_prior.get("dr_y", 0.0)) * float(self.imu_axis_sign_y)
-                dr_z = float(imu_prior.get("dr_z", 0.0)) * float(self.imu_axis_sign_z)
+                # Preintegration has already applied R_CI.  Keep this pose
+                # initialization on the exact quaternion convention used by
+                # the 9DoF residual instead of applying a second axis fix.
+                dr_x = float(imu_prior.get("dr_x", 0.0))
+                dr_y = float(imu_prior.get("dr_y", 0.0))
+                dr_z = float(imu_prior.get("dr_z", 0.0))
+                if not all(math.isfinite(value) for value in (dr_x, dr_y, dr_z)):
+                    return None
 
                 # IMU rotation prior 반영 강도 조절
                 dr_x *= float(self.imu_pose_rot_weight)
@@ -665,15 +747,24 @@ class MotionFilter:
                     float(self.imu_pose_max_rot),
                 )
 
-                # axis-angle -> quaternion
-                q_delta = self.axis_angle_to_quat(dr_x, dr_y, dr_z)
-
-                # 필요하면 inverse 적용
-                if self.imu_pose_inverse:
-                    q_delta = self.quat_inverse(q_delta)
-
-                # 이전 pose quaternion에 IMU delta rotation 합성
-                q_new = self.quat_multiply(q_prev, q_delta)
+                q_prev_tensor = torch.as_tensor(
+                    q_prev,
+                    dtype=prev_pose.dtype,
+                    device=prev_pose.device,
+                )
+                q_delta = rotvec_to_quat(
+                    torch.as_tensor(
+                        [dr_x, dr_y, dr_z],
+                        dtype=prev_pose.dtype,
+                        device=prev_pose.device,
+                    )
+                )
+                q_new = predict_imu_rotation(
+                    q_prev_tensor,
+                    q_delta,
+                    compose_order=self.imu_pose_compose_order,
+                    inverse_imu=self.imu_pose_full_inverse,
+                ).detach().cpu().tolist()
 
             else:
                 # rotation prior를 쓰지 않으면 이전 quaternion 유지

@@ -263,6 +263,34 @@ def _scalar_from_blob(blob, key, default=np.nan):
     return value if math.isfinite(value) else float(default)
 
 
+def _diagnostic_scalar(diagnostics, stage, key, default=np.nan):
+    if not isinstance(diagnostics, dict):
+        return float(default)
+    snapshot = diagnostics.get(stage, {})
+    if not isinstance(snapshot, dict):
+        return float(default)
+    try:
+        value = float(snapshot.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+    return value if math.isfinite(value) else float(default)
+
+
+def _diagnostic_vector_norm(diagnostics, stage, key, default=np.nan):
+    if not isinstance(diagnostics, dict):
+        return float(default)
+    snapshot = diagnostics.get(stage, {})
+    if not isinstance(snapshot, dict):
+        return float(default)
+    try:
+        value = np.asarray(snapshot.get(key), dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError):
+        return float(default)
+    if value.size < 3 or not np.isfinite(value[:3]).all():
+        return float(default)
+    return float(np.linalg.norm(value[:3]))
+
+
 def reconstruction_metric_metadata(blob, auto_metricize_imu=True):
     """Describe the length unit stored in one reconstruction blob.
 
@@ -282,6 +310,9 @@ def reconstruction_metric_metadata(blob, auto_metricize_imu=True):
     alignment_metrics = blob.get("imu_alignment_metrics", {})
     if not isinstance(alignment_metrics, dict):
         alignment_metrics = {}
+    state_diagnostics = blob.get("imu_state_diagnostics", {})
+    if not isinstance(state_diagnostics, dict):
+        state_diagnostics = {}
 
     history = blob.get("imu_bias_refinement_history", [])
     if not isinstance(history, (list, tuple)):
@@ -326,6 +357,38 @@ def reconstruction_metric_metadata(blob, auto_metricize_imu=True):
         "vi_init_edges": int(float(alignment_metrics.get("edges", 0.0))),
         "vi_init_backend_fallback": int(
             float(alignment_metrics.get("backend_fallback", 0.0)) > 0.5
+        ),
+        # These snapshots expose whether the scale/bias problem appeared in
+        # VI initialization or during a later frontend/backend pass.
+        "vi_init_unit_scale": _diagnostic_scalar(
+            state_diagnostics, "vi_init_committed", "imu_unit_scale"
+        ),
+        "post_frontend_unit_scale": _diagnostic_scalar(
+            state_diagnostics, "post_frontend", "imu_unit_scale"
+        ),
+        "post_backend_visual_unit_scale": _diagnostic_scalar(
+            state_diagnostics, "post_backend_visual", "imu_unit_scale"
+        ),
+        "post_backend_final_unit_scale": _diagnostic_scalar(
+            state_diagnostics, "post_backend_final", "imu_unit_scale"
+        ),
+        "vi_init_gravity_norm_mps2": _diagnostic_scalar(
+            state_diagnostics, "vi_init_committed", "gravity_metric_norm"
+        ),
+        "final_gravity_norm_mps2": _diagnostic_scalar(
+            state_diagnostics, "post_backend_final", "gravity_metric_norm"
+        ),
+        "vi_init_accel_bias_norm": _diagnostic_vector_norm(
+            state_diagnostics, "vi_init_committed", "global_accel_bias"
+        ),
+        "final_accel_bias_norm": _diagnostic_vector_norm(
+            state_diagnostics, "post_backend_final", "global_accel_bias"
+        ),
+        "vi_init_gyro_bias_norm": _diagnostic_vector_norm(
+            state_diagnostics, "vi_init_committed", "global_gyro_bias"
+        ),
+        "final_gyro_bias_norm": _diagnostic_vector_norm(
+            state_diagnostics, "post_backend_final", "global_gyro_bias"
         ),
         "bias_refine_attempts": attempts,
         "bias_refine_updates": updates,
