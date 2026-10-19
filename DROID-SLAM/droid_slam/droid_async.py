@@ -11,7 +11,10 @@ from droid_frontend import DroidFrontend
 from droid_backend import DroidAsyncBackend
 from trajectory_filler import PoseTrajectoryFiller
 from align import align_pose_fragements
-from imu_runtime import apply_learned_imu_ba_weight
+from imu_runtime import (
+    apply_learned_imu_ba_weight,
+    configure_confidence_only_imu_weighting,
+)
 
 from collections import OrderedDict
 from torch.multiprocessing import Process
@@ -53,6 +56,19 @@ def backend_process(args, depth_video1, depth_video2, device="cuda"):
 
     with torch.no_grad():
         net = load_network(args.weights, device=device)
+        if getattr(args, "use_dvi_imu_quality_fusion", False):
+            loaded_keys = getattr(net, "_loaded_state_keys", set())
+            has_dvi_quality_head = any(
+                key.startswith("update.dvi_imu_quality_fusion.")
+                for key in loaded_keys
+            )
+            if not has_dvi_quality_head:
+                net.initialize_dvi_imu_quality_fusion()
+                print(
+                    "[IMU] initialized scalar DVI IMU-quality fusion from "
+                    "an older checkpoint; quality contribution is neutral"
+                )
+        configure_confidence_only_imu_weighting(args, source="async_backend")
         apply_learned_imu_ba_weight(args, net, source="async_backend")
 
         # use more compute if running backend on seperate device
@@ -193,6 +209,21 @@ class DroidAsync:
         )
 
         net = load_network(args.weights, device=self.frontend_device)
+        if getattr(args, "use_dvi_imu_quality_fusion", False):
+            loaded_keys = getattr(net, "_loaded_state_keys", set())
+            has_dvi_quality_head = any(
+                key.startswith("update.dvi_imu_quality_fusion.")
+                for key in loaded_keys
+            )
+            if not has_dvi_quality_head:
+                net.initialize_dvi_imu_quality_fusion()
+                print(
+                    "[IMU] initialized scalar DVI IMU-quality fusion from "
+                    "an older checkpoint; quality contribution is neutral"
+                )
+        configure_confidence_only_imu_weighting(
+            self.args, source="async_frontend"
+        )
         apply_learned_imu_ba_weight(self.args, net, source="async_frontend")
 
         self.video1 = DepthVideo(

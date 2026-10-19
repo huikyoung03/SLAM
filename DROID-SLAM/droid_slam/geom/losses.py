@@ -733,15 +733,21 @@ def imu_confidence_nll_loss(
             continue
         confidence = confidence.to(device=pose_data.device, dtype=pose_data.dtype)
         if confidence.ndim == 1:
-            confidence = confidence.unsqueeze(0)
-        if confidence.ndim != 2:
+            confidence = confidence.unsqueeze(0).unsqueeze(-1)
+        elif confidence.ndim == 2:
+            confidence = confidence.unsqueeze(-1)
+        if confidence.ndim != 3:
             raise ValueError(
-                "imu confidence must be [N] or [B, N] after temporal aggregation, "
+                "imu confidence must be [N], [B, N], or [B, N, 1|3] after temporal aggregation, "
                 f"got {tuple(confidence.shape)}"
             )
         if confidence.shape[0] == 1 and batch > 1:
-            confidence = confidence.expand(batch, -1)
-        if confidence.shape[0] != batch or confidence.shape[1] < num_frames:
+            confidence = confidence.expand(batch, -1, -1)
+        if (
+            confidence.shape[0] != batch
+            or confidence.shape[1] < num_frames
+            or confidence.shape[-1] not in (1, 3)
+        ):
             raise ValueError(
                 "imu confidence does not cover the full pose sequence: "
                 f"confidence={tuple(confidence.shape)}, poses={tuple(pose_data.shape)}"
@@ -772,25 +778,52 @@ def imu_confidence_nll_loss(
             return_mask=True,
         )
 
-        energy = (
-            scalar_weight(pos_weight, r_p) * r_p.square().mean(dim=-1)
-            + scalar_weight(vel_weight, r_v) * r_v.square().mean(dim=-1)
-            + scalar_weight(rot_weight, r_R) * r_R.square().mean(dim=-1)
-        )
-        valid = mask & torch.isfinite(energy)
-        if not bool(valid.any().detach().cpu().item()):
-            continue
+        pos_energy = scalar_weight(pos_weight, r_p) * r_p.square().mean(dim=-1)
+        vel_energy = scalar_weight(vel_weight, r_v) * r_v.square().mean(dim=-1)
+        rot_energy = scalar_weight(rot_weight, r_R) * r_R.square().mean(dim=-1)
 
-        normalizer = energy.detach()[valid].median().clamp_min(1e-6)
-        normalized_energy = (energy.detach() / normalizer).clamp(max=100.0)
-        factor_confidence = confidence[:, 1:num_frames].clamp(1e-4, 1.0 - 1e-4)
-        nll = factor_confidence * normalized_energy - torch.log(factor_confidence)
-        step_loss = nll[valid].mean()
+        if confidence.shape[-1] == 1:
+            # Preserve the original scalar-confidence objective exactly for
+            # old checkpoints and scalar-head ablations.
+            energy = pos_energy + vel_energy + rot_energy
+            valid = mask & torch.isfinite(energy)
+            if not bool(valid.any().detach().cpu().item()):
+                continue
+            normalizer = energy.detach()[valid].median().clamp_min(1e-6)
+            normalized_energy = (energy.detach() / normalizer).clamp(max=100.0)
+            factor_confidence = confidence[:, 1:num_frames, 0].clamp(1e-4, 1.0 - 1e-4)
+            nll = factor_confidence * normalized_energy - torch.log(factor_confidence)
+            step_loss = nll[valid].mean()
+            confidence_for_metric = factor_confidence[valid]
+        else:
+            # Component channel order is [rotation, velocity, position].
+            # Each category receives an independent normalized energy so a
+            # large translation unit cannot dominate gyro confidence learning.
+            component_energy = torch.stack(
+                [rot_energy, vel_energy, pos_energy], dim=-1
+            )
+            valid = mask & torch.isfinite(component_energy).all(dim=-1)
+            if not bool(valid.any().detach().cpu().item()):
+                continue
+            masked_energy = torch.where(
+                valid[..., None],
+                component_energy.detach(),
+                torch.full_like(component_energy, float("nan")),
+            )
+            normalizer = torch.nanmedian(masked_energy, dim=1, keepdim=True).values
+            normalizer = torch.where(
+                torch.isfinite(normalizer), normalizer, torch.ones_like(normalizer)
+            ).clamp_min(1e-6)
+            normalized_energy = (component_energy.detach() / normalizer).clamp(max=100.0)
+            factor_confidence = confidence[:, 1:num_frames].clamp(1e-4, 1.0 - 1e-4)
+            nll = factor_confidence * normalized_energy - torch.log(factor_confidence)
+            step_loss = nll[valid].mean()
+            confidence_for_metric = factor_confidence[valid]
         step_weight = float(gamma) ** (steps - step_index - 1)
         total = step_loss * step_weight if total is None else total + step_loss * step_weight
         total_weight += step_weight
         total_edges += int(valid.sum().detach().cpu().item())
-        last_confidence_mean = factor_confidence[valid].mean()
+        last_confidence_mean = confidence_for_metric.mean()
 
     if total is None:
         zero = poses_est[-1].data.sum() * 0.0
@@ -809,6 +842,461 @@ def imu_confidence_nll_loss(
             if last_confidence_mean is not None
             else 0.0
         ),
+    }
+
+
+def imu_confidence_pose_prior_ranking_loss(
+    pose_only_poses,
+    pose_only_confidence,
+    imu_delta,
+    imu_valid=None,
+    imu_info=None,
+    imu_info_reference=None,
+    imu_bias_jacobian=None,
+    gyro_bias=None,
+    accel_bias=None,
+    gravity=None,
+    imu_camera_translation=None,
+    max_residual=None,
+    pos_weight=0.05,
+    vel_weight=0.05,
+    rot_weight=1.0,
+    imu_compose_order="dq_prev",
+    imu_inverse=True,
+    imu_optimize_bias=True,
+    augmented_mask=None,
+    absolute_weight=0.0,
+    energy_log_reference=None,
+    energy_reference_momentum=0.98,
+    energy_temperature=0.75,
+    absolute_target_mode="median_residual",
+    quality_only_confidence=None,
+):
+    """Supervise confidence from the *visual-only* pose/IMU disagreement.
+
+    This intentionally does not inspect a pose that has already gone through
+    full IMU DBA.  ``pose_only_poses`` is the final estimate of the visual
+    prefix, so it is an independent reference for each IMU interval.
+
+    The ranking term teaches interval ordering: if visual pose ``i``
+    disagrees with its IMU prior more than visual pose ``j``, confidence ``i``
+    must be lower.  When ``absolute_weight`` is positive, the same *pre-BA*
+    disagreement additionally produces an absolute confidence target.  In
+    ``median_residual`` mode that target is fully data-derived from a robust
+    running log-energy reference. In ``nominal_clean`` mode, the supplied IMU
+    covariance defines a clean, uncorrupted interval as the nominal factor
+    (confidence one). ``split_nominal_quality`` keeps this nominal convention
+    only for the raw-IMU quality branch; the final visual-GRU+quality factor
+    confidence keeps its residual-derived target. In
+    ``one_sided_nominal_quality`` mode, normal clean residuals retain full
+    confidence and only their high-residual tail is attenuated. Runtime still
+    consumes one scalar per factor: these modes alter supervision, not the BA
+    weighting topology.
+
+    When synthetic degradation is supplied, every bad-vs-clean pair is also
+    ordered as ``c_bad < c_clean``.  This makes raw-noise, drift, and short
+    dropout augmentation observable even for a nearly static camera, where a
+    pose residual alone can be ambiguous.
+    """
+
+    if (
+        pose_only_poses is None
+        or pose_only_confidence is None
+        or imu_delta is None
+    ):
+        if pose_only_poses is not None:
+            zero = _pose_data(pose_only_poses).sum() * 0.0
+        elif torch.is_tensor(imu_delta):
+            zero = imu_delta.sum() * 0.0
+        else:
+            zero = torch.zeros(())
+        return zero, {
+            "imu_confidence_pose_prior": 0.0,
+            "imu_confidence_pose_prior_ranking": 0.0,
+            "imu_confidence_pose_prior_absolute": 0.0,
+            "imu_confidence_pose_prior_quality_only_absolute": 0.0,
+            "imu_confidence_pose_prior_target_mean": 0.0,
+            "imu_confidence_pose_prior_energy_log_reference": float("nan"),
+            "imu_confidence_pose_prior_pairs": 0.0,
+            "imu_confidence_pose_prior_aug_pairs": 0.0,
+            "imu_confidence_pose_prior_clean_mean": 0.0,
+            "imu_confidence_pose_prior_aug_mean": 0.0,
+        }
+
+    pose_data = _pose_data(pose_only_poses)
+    batch, num_frames = pose_data.shape[:2]
+    if num_frames < 3:
+        zero = pose_data.sum() * 0.0
+        return zero, {
+            "imu_confidence_pose_prior": 0.0,
+            "imu_confidence_pose_prior_ranking": 0.0,
+            "imu_confidence_pose_prior_absolute": 0.0,
+            "imu_confidence_pose_prior_quality_only_absolute": 0.0,
+            "imu_confidence_pose_prior_target_mean": 0.0,
+            "imu_confidence_pose_prior_energy_log_reference": float("nan"),
+            "imu_confidence_pose_prior_pairs": 0.0,
+            "imu_confidence_pose_prior_aug_pairs": 0.0,
+            "imu_confidence_pose_prior_clean_mean": 0.0,
+            "imu_confidence_pose_prior_aug_mean": 0.0,
+        }
+
+    confidence = pose_only_confidence.to(device=pose_data.device, dtype=pose_data.dtype)
+    if confidence.ndim == 1:
+        confidence = confidence.unsqueeze(0).unsqueeze(-1)
+    elif confidence.ndim == 2:
+        confidence = confidence.unsqueeze(-1)
+    if confidence.ndim != 3 or confidence.shape[-1] != 1:
+        raise ValueError(
+            "pose-only scalar IMU confidence must be [B, N] or [B, N, 1], got "
+            f"{tuple(confidence.shape)}"
+        )
+    if confidence.shape[0] == 1 and batch > 1:
+        confidence = confidence.expand(batch, -1, -1)
+    if confidence.shape[0] != batch or confidence.shape[1] < num_frames:
+        raise ValueError(
+            "pose-only confidence does not cover pose sequence: "
+            f"confidence={tuple(confidence.shape)}, poses={tuple(pose_data.shape)}"
+        )
+
+    quality_confidence = None
+    if quality_only_confidence is not None:
+        quality_confidence = quality_only_confidence.to(
+            device=pose_data.device, dtype=pose_data.dtype
+        )
+        if quality_confidence.ndim == 1:
+            quality_confidence = quality_confidence.unsqueeze(0)
+        if quality_confidence.ndim == 3 and quality_confidence.shape[-1] == 1:
+            quality_confidence = quality_confidence[..., 0]
+        if quality_confidence.ndim != 2:
+            raise ValueError(
+                "quality_only_confidence must be [B, N] or [B, N, 1], got "
+                f"{tuple(quality_only_confidence.shape)}"
+            )
+        if quality_confidence.shape[0] == 1 and batch > 1:
+            quality_confidence = quality_confidence.expand(batch, -1)
+        if (
+            quality_confidence.shape[0] != batch
+            or quality_confidence.shape[1] < num_frames
+        ):
+            raise ValueError(
+                "quality_only_confidence does not cover pose sequence: "
+                f"confidence={tuple(quality_confidence.shape)}, "
+                f"poses={tuple(pose_data.shape)}"
+            )
+        quality_confidence = quality_confidence[:, :num_frames]
+
+    # No local velocity/bias from a later full-IMU solve is accepted here.
+    # `_pose_velocity_motion` inside the residual derives velocity exclusively
+    # from this visual pose prefix; local biases are zero in this supervision.
+    r_p, r_v, r_R, _, _, valid = full_preintegration_residual(
+        pose_only_poses,
+        imu_delta,
+        imu_valid=imu_valid,
+        imu_info=imu_info,
+        imu_info_reference=imu_info_reference,
+        imu_bias_jacobian=imu_bias_jacobian,
+        imu_motion=None,
+        gyro_bias=gyro_bias,
+        accel_bias=accel_bias,
+        gravity=gravity,
+        imu_camera_translation=imu_camera_translation,
+        imu_compose_order=imu_compose_order,
+        imu_inverse=imu_inverse,
+        max_residual=max_residual,
+        # The quality ordering must be driven by the pose/prior mismatch, not
+        # cancelled by the covariance reduction we intentionally inject for a
+        # dropout.  IMU information remains an input to the quality head.
+        use_imu_info_weighting=False,
+        imu_optimize_bias=imu_optimize_bias,
+        return_mask=True,
+    )
+
+    def scalar_weight(value, anchor):
+        if torch.is_tensor(value):
+            return value.to(device=anchor.device, dtype=anchor.dtype).reshape(())
+        return anchor.new_tensor(float(value))
+
+    energy = (
+        scalar_weight(pos_weight, r_p) * r_p.square().mean(dim=-1)
+        + scalar_weight(vel_weight, r_v) * r_v.square().mean(dim=-1)
+        + scalar_weight(rot_weight, r_R) * r_R.square().mean(dim=-1)
+    ).detach()
+    valid = valid & torch.isfinite(energy)
+    logits = torch.logit(
+        confidence[:, 1:num_frames, 0].clamp(1e-5, 1.0 - 1e-5)
+    )
+
+    augmented = torch.zeros_like(valid)
+    if augmented_mask is not None:
+        augmented = augmented_mask.to(device=pose_data.device, dtype=torch.bool)
+        if augmented.ndim == 1:
+            augmented = augmented.unsqueeze(0)
+        if augmented.shape[0] == 1 and batch > 1:
+            augmented = augmented.expand(batch, -1)
+        if augmented.shape[0] != batch or augmented.shape[1] < num_frames:
+            raise ValueError(
+                "augmented_mask must cover the pose sequence: "
+                f"mask={tuple(augmented.shape)}, poses={tuple(pose_data.shape)}"
+            )
+        augmented = augmented[:, 1:num_frames]
+
+    absolute_weight = float(absolute_weight)
+    if absolute_weight < 0.0:
+        raise ValueError(f"absolute_weight must be non-negative, got {absolute_weight}")
+    energy_temperature = float(energy_temperature)
+    if energy_temperature <= 0.0:
+        raise ValueError(
+            f"energy_temperature must be positive, got {energy_temperature}"
+        )
+    energy_reference_momentum = float(energy_reference_momentum)
+    if not 0.0 <= energy_reference_momentum < 1.0:
+        raise ValueError(
+            "energy_reference_momentum must be in [0, 1), got "
+            f"{energy_reference_momentum}"
+        )
+
+    # Absolute calibration is intentionally based on the same visual-only
+    # pose/IMU residual as ranking.  The reference is updated from *clean*
+    # intervals only, so train-time corruption is correctly treated as an
+    # out-of-distribution quality drop rather than redefining "normal" IMU.
+    absolute_loss = confidence.sum() * 0.0
+    quality_only_absolute_loss = confidence.sum() * 0.0
+    absolute_target_mean = 0.0
+    absolute_target_clean_mean = 0.0
+    absolute_target_augmented_mean = 0.0
+    quality_target_mean = 0.0
+    quality_target_clean_mean = 0.0
+    quality_target_augmented_mean = 0.0
+    energy_reference_value = float("nan")
+    if absolute_weight > 0.0 and bool(valid.any().detach().cpu().item()):
+        log_energy = torch.log1p(energy.clamp_min(0.0))
+        reference_mask = valid & ~augmented
+        if not bool(reference_mask.any().detach().cpu().item()):
+            reference_mask = valid
+        # Residual-centred modes use the clean median, which maps a normal
+        # interval to a target of 0.5. For confidence-only IMU weighting the
+        # supplied covariance already represents nominal information, so the
+        # one-sided mode instead learns the clean 90th-percentile residual and
+        # attenuates only above that data-derived tail threshold.
+        if absolute_target_mode == "one_sided_nominal_quality":
+            batch_reference = torch.quantile(
+                log_energy[reference_mask], 0.90
+            ).detach()
+        else:
+            batch_reference = torch.median(log_energy[reference_mask]).detach()
+
+        if energy_log_reference is not None:
+            if not torch.is_tensor(energy_log_reference) or energy_log_reference.numel() != 1:
+                raise ValueError(
+                    "energy_log_reference must be a scalar tensor when provided"
+                )
+            reference_tensor = energy_log_reference.to(
+                device=pose_data.device, dtype=pose_data.dtype
+            )
+            previous_reference = reference_tensor.detach()
+            if torch.isfinite(previous_reference):
+                active_reference = previous_reference
+                updated_reference = (
+                    energy_reference_momentum * previous_reference
+                    + (1.0 - energy_reference_momentum) * batch_reference
+                )
+            else:
+                active_reference = batch_reference
+                updated_reference = batch_reference
+            with torch.no_grad():
+                energy_log_reference.copy_(updated_reference.to(energy_log_reference))
+        else:
+            active_reference = batch_reference
+
+        residual_targets = torch.sigmoid(
+            (active_reference - log_energy) / energy_temperature
+        ).detach()
+        if absolute_target_mode == "median_residual":
+            direct_targets = residual_targets
+            quality_targets = residual_targets
+        elif absolute_target_mode == "nominal_clean":
+            # `imu_info` already represents the nominal raw-IMU covariance.
+            # A confidence value is therefore an *extra*, relative information
+            # correction: it must not attenuate intervals that were neither
+            # corrupted nor identified as an abnormal raw-IMU sample.  The
+            # synthetic corruption keeps its residual-derived target and the
+            # ranking loss still lets a visual/IMU disagreement lower it.
+            direct_targets = torch.where(
+                augmented,
+                residual_targets,
+                torch.ones_like(residual_targets),
+            )
+            quality_targets = direct_targets
+        elif absolute_target_mode == "split_nominal_quality":
+            # The raw-quality MLP has no visual context. Its calibration is
+            # therefore relative to the supplied IMU covariance: untouched
+            # intervals retain nominal information, while corrupted intervals
+            # learn a residual-derived attenuation. The fused DVI confidence
+            # does have visual context, so it remains free to lower confidence
+            # wherever the visual pose and IMU prior disagree.
+            direct_targets = residual_targets
+            quality_targets = torch.where(
+                augmented,
+                residual_targets,
+                torch.ones_like(residual_targets),
+            )
+        elif absolute_target_mode == "one_sided_nominal_quality":
+            # A residual in the normal clean range is not evidence that this
+            # IMU factor is bad. Leave it at full covariance-relative
+            # strength; smoothly lower only the high-residual tail. Synthetic
+            # corruption remains residual-supervised and is also constrained
+            # by the bad-vs-clean ranking term below.
+            direct_targets = torch.where(
+                augmented,
+                residual_targets,
+                torch.exp(
+                    -((log_energy - active_reference).clamp_min(0.0))
+                    / energy_temperature
+                ),
+            )
+            # Raw quality has no visual context. Untouched IMU is nominal;
+            # corrupted IMU receives the same residual-derived correction.
+            quality_targets = torch.where(
+                augmented,
+                residual_targets,
+                torch.ones_like(residual_targets),
+            )
+        else:
+            raise ValueError(
+                "absolute_target_mode must be 'median_residual', 'nominal_clean', "
+                "'split_nominal_quality', or 'one_sided_nominal_quality', got "
+                f"{absolute_target_mode!r}"
+            )
+        direct_confidence = confidence[:, 1:num_frames, 0].clamp(1e-5, 1.0 - 1e-5)
+        absolute_loss = torch.nn.functional.binary_cross_entropy(
+            direct_confidence[valid], direct_targets[valid]
+        )
+        if quality_confidence is not None:
+            quality_factor = quality_confidence[:, 1:num_frames].clamp(1e-5, 1.0 - 1e-5)
+            quality_only_absolute_loss = torch.nn.functional.binary_cross_entropy(
+                quality_factor[valid], quality_targets[valid]
+            )
+            absolute_loss = 0.5 * (absolute_loss + quality_only_absolute_loss)
+
+        absolute_target_mean = float(direct_targets[valid].mean().detach().item())
+        quality_target_mean = float(quality_targets[valid].mean().detach().item())
+        clean_target_mask = valid & ~augmented
+        augmented_target_mask = valid & augmented
+        if bool(clean_target_mask.any().detach().cpu().item()):
+            absolute_target_clean_mean = float(
+                direct_targets[clean_target_mask].mean().detach().item()
+            )
+            quality_target_clean_mean = float(
+                quality_targets[clean_target_mask].mean().detach().item()
+            )
+        if bool(augmented_target_mask.any().detach().cpu().item()):
+            absolute_target_augmented_mean = float(
+                direct_targets[augmented_target_mask].mean().detach().item()
+            )
+            quality_target_augmented_mean = float(
+                quality_targets[augmented_target_mask].mean().detach().item()
+            )
+        energy_reference_value = float(active_reference.detach().item())
+
+    pair_losses = []
+    aug_pair_losses = []
+    pair_count = 0
+    aug_pair_count = 0
+    clean_confidences = []
+    augmented_confidences = []
+    for batch_index in range(batch):
+        row_valid = valid[batch_index]
+        if int(row_valid.sum().detach().item()) >= 2:
+            row_energy = energy[batch_index, row_valid]
+            row_logits = logits[batch_index, row_valid]
+            # Strict upper triangle prevents each ordering constraint from
+            # being counted twice.  Log energy keeps a rare extreme interval
+            # from setting a numerical scale for all other pairs.
+            energy_order = torch.log1p(row_energy.clamp_min(0.0))
+            upper = torch.triu(
+                torch.ones(
+                    (row_energy.numel(), row_energy.numel()),
+                    device=pose_data.device,
+                    dtype=torch.bool,
+                ),
+                diagonal=1,
+            )
+            higher_energy = energy_order[:, None] > energy_order[None, :]
+            lower_energy = energy_order[:, None] < energy_order[None, :]
+            ordered = upper & (higher_energy | lower_energy)
+            if bool(ordered.any().detach().cpu().item()):
+                sign = torch.where(higher_energy, 1.0, -1.0)
+                # Higher visual/IMU disagreement => lower confidence logit.
+                ranking = torch.nn.functional.softplus(
+                    sign * (row_logits[:, None] - row_logits[None, :])
+                )
+                pair_losses.append(ranking[ordered].mean())
+                pair_count += int(ordered.sum().detach().item())
+
+        bad = row_valid & augmented[batch_index]
+        clean = row_valid & ~augmented[batch_index]
+        if bool(bad.any().detach().cpu().item()) and bool(clean.any().detach().cpu().item()):
+            # Synthetic corruption has an unambiguous ordering label.  It is
+            # still only a relative constraint, so it cannot become a second
+            # global attenuation parameter.
+            bad_logits = logits[batch_index, bad]
+            clean_logits = logits[batch_index, clean]
+            aug_ranking = torch.nn.functional.softplus(
+                bad_logits[:, None] - clean_logits[None, :]
+            )
+            aug_pair_losses.append(aug_ranking.mean())
+            aug_pair_count += int(aug_ranking.numel())
+
+        row_confidence = confidence[batch_index, 1:num_frames, 0]
+        if bool((row_valid & ~augmented[batch_index]).any().detach().cpu().item()):
+            clean_confidences.append(row_confidence[row_valid & ~augmented[batch_index]])
+        if bool((row_valid & augmented[batch_index]).any().detach().cpu().item()):
+            augmented_confidences.append(row_confidence[row_valid & augmented[batch_index]])
+
+    terms = []
+    if pair_losses:
+        terms.append(torch.stack(pair_losses).mean())
+    if aug_pair_losses:
+        terms.append(torch.stack(aug_pair_losses).mean())
+    ranking_total = (
+        torch.stack(terms).mean() if terms else confidence.sum() * 0.0
+    )
+    total = ranking_total + absolute_weight * absolute_loss
+
+    clean_mean = (
+        torch.cat(clean_confidences).mean()
+        if clean_confidences
+        else total.detach() * 0.0
+    )
+    augmented_mean = (
+        torch.cat(augmented_confidences).mean()
+        if augmented_confidences
+        else total.detach() * 0.0
+    )
+    return total, {
+        "imu_confidence_pose_prior": float(total.detach().item()),
+        "imu_confidence_pose_prior_ranking": float(ranking_total.detach().item()),
+        "imu_confidence_pose_prior_absolute": float(absolute_loss.detach().item()),
+        "imu_confidence_pose_prior_quality_only_absolute": float(
+            quality_only_absolute_loss.detach().item()
+        ),
+        "imu_confidence_pose_prior_target_mean": absolute_target_mean,
+        "imu_confidence_pose_prior_target_clean_mean": absolute_target_clean_mean,
+        "imu_confidence_pose_prior_target_augmented_mean": (
+            absolute_target_augmented_mean
+        ),
+        "imu_confidence_pose_prior_quality_target_mean": quality_target_mean,
+        "imu_confidence_pose_prior_quality_target_clean_mean": (
+            quality_target_clean_mean
+        ),
+        "imu_confidence_pose_prior_quality_target_augmented_mean": (
+            quality_target_augmented_mean
+        ),
+        "imu_confidence_pose_prior_energy_log_reference": energy_reference_value,
+        "imu_confidence_pose_prior_pairs": float(pair_count),
+        "imu_confidence_pose_prior_aug_pairs": float(aug_pair_count),
+        "imu_confidence_pose_prior_clean_mean": float(clean_mean.detach().item()),
+        "imu_confidence_pose_prior_aug_mean": float(augmented_mean.detach().item()),
     }
 
 

@@ -40,6 +40,12 @@ def dataset_factory(dataset_list, **kwargs):
             dataset_kwargs.pop('imu_train_frame_strides', None)
             dataset_kwargs.pop('imu_train_gyro_noise_density', None)
             dataset_kwargs.pop('imu_train_accel_noise_density', None)
+            dataset_kwargs.pop('euroc_camera_frame_stride', None)
+            dataset_kwargs.pop('euroc_keyframe_manifest_root', None)
+        if key != 'euroc':
+            dataset_kwargs.pop('euroc_keyframe_manifest_root', None)
+            dataset_kwargs.pop('euroc_sequence_include', None)
+            dataset_kwargs.pop('euroc_sequence_exclude', None)
         db = dataset_map[key][0](**dataset_kwargs)
 
         print("Dataset {} has {} images".format(key, len(db)))

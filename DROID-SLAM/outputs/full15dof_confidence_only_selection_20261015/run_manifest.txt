@@ -1,0 +1,106 @@
+protocol=MH_03 train -> V1_02,V2_02 select -> V1_03,V2_03 final test
+stride=2
+max_frames=0
+imu_ba_weight=0.002
+imu_confidence_only_weighting=1
+run_final_test=0
+min_coverage_ratio=0.95
+tuned_schedule=0.25 0.50 0.75 1.00
+val_v1_root=/home/ubuntu/SLAM/datasets/euroc_validation/prepared/V1_02_medium_droid_cam0
+val_v2_root=/home/ubuntu/SLAM/datasets/euroc_validation/prepared/V2_02_medium_droid_cam0
+test_v1_root=/home/ubuntu/SLAM/datasets/euroc_heldout/prepared/V1_03_difficult_droid_cam0
+test_v2_root=/home/ubuntu/SLAM/datasets/euroc_heldout/prepared/V2_03_difficult_droid_cam0
+checkpoints=checkpoints/full15dof_confidence_only_3000_001000.pth checkpoints/full15dof_confidence_only_3000_002000.pth checkpoints/full15dof_confidence_only_3000_final_003000.pth
+2dfd39f0dcad44012ca7bbb8aa70b55edbfa9c99
+ M demo.py
+ M droid_slam/data_readers/base.py
+ M droid_slam/data_readers/factory.py
+ M droid_slam/depth_video.py
+ M droid_slam/droid.py
+ M droid_slam/droid_async.py
+ M droid_slam/droid_backend.py
+ M droid_slam/droid_frontend.py
+ M droid_slam/droid_net.py
+ M droid_slam/factor_graph.py
+ M droid_slam/geom/ba.py
+ M droid_slam/geom/losses.py
+ M droid_slam/logger.py
+ M droid_slam/modules/extractor.py
+ M droid_slam/motion_filter.py
+ M evaluation_scripts/test_euroc.py
+ M src/droid.cpp
+ M src/droid_kernels.cu
+ M train.py
+?? CHAPTER3_PRESENTATION_STORY.md
+?? CODE_FLOW_REPORT.md
+?? DROID_IMU_PROGRESS_REPORT.md
+?? INTERIM_PRESENTATION_10MIN.md
+?? PROGRESS_EXPERIMENT_SEQUENCE.md
+?? PROGRESS_PRESENTATION_IMPLEMENTATION_GUIDE.md
+?? WEEKLY_REPORT_15DOF_IMU_20261008.md
+?? WEEKLY_REPORT_9DOF_IMU.md
+?? droid_slam/data_readers/euroc.py
+?? droid_slam/data_readers/imu_preintegration.py
+?? droid_slam/data_readers/sampling.py
+?? droid_slam/data_readers/tartan_v2.py
+?? droid_slam/geom/imu_factor.py
+?? droid_slam/imu_contract.py
+?? droid_slam/imu_prior.py
+?? droid_slam/imu_residual.py
+?? droid_slam/imu_runtime.py
+?? droid_slam/vi_initialization.py
+?? export_reconstruction_ply.py
+?? logs/
+?? outputs/
+?? presentation_assets/
+?? run_webp_imu_selected_experiment.sh
+?? tools/analyze_imu_experiments.py
+?? tools/analyze_reconstruction_health.py
+?? tools/calibrate_imu_camera_rotation.py
+?? tools/compare_nonloop_metrics.py
+?? tools/compare_recon_metrics.py
+?? tools/convert_euroc_mcap_to_mav0.py
+?? tools/download_tartanair_v2_subset.py
+?? tools/evaluate_euroc_recon.py
+?? tools/export_dvi_9dof_architecture_h5.py
+?? tools/imu_preintegrate.py
+?? tools/make_imu_selected_session_webp.py
+?? tools/match_ply_point_count.py
+?? tools/plot_euroc_recon_vs_gt.py
+?? tools/plot_trajectory_topview.py
+?? tools/prepare_euroc_cam0.py
+?? tools/reintegrate_imu_prior_from_reconstruction.py
+?? tools/run_9dof_axisfix_finetune.sh
+?? tools/run_9dof_noise_finetune.sh
+?? tools/run_component_imu_confidence_finetune.sh
+?? tools/run_dvi_scalar_imu_confidence_finetune.sh
+?? tools/run_dvi_stage3_select_and_4way_test.sh
+?? tools/run_euroc_15dof_confidence_only.sh
+?? tools/run_euroc_15dof_lambda_confidence_ablation.sh
+?? tools/run_euroc_9dof_lambda_confidence_ablation.sh
+?? tools/run_euroc_dvi_imu_4way_test_pair.sh
+?? tools/run_euroc_dvi_imu_ablation.sh
+?? tools/run_euroc_dvi_scalar_imu_confidence_finetune.sh
+?? tools/run_euroc_heldout_validation.sh
+?? tools/run_euroc_imu_ablation.sh
+?? tools/run_euroc_joint_shared_bias_validation.sh
+?? tools/run_euroc_reintegrated_15dof_validation.sh
+?? tools/run_euroc_two_stage_15dof_validation.sh
+?? tools/run_euroc_two_stage_component_compare.sh
+?? tools/run_long_imu_postprocess.sh
+?? tools/run_two_stage_dense_diagnostic.sh
+?? tools/select_9dof_checkpoint.sh
+?? tools/select_dvi_stage3_checkpoint.sh
+?? tools/show_training_metrics.py
+?? tools/test_balanced_sequence_sampler.py
+?? tools/test_component_imu_confidence.py
+?? tools/test_dvi_imu_confidence.py
+?? tools/test_global_bias_15dof.py
+?? tools/test_imu_confidence_runtime.py
+?? tools/test_imu_input_contract.py
+?? tools/test_imu_preintegration_jacobians.py
+?? tools/test_joint_shared_bias_schur.py
+?? tools/test_shared_bias_refinement.py
+?? tools/test_train_two_stage_imu_schedule.py
+?? tools/test_two_stage_imu_ba.py
+?? tools/test_vi_init_snapshot_history.py

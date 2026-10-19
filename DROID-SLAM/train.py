@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 
 # dataset loader 생성 함수
 from data_readers.factory import dataset_factory
+from data_readers.sampling import BalancedSequenceDistributedSampler
 
 # Lie group pose 표현
 # SO3: rotation group
@@ -24,6 +25,7 @@ from lietorch import SO3, SE3, Sim3
 # loss 함수 모듈
 from geom import losses
 from geom.losses import geodesic_loss, residual_loss, flow_loss
+from geom.imu_factor import temporal_imu_quality_features
 
 # 학습용 frame graph 생성 함수
 from geom.graph_utils import build_frame_graph
@@ -129,6 +131,12 @@ def freeze_non_imu_parameters(
     use_imu_ba,
     use_acc_bias,
     use_learned_imu_residual_weights=False,
+    use_component_imu_confidence=False,
+    use_dvi_imu_confidence=False,
+    use_dvi_imu_quality_fusion=False,
+    freeze_imu_ba_weight=False,
+    freeze_imu_confidence_head=False,
+    imu_confidence_only_weighting=False,
 ):
     """
     기존 DROID visual/update network 파라미터를 freeze하고,
@@ -171,10 +179,31 @@ def freeze_non_imu_parameters(
     #   2. update module 내부 IMU confidence branch
     # 를 학습 가능하게 설정
     if use_imu_ba:
-        model.imu_ba_log_weight.requires_grad_(True)
+        # In confidence-only mode the factor's global strength is exactly
+        # one.  Keep the legacy checkpoint parameter for compatibility, but
+        # never optimize it: the confidence head is the sole learned
+        # attenuation mechanism.
+        if not freeze_imu_ba_weight and not imu_confidence_only_weighting:
+            model.imu_ba_log_weight.requires_grad_(True)
 
-        for p in model.update.imu_confidence.parameters():
-            p.requires_grad_(True)
+        # The global IMU factor scale and per-interval confidence multiply in
+        # DBA.  A scale-only calibration must be able to hold the confidence
+        # head at its neutral value so the two mechanisms are identifiable.
+        if not freeze_imu_confidence_head:
+            if use_component_imu_confidence:
+                for p in model.update.imu_component_confidence.parameters():
+                    p.requires_grad_(True)
+                for p in model.update.imu_quality_fusion.parameters():
+                    p.requires_grad_(True)
+            elif use_dvi_imu_confidence:
+                for p in model.update.dvi_imu_confidence.parameters():
+                    p.requires_grad_(True)
+                if use_dvi_imu_quality_fusion:
+                    for p in model.update.dvi_imu_quality_fusion.parameters():
+                        p.requires_grad_(True)
+            else:
+                for p in model.update.imu_confidence.parameters():
+                    p.requires_grad_(True)
 
     if use_learned_imu_residual_weights:
         model.imu_pos_log_weight.requires_grad_(True)
@@ -204,6 +233,57 @@ def save_checkpoint(model, path):
 
     module = model.module if hasattr(model, "module") else model
     torch.save(module.state_dict(), path)
+
+
+def save_training_state(model, optimizer, scheduler, path, total_steps, sampler_epoch, rng):
+    """Save an optimizer/scheduler continuation state beside a model ckpt.
+
+    The ordinary ``*.pth`` checkpoint deliberately remains a plain DROID
+    ``state_dict`` so demo/evaluation loaders stay backward-compatible.  The
+    separate training-state file is used only when an experiment must release
+    GPU memory for an intermediate validation run and then resume the same
+    8k learning-rate schedule.
+    """
+
+    module = model.module if hasattr(model, "module") else model
+    payload = {
+        "format": "droid-training-state-v1",
+        "model": module.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "total_steps": int(total_steps),
+        "sampler_epoch": int(sampler_epoch),
+        "numpy_generator_state": rng.bit_generator.state,
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state(),
+    }
+    torch.save(payload, path)
+
+
+def restore_training_state(model, optimizer, scheduler, path, rng):
+    """Restore a state written by :func:`save_training_state`."""
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or payload.get("format") != "droid-training-state-v1":
+        raise ValueError(
+            "resume_training_state is not a DROID training-state checkpoint: "
+            f"{path}"
+        )
+    for key in ("model", "optimizer", "scheduler", "total_steps", "sampler_epoch"):
+        if key not in payload:
+            raise ValueError(f"resume_training_state is missing '{key}': {path}")
+
+    module = model.module if hasattr(model, "module") else model
+    module.load_state_dict(payload["model"], strict=True)
+    optimizer.load_state_dict(payload["optimizer"])
+    scheduler.load_state_dict(payload["scheduler"])
+    rng.bit_generator.state = payload.get("numpy_generator_state", rng.bit_generator.state)
+    if "torch_rng_state" in payload:
+        torch.set_rng_state(payload["torch_rng_state"])
+    if "cuda_rng_state" in payload:
+        torch.cuda.set_rng_state(payload["cuda_rng_state"])
+
+    return int(payload["total_steps"]), int(payload["sampler_epoch"])
 
 
 def clamp_parameter_norm(param, max_norm):
@@ -256,7 +336,7 @@ def imu_confidence_saturation_loss(confidences, imu_valid=None, ceiling=0.95):
             continue
         if confidence.ndim == 1:
             confidence = confidence.unsqueeze(0)
-        if confidence.ndim != 2 or confidence.shape[1] < 2:
+        if confidence.ndim not in (2, 3) or confidence.shape[1] < 2:
             continue
 
         # c[:, j] belongs to the temporal IMU factor (j - 1, j). Frame zero
@@ -303,8 +383,24 @@ def imu_residual_weight_prior_loss(model, reference=0.05):
     return torch.log(weights.clamp_min(1e-8) / target).square().mean()
 
 
-def reset_imu_confidence_head(model, value=0.5):
-    """Recalibrate only the final IMU-confidence logit layer.
+def reset_imu_residual_weights(model, reference=0.05):
+    """Start a relative p/v calibration run from the fixed 15DoF setting."""
+
+    if not hasattr(model, "set_imu_full_residual_weights"):
+        raise ValueError(
+            "--reset_imu_residual_weights requires a DroidNet with "
+            "set_imu_full_residual_weights()."
+        )
+    model.set_imu_full_residual_weights(reference, reference)
+
+
+def reset_imu_confidence_head(
+    model,
+    value=0.5,
+    use_dvi_imu_confidence=False,
+    use_dvi_imu_quality_fusion=False,
+):
+    """Recalibrate the active scalar IMU-confidence logit layer.
 
     This is useful when a previous clean-sensor training run drove the sigmoid
     to one for every frame. The preceding GRU and confidence features remain
@@ -316,15 +412,306 @@ def reset_imu_confidence_head(model, value=0.5):
     if not 0.0 < value < 1.0:
         raise ValueError(f"IMU confidence reset value must be in (0, 1), got {value}")
 
-    head = model.update.imu_confidence
-    final_conv = head[2]
-    if not isinstance(final_conv, torch.nn.Conv2d):
-        raise TypeError("expected the final IMU confidence projection to be Conv2d")
+    # The legacy scalar head is a small Sequential module, whereas the
+    # DVI head is itself the documented 1x1 projection.  Resetting the
+    # legacy head during a DVI run has no effect on the active branch and can
+    # leave an inherited DVI checkpoint saturated near one.
+    head = (
+        model.update.dvi_imu_confidence
+        if use_dvi_imu_confidence
+        else model.update.imu_confidence
+    )
+    if isinstance(head, torch.nn.Conv2d):
+        final_conv = head
+    elif isinstance(head, torch.nn.Sequential):
+        final_conv = next(
+            (layer for layer in reversed(head) if isinstance(layer, torch.nn.Conv2d)),
+            None,
+        )
+    else:
+        final_conv = None
+    if final_conv is None:
+        raise TypeError("expected the active IMU confidence projection to be Conv2d")
 
     logit = float(np.log(value / (1.0 - value)))
     with torch.no_grad():
         final_conv.weight.zero_()
         final_conv.bias.fill_(logit)
+
+    if use_dvi_imu_confidence and use_dvi_imu_quality_fusion:
+        model.initialize_dvi_imu_quality_fusion()
+
+
+def imu_confidence_schedule_loss(confidences, targets, imu_valid=None):
+    """Teach a weak, manual confidence curriculum on full-IMU unrolls.
+
+    ``targets[k]`` supervises the mean confidence of full-IMU unroll ``k``.
+    The last target is reused if a caller supplies more unrolls than targets.
+    This is intentionally a *mean* calibration loss: individual temporal
+    factors remain free to deviate from the manual ramp based on the GRU
+    state, so the learned branch can still represent data-dependent quality.
+    """
+
+    if not confidences:
+        return None
+    if not targets:
+        raise ValueError("imu confidence schedule targets must not be empty")
+    targets = tuple(float(value) for value in targets)
+    if any(value < 0.0 or value > 1.0 for value in targets):
+        raise ValueError(
+            "imu confidence schedule targets must lie in [0, 1], got "
+            f"{targets}"
+        )
+
+    losses = []
+    for step, confidence in enumerate(confidences):
+        if confidence is None:
+            continue
+        if confidence.ndim == 1:
+            confidence = confidence.unsqueeze(0)
+        if confidence.ndim not in (2, 3) or confidence.shape[1] < 2:
+            continue
+
+        # Frame zero has no preceding IMU interval, so it must not influence
+        # the schedule mean.  This mirrors the saturation/NLL masking above.
+        factor_confidence = confidence[:, 1:]
+        if imu_valid is not None:
+            valid = imu_valid.to(device=confidence.device, dtype=torch.bool)
+            if valid.ndim == 1:
+                valid = valid.unsqueeze(0)
+            if valid.shape[0] == 1 and factor_confidence.shape[0] > 1:
+                valid = valid.expand(factor_confidence.shape[0], -1)
+            if (
+                valid.shape[0] != factor_confidence.shape[0]
+                or valid.shape[1] < factor_confidence.shape[1] + 1
+            ):
+                raise ValueError(
+                    "imu_valid must cover the temporal confidence sequence: "
+                    f"confidence={tuple(confidence.shape)}, valid={tuple(valid.shape)}"
+                )
+            factor_confidence = factor_confidence[
+                valid[:, 1:factor_confidence.shape[1] + 1]
+            ]
+
+        if factor_confidence.numel() == 0:
+            continue
+        target = factor_confidence.new_tensor(targets[min(step, len(targets) - 1)])
+        losses.append((factor_confidence.mean() - target).square())
+
+    if not losses:
+        # Keep DDP parameter usage identical for an all-invalid IMU batch.
+        return confidences[-1].sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def augment_imu_confidence_inputs(
+    imu_delta,
+    imu_valid,
+    imu_info,
+    *,
+    probability=0.0,
+    gyro_noise_std=0.0,
+    accel_noise_std=0.0,
+    gyro_bias_drift_std=0.0,
+    accel_bias_drift_std=0.0,
+    dropout_probability=0.0,
+    dropout_max_length=1,
+    dropout_info_scale=0.05,
+):
+    """Inject train-only, preintegration-equivalent IMU degradation.
+
+    The loader deliberately exposes composed camera-to-camera IMU priors, not
+    the individual 200 Hz samples.  Perturbing ``[dR, dv, dp]`` with the
+    corresponding integration powers of ``dt`` is therefore the equivalent
+    of perturbing the raw gyro/accelerometer stream before preintegration:
+
+    * white gyro/accelerometer noise changes ``dR``/``dv``/``dp``;
+    * random-walk bias is cumulative over the selected clip;
+    * a short sample dropout is represented as a held/incomplete interval
+      with greatly reduced information, but remains a valid factor so the
+      confidence head can learn to reject it.
+
+    ``imu_info_reference`` is intentionally *not* changed by this routine.
+    It remains the nominal sensor reference, while the degraded row carries
+    lower relative information for the IMU-quality feature branch.
+
+    Returns augmented ``(delta, info, degraded_mask, dropout_mask)``.  The
+    two masks refer to temporal factors and have the same ``[B, N]`` layout
+    as ``imu_valid``; frame zero is always false.
+    """
+
+    if imu_delta is None:
+        return imu_delta, imu_info, None, None
+
+    probability = float(probability)
+    dropout_probability = float(dropout_probability)
+    if probability <= 0.0 and dropout_probability <= 0.0:
+        return imu_delta, imu_info, None, None
+
+    if imu_delta.ndim != 3 or imu_delta.shape[-1] < 10:
+        raise ValueError(
+            "IMU confidence augmentation expects imu_delta [B, N, >=10], got "
+            f"{tuple(imu_delta.shape)}"
+        )
+
+    batch, num_frames = imu_delta.shape[:2]
+    delta = imu_delta.clone()
+    info = imu_info.clone() if imu_info is not None else None
+
+    if imu_valid is None:
+        valid = torch.ones(
+            (batch, num_frames), device=delta.device, dtype=torch.bool
+        )
+    else:
+        valid = imu_valid.to(device=delta.device, dtype=torch.bool)
+        if valid.ndim == 1:
+            valid = valid.unsqueeze(0)
+        if valid.shape[0] == 1 and batch > 1:
+            valid = valid.expand(batch, -1)
+        if valid.shape != (batch, num_frames):
+            raise ValueError(
+                "imu_valid must match imu_delta during confidence augmentation: "
+                f"valid={tuple(valid.shape)}, delta={tuple(imu_delta.shape)}"
+            )
+
+    temporal_valid = valid.clone()
+    temporal_valid[:, 0] = False
+    random_bad = (
+        torch.rand((batch, num_frames), device=delta.device) < probability
+    ) & temporal_valid
+
+    # Draw contiguous short dropout runs per clip.  An actual invalid runtime
+    # interval is omitted by BA; this train-only partial-dropout model instead
+    # leaves a degraded factor in place so learned confidence has a gradient.
+    dropout = torch.zeros_like(temporal_valid)
+    max_length = max(1, int(dropout_max_length))
+    for batch_index in range(batch):
+        if num_frames <= 1 or torch.rand((), device=delta.device) >= dropout_probability:
+            continue
+        length = int(
+            torch.randint(1, max_length + 1, (), device=delta.device).item()
+        )
+        length = min(length, num_frames - 1)
+        start = int(
+            torch.randint(1, num_frames - length + 1, (), device=delta.device).item()
+        )
+        dropout[batch_index, start:start + length] = temporal_valid[
+            batch_index, start:start + length
+        ]
+
+    degraded = random_bad | dropout
+    if not bool(degraded.any().detach().cpu().item()):
+        return delta, info, degraded, dropout
+
+    dt = delta[..., 0:1].clamp_min(1e-4)
+    factor_mask = random_bad.unsqueeze(-1).to(dtype=delta.dtype)
+    sqrt_dt = dt.sqrt()
+
+    gyro_noise_std = float(gyro_noise_std)
+    accel_noise_std = float(accel_noise_std)
+    if gyro_noise_std > 0.0:
+        delta[..., 1:4] = delta[..., 1:4] + factor_mask * (
+            torch.randn_like(delta[..., 1:4]) * gyro_noise_std * sqrt_dt
+        )
+    if accel_noise_std > 0.0:
+        acceleration_noise = (
+            torch.randn_like(delta[..., 4:7]) * accel_noise_std * sqrt_dt
+        )
+        delta[..., 4:7] = delta[..., 4:7] + factor_mask * acceleration_noise
+        delta[..., 7:10] = delta[..., 7:10] + factor_mask * (
+            0.5 * acceleration_noise * dt
+        )
+
+    # The drift is a per-clip random walk in physical bias units.  It is only
+    # active for clips that contain a synthetic bad interval, which keeps a
+    # clean clip genuinely clean and provides clean-vs-degraded ranking pairs.
+    clip_has_bad = random_bad.any(dim=1, keepdim=True).unsqueeze(-1)
+    gyro_bias_drift_std = float(gyro_bias_drift_std)
+    accel_bias_drift_std = float(accel_bias_drift_std)
+    if gyro_bias_drift_std > 0.0:
+        gyro_drift = torch.cumsum(
+            torch.randn_like(delta[..., 1:4]) * gyro_bias_drift_std * sqrt_dt,
+            dim=1,
+        )
+        delta[..., 1:4] = delta[..., 1:4] + gyro_drift * dt * clip_has_bad
+    if accel_bias_drift_std > 0.0:
+        accel_drift = torch.cumsum(
+            torch.randn_like(delta[..., 4:7]) * accel_bias_drift_std * sqrt_dt,
+            dim=1,
+        )
+        delta[..., 4:7] = delta[..., 4:7] + accel_drift * dt * clip_has_bad
+        delta[..., 7:10] = delta[..., 7:10] + 0.5 * accel_drift * dt.square() * clip_has_bad
+
+    if bool(dropout.any().detach().cpu().item()):
+        # A zero-order-held interval is a conservative proxy for a short raw
+        # sample gap.  Keep dt intact because the camera timestamps did not
+        # disappear; only the measured increment became untrustworthy.
+        dropout_mask = dropout.unsqueeze(-1)
+        delta[..., 1:10] = torch.where(
+            dropout_mask,
+            torch.zeros_like(delta[..., 1:10]),
+            delta[..., 1:10],
+        )
+
+    if info is not None:
+        if info.ndim != 3 or info.shape[:2] != (batch, num_frames) or info.shape[-1] < 3:
+            raise ValueError(
+                "imu_info must be [B, N, >=3] and match imu_delta during "
+                f"confidence augmentation, got {tuple(info.shape)}"
+            )
+        # The raw-quality MLP can see the lower propagated information.  The
+        # factor is still valid: confidence, rather than a hard validity gate,
+        # learns the remaining attenuation.
+        ordinary_scale = 0.5
+        info[..., :3] = torch.where(
+            random_bad.unsqueeze(-1),
+            info[..., :3] * ordinary_scale,
+            info[..., :3],
+        )
+        info[..., :3] = torch.where(
+            dropout.unsqueeze(-1),
+            info[..., :3] * float(dropout_info_scale),
+            info[..., :3],
+        )
+
+    return delta, info, degraded, dropout
+
+
+def select_full_imu_stage_outputs(
+    poses_est,
+    imu_confidences,
+    imu_motions,
+    pose_only_steps,
+):
+    """Select only the full-IMU suffix of an unrolled two-stage solve.
+
+    ``DroidNet`` keeps pose and confidence outputs aligned with every unroll
+    step, but initializes and returns motion states only after the visual-only
+    prefix.  Full preintegration supervision must use the matching suffix;
+    otherwise the auxiliary loss would train on states that never saw an IMU
+    factor in DBA.
+    """
+
+    start = int(pose_only_steps)
+    if start < 0 or start >= len(poses_est):
+        raise ValueError(
+            "imu_train_pose_only_steps must leave at least one full IMU "
+            f"unroll step, got start={start}, outputs={len(poses_est)}"
+        )
+    if imu_confidences and len(imu_confidences) != len(poses_est):
+        raise ValueError(
+            "DroidNet IMU confidence outputs must align with unrolled poses: "
+            f"confidence={len(imu_confidences)}, poses={len(poses_est)}"
+        )
+
+    stage_poses = poses_est[start:]
+    stage_confidences = imu_confidences[start:] if imu_confidences else []
+    if imu_motions and len(imu_motions) != len(stage_poses):
+        raise ValueError(
+            "DroidNet IMU motion outputs must cover exactly the full-IMU "
+            f"suffix: motion={len(imu_motions)}, full_steps={len(stage_poses)}"
+        )
+    return stage_poses, stage_confidences, imu_motions
 
 
 def train(gpu, args):
@@ -364,6 +751,8 @@ def train(gpu, args):
     ############################################################
 
     checkpoint_has_imu_ba_weight = False
+    checkpoint_has_component_imu_confidence = False
+    checkpoint_has_dvi_imu_quality_fusion = False
     if args.ckpt is not None:
         # DDP checkpoint에서 "module." prefix가 붙어 있을 수 있으므로 제거
         state_dict = OrderedDict([
@@ -371,6 +760,15 @@ def train(gpu, args):
             for (k, v) in torch.load(args.ckpt).items()
         ])
         checkpoint_has_imu_ba_weight = "imu_ba_log_weight" in state_dict
+        checkpoint_has_component_imu_confidence = any(
+            key.startswith("update.imu_component_confidence.")
+            or key.startswith("update.imu_quality_fusion.")
+            for key in state_dict
+        )
+        checkpoint_has_dvi_imu_quality_fusion = any(
+            key.startswith("update.dvi_imu_quality_fusion.")
+            for key in state_dict
+        )
 
         # strict=False:
         #   기존 DROID checkpoint에는 새로 추가한 IMU parameter가 없을 수 있음.
@@ -382,6 +780,22 @@ def train(gpu, args):
 
         if gpu == 0 and (missing or unexpected):
             print(f"[CKPT] missing={missing}, unexpected={unexpected}")
+
+    if args.use_component_imu_confidence and not checkpoint_has_component_imu_confidence:
+        model.initialize_component_imu_confidence_from_scalar()
+        if gpu == 0:
+            print(
+                "[IMU] initialized component confidence from the scalar GRU head; "
+                "IMU-quality fusion starts neutral"
+            )
+
+    if args.use_dvi_imu_quality_fusion and not checkpoint_has_dvi_imu_quality_fusion:
+        model.initialize_dvi_imu_quality_fusion()
+        if gpu == 0:
+            print(
+                "[IMU] initialized scalar DVI IMU-quality fusion from an "
+                "older checkpoint; quality contribution starts neutral"
+            )
 
     ############################################################
     # 4. IMU bias 초기값 설정
@@ -425,6 +839,19 @@ def train(gpu, args):
         args.use_full_imu_ba and args.use_imu_loss
     )
 
+    # The two-stage unroll has visual-only outputs first, followed by the
+    # full T/v/ba/bg optimizer. IMU supervision is intentionally restricted
+    # to the latter so training and runtime share the same state contract.
+    imu_train_pose_only_steps = (
+        args.imu_train_pose_only_steps if args.use_full_imu_ba else 0
+    )
+    if gpu == 0 and args.use_full_imu_ba:
+        print(
+            "[TRAIN] full IMU unroll schedule: "
+            f"pose_only={imu_train_pose_only_steps}, "
+            f"full_15dof={args.iters - imu_train_pose_only_steps}"
+        )
+
     # IMU 데이터를 dataset에서 로드해야 하는지 여부
     #
     # IMU loss를 쓰거나, IMU BA를 쓰거나, full IMU loss를 쓰면
@@ -435,6 +862,8 @@ def train(gpu, args):
     # calibration parameters. It may still *use* them in the residual, but it
     # must not optimize them during the confidence/weight fine-tuning stage.
     train_global_imu_bias = use_imu_data and not args.use_pose_velocity_imu_ba
+    if args.freeze_global_imu_bias:
+        train_global_imu_bias = False
 
     # Rotation-only IMU loss can train gyro bias alone. Full 15DoF training can
     # additionally train accel bias, whereas the fixed-bias 9DoF mode cannot.
@@ -446,7 +875,11 @@ def train(gpu, args):
     # IMU BA global weight는 새 학습에서는 0.05로 초기화한다. 반면 IMU
     # checkpoint를 이어 학습할 때는 이미 학습된 값을 보존하고, 사용자가
     # --imu_ba_weight를 명시했을 때만 의도적으로 재설정한다.
-    if args.use_imu_ba and not args.eval_only:
+    if (
+        args.use_imu_ba
+        and not args.eval_only
+        and not args.imu_confidence_only_weighting
+    ):
         if args.imu_ba_weight is not None:
             model.set_imu_ba_weight(args.imu_ba_weight)
             if gpu == 0:
@@ -460,13 +893,37 @@ def train(gpu, args):
                 "[IMU] preserving checkpoint global BA weight="
                 f"{model.get_imu_ba_weight().detach().item():.7g}"
             )
+    elif args.use_imu_ba and args.imu_confidence_only_weighting and gpu == 0:
+        print(
+            "[IMU] confidence-only weighting: global IMU BA weight is fixed "
+            "to 1.0; imu_ba_log_weight is ignored and frozen"
+        )
 
     if args.reset_imu_confidence_head:
-        reset_imu_confidence_head(model, args.imu_confidence_reset_value)
+        reset_imu_confidence_head(
+            model,
+            args.imu_confidence_reset_value,
+            use_dvi_imu_confidence=args.use_dvi_imu_confidence,
+            use_dvi_imu_quality_fusion=args.use_dvi_imu_quality_fusion,
+        )
+        if args.use_component_imu_confidence:
+            model.initialize_component_imu_confidence_from_scalar()
+        model.reset_imu_confidence_calibration()
         if gpu == 0:
             print(
-                "[IMU] reset final IMU confidence head to "
+                "[IMU] reset active "
+                f"{'DVI' if args.use_dvi_imu_confidence else 'scalar'} "
+                "confidence head to "
                 f"{args.imu_confidence_reset_value:g}"
+            )
+            print("[IMU] reset pre-BA confidence calibration reference")
+
+    if args.reset_imu_residual_weights:
+        reset_imu_residual_weights(model)
+        if gpu == 0:
+            print(
+                "[IMU] reset learned relative position/velocity residual "
+                "weights to (0.05, 0.05)"
             )
 
     ############################################################
@@ -478,6 +935,12 @@ def train(gpu, args):
     if not train_global_imu_bias:
         model.imu_gyro_bias.requires_grad_(False)
         model.imu_acc_bias.requires_grad_(False)
+
+        if gpu == 0 and args.freeze_global_imu_bias:
+            print(
+                "[TRAIN] global IMU biases are frozen; full 15DoF DBA may "
+                "still optimize its per-window local bias state."
+            )
 
     # acc bias가 필요 없는 모드이면 acc bias freeze
     if not use_acc_bias:
@@ -493,10 +956,51 @@ def train(gpu, args):
 
         for p in model.update.imu_confidence.parameters():
             p.requires_grad_(False)
+        for p in model.update.imu_component_confidence.parameters():
+            p.requires_grad_(False)
+        for p in model.update.imu_quality_fusion.parameters():
+            p.requires_grad_(False)
+        for p in model.update.dvi_imu_confidence.parameters():
+            p.requires_grad_(False)
+        for p in model.update.dvi_imu_quality_fusion.parameters():
+            p.requires_grad_(False)
+
+    if args.freeze_imu_ba_weight or args.imu_confidence_only_weighting:
+        model.imu_ba_log_weight.requires_grad_(False)
 
     if not args.use_learned_imu_residual_weights:
         model.imu_pos_log_weight.requires_grad_(False)
         model.imu_vel_log_weight.requires_grad_(False)
+
+    # Only one confidence branch participates in a forward pass.  Explicitly
+    # freezing the inactive branch avoids DDP's unused-parameter failure while
+    # keeping old scalar-checkpoint training behavior unchanged.
+    if args.use_component_imu_confidence:
+        for p in model.update.imu_confidence.parameters():
+            p.requires_grad_(False)
+        for p in model.update.dvi_imu_confidence.parameters():
+            p.requires_grad_(False)
+        for p in model.update.dvi_imu_quality_fusion.parameters():
+            p.requires_grad_(False)
+    elif args.use_dvi_imu_confidence:
+        for p in model.update.imu_confidence.parameters():
+            p.requires_grad_(False)
+        for p in model.update.imu_component_confidence.parameters():
+            p.requires_grad_(False)
+        for p in model.update.imu_quality_fusion.parameters():
+            p.requires_grad_(False)
+        if not args.use_dvi_imu_quality_fusion:
+            for p in model.update.dvi_imu_quality_fusion.parameters():
+                p.requires_grad_(False)
+    else:
+        for p in model.update.imu_component_confidence.parameters():
+            p.requires_grad_(False)
+        for p in model.update.imu_quality_fusion.parameters():
+            p.requires_grad_(False)
+        for p in model.update.dvi_imu_confidence.parameters():
+            p.requires_grad_(False)
+        for p in model.update.dvi_imu_quality_fusion.parameters():
+            p.requires_grad_(False)
 
     if gpu == 0 and args.use_pose_velocity_imu_ba:
         print(
@@ -517,6 +1021,12 @@ def train(gpu, args):
             use_imu_ba=args.use_imu_ba,
             use_acc_bias=use_acc_bias,
             use_learned_imu_residual_weights=args.use_learned_imu_residual_weights,
+            use_component_imu_confidence=args.use_component_imu_confidence,
+            use_dvi_imu_confidence=args.use_dvi_imu_confidence,
+            use_dvi_imu_quality_fusion=args.use_dvi_imu_quality_fusion,
+            freeze_imu_ba_weight=args.freeze_imu_ba_weight,
+            freeze_imu_confidence_head=args.freeze_imu_confidence_head,
+            imu_confidence_only_weighting=args.imu_confidence_only_weighting,
         )
 
         if gpu == 0:
@@ -560,6 +1070,10 @@ def train(gpu, args):
         imu_train_frame_strides=args.imu_train_frame_strides,
         imu_train_gyro_noise_density=args.imu_train_gyro_noise_density,
         imu_train_accel_noise_density=args.imu_train_accel_noise_density,
+        euroc_camera_frame_stride=args.euroc_camera_frame_stride,
+        euroc_keyframe_manifest_root=args.euroc_keyframe_manifest_root,
+        euroc_sequence_include=args.euroc_sequence_include,
+        euroc_sequence_exclude=args.euroc_sequence_exclude,
     )
 
     # dataset에 dense depth가 있는지 확인
@@ -600,12 +1114,25 @@ def train(gpu, args):
     # 11. Distributed DataLoader 생성
     ############################################################
 
-    train_sampler = torch.utils.data.distributed.DistributedSampler(
-        db,
-        shuffle=True,
-        num_replicas=args.world_size,
-        rank=gpu
-    )
+    if args.balance_sequence_sampling:
+        train_sampler = BalancedSequenceDistributedSampler(
+            db,
+            num_replicas=args.world_size,
+            rank=gpu,
+            seed=0,
+        )
+        if gpu == 0:
+            print(
+                "[DATA] balanced sequence sampling enabled; each discovered "
+                "sequence receives equal expected clip mass"
+            )
+    else:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            db,
+            shuffle=True,
+            num_replicas=args.world_size,
+            rank=gpu
+        )
 
     train_loader = DataLoader(
         db,
@@ -658,12 +1185,42 @@ def train(gpu, args):
 
     should_keep_training = True
     total_steps = 0
+    sampler_epoch = 0
+    if args.resume_training_state is not None:
+        total_steps, sampler_epoch = restore_training_state(
+            model,
+            optimizer,
+            scheduler,
+            args.resume_training_state,
+            rng,
+        )
+        if total_steps >= args.steps:
+            raise ValueError(
+                "resume_training_state has already reached or exceeded "
+                f"--steps: restored={total_steps}, steps={args.steps}"
+            )
+        if args.stop_after_steps <= total_steps:
+            raise ValueError(
+                "--stop_after_steps must be greater than the restored step: "
+                f"restored={total_steps}, stop_after={args.stop_after_steps}"
+            )
+        if gpu == 0:
+            print(
+                "[RESUME] restored optimizer/scheduler/training state "
+                f"from {args.resume_training_state}; step={total_steps}, "
+                f"next_stop={args.stop_after_steps}, total_schedule={args.steps}"
+            )
 
     ############################################################
     # 14. Main training loop
     ############################################################
 
     while should_keep_training:
+        # DistributedSampler otherwise repeats its initial shuffle order on
+        # every pass through the finite dataset. The balanced sampler follows
+        # the same PyTorch epoch contract.
+        train_sampler.set_epoch(sampler_epoch)
+        sampler_epoch += 1
         for i_batch, item in enumerate(train_loader):
 
             ####################################################
@@ -710,6 +1267,32 @@ def train(gpu, args):
             # separate from the selected frame intervals so composed IMU
             # covariance remains meaningful in the training BA/loss.
             imu_info_reference = item[8] if len(item) > 8 else None
+
+            # Confidence training sees train-only IMU degradation *before*
+            # both its direct raw-quality features and the full-IMU DBA.  The
+            # visual-only prefix below deliberately receives no IMU factor,
+            # making it a valid independent teacher for this augmented prior.
+            imu_confidence_augmented = None
+            imu_confidence_dropout = None
+            if args.use_imu_confidence_augmentation:
+                (
+                    imu_delta,
+                    imu_info,
+                    imu_confidence_augmented,
+                    imu_confidence_dropout,
+                ) = augment_imu_confidence_inputs(
+                    imu_delta,
+                    imu_valid,
+                    imu_info,
+                    probability=args.imu_confidence_aug_probability,
+                    gyro_noise_std=args.imu_confidence_aug_gyro_noise_std,
+                    accel_noise_std=args.imu_confidence_aug_accel_noise_std,
+                    gyro_bias_drift_std=args.imu_confidence_aug_gyro_bias_drift_std,
+                    accel_bias_drift_std=args.imu_confidence_aug_accel_bias_drift_std,
+                    dropout_probability=args.imu_confidence_aug_dropout_probability,
+                    dropout_max_length=args.imu_confidence_aug_dropout_max_length,
+                    dropout_info_scale=args.imu_confidence_aug_dropout_info_scale,
+                )
 
             ####################################################
             # 14-3. pose convention 변환
@@ -803,17 +1386,30 @@ def train(gpu, args):
                         imu_info_reference=imu_info_reference if args.use_imu_ba else None,
                         imu_bias_jacobian=imu_bias_jacobian if args.use_imu_ba else None,
 
-                        # None이면 model 내부 learnable weight 사용 가능
-                        # use_imu_ba가 아니면 0으로 꺼둠
-                        imu_ba_weight=None if args.use_imu_ba else 0.0,
+                        # Confidence-only mode has no learned or hand-tuned
+                        # global IMU attenuation.  A confidence of one means
+                        # that the preintegration factor enters DBA at its
+                        # full covariance-relative strength.
+                        imu_ba_weight=(
+                            1.0
+                            if args.imu_confidence_only_weighting
+                            else (None if args.use_imu_ba else 0.0)
+                        ),
+                        imu_confidence_only_weighting=(
+                            args.imu_confidence_only_weighting
+                        ),
 
                         # IMU residual clipping / confidence 관련 설정
                         imu_ba_max_residual=args.imu_max_residual,
                         imu_confidence_floor=args.imu_conf_floor,
                         return_imu_confidence=args.use_imu_ba,
+                        use_component_imu_confidence=args.use_component_imu_confidence,
+                        use_dvi_imu_confidence=args.use_dvi_imu_confidence,
+                        use_dvi_imu_quality_fusion=args.use_dvi_imu_quality_fusion,
 
                         # full IMU BA 관련 설정
                         use_full_imu_ba=args.use_full_imu_ba,
+                        imu_pose_only_steps=imu_train_pose_only_steps,
                         imu_full_pos_weight=args.imu_full_pos_weight,
                         imu_full_vel_weight=args.imu_full_vel_weight,
                         use_learned_imu_residual_weights=args.use_learned_imu_residual_weights,
@@ -881,6 +1477,21 @@ def train(gpu, args):
                     poses_est, disps_est, residuals = model_output
                     gyro_bias = None
 
+                imu_loss_poses = poses_est
+                imu_loss_confidences = imu_confidences
+                imu_loss_motions = imu_motions
+                if args.use_full_imu_ba:
+                    (
+                        imu_loss_poses,
+                        imu_loss_confidences,
+                        imu_loss_motions,
+                    ) = select_full_imu_stage_outputs(
+                        poses_est,
+                        imu_confidences,
+                        imu_motions,
+                        imu_train_pose_only_steps,
+                    )
+
                 ################################################
                 # 14-6-3. 기존 DROID visual loss 계산
                 ################################################
@@ -935,13 +1546,15 @@ def train(gpu, args):
                         imu_loss_vel_weight = args.imu_loss_vel_weight
 
                     imu_loss, imu_metrics = losses.imu_full_preintegration_loss(
-                        poses_est,
+                        imu_loss_poses,
                         imu_delta,
                         imu_valid=imu_valid,
                         imu_info=imu_info,
                         imu_info_reference=imu_info_reference,
                         imu_bias_jacobian=imu_bias_jacobian,
-                        imu_motions=imu_motions if len(imu_motions) > 0 else None,
+                        imu_motions=(
+                            imu_loss_motions if len(imu_loss_motions) > 0 else None
+                        ),
                         gyro_bias=gyro_bias,
                         accel_bias=core_model.imu_acc_bias,
                         gamma=args.imu_gamma,
@@ -1024,10 +1637,10 @@ def train(gpu, args):
                 if (
                     args.use_imu_ba
                     and args.w_imu_confidence_saturation != 0.0
-                    and len(imu_confidences) > 0
+                    and len(imu_loss_confidences) > 0
                 ):
                     confidence_reg_loss = imu_confidence_saturation_loss(
-                        imu_confidences,
+                        imu_loss_confidences,
                         imu_valid=imu_valid,
                         ceiling=args.imu_confidence_saturation_ceiling,
                     )
@@ -1042,7 +1655,7 @@ def train(gpu, args):
                     args.use_imu_ba
                     and use_full_imu_loss
                     and args.w_imu_confidence_nll != 0.0
-                    and len(imu_confidences) > 0
+                    and len(imu_loss_confidences) > 0
                 ):
                     core_model = model.module if hasattr(model, 'module') else model
                     if args.use_learned_imu_residual_weights:
@@ -1054,14 +1667,18 @@ def train(gpu, args):
                         confidence_vel_weight = args.imu_loss_vel_weight
                     confidence_nll_loss, confidence_nll_metrics = (
                         losses.imu_confidence_nll_loss(
-                            poses_est,
-                            imu_confidences,
+                            imu_loss_poses,
+                            imu_loss_confidences,
                             imu_delta,
                             imu_valid=imu_valid,
                             imu_info=imu_info,
                             imu_info_reference=imu_info_reference,
                             imu_bias_jacobian=imu_bias_jacobian,
-                            imu_motions=imu_motions if len(imu_motions) > 0 else None,
+                            imu_motions=(
+                                imu_loss_motions
+                                if len(imu_loss_motions) > 0
+                                else None
+                            ),
                             gyro_bias=gyro_bias,
                             accel_bias=core_model.imu_acc_bias,
                             gravity=args.imu_gravity,
@@ -1077,6 +1694,105 @@ def train(gpu, args):
                             imu_info_weight_eps=args.imu_info_weight_eps,
                             imu_optimize_bias=not args.use_pose_velocity_imu_ba,
                         )
+                    )
+
+                confidence_pose_prior_loss = torch.zeros((), device=images.device)
+                confidence_pose_prior_metrics = {
+                    "imu_confidence_pose_prior": 0.0,
+                    "imu_confidence_pose_prior_ranking": 0.0,
+                    "imu_confidence_pose_prior_absolute": 0.0,
+                    "imu_confidence_pose_prior_quality_only_absolute": 0.0,
+                    "imu_confidence_pose_prior_target_mean": 0.0,
+                    "imu_confidence_pose_prior_target_clean_mean": 0.0,
+                    "imu_confidence_pose_prior_target_augmented_mean": 0.0,
+                    "imu_confidence_pose_prior_quality_target_mean": 0.0,
+                    "imu_confidence_pose_prior_quality_target_clean_mean": 0.0,
+                    "imu_confidence_pose_prior_quality_target_augmented_mean": 0.0,
+                    "imu_confidence_pose_prior_energy_log_reference": float("nan"),
+                    "imu_confidence_pose_prior_pairs": 0.0,
+                    "imu_confidence_pose_prior_aug_pairs": 0.0,
+                    "imu_confidence_pose_prior_clean_mean": 0.0,
+                    "imu_confidence_pose_prior_aug_mean": 0.0,
+                }
+                if (
+                    args.use_imu_ba
+                    and args.w_imu_confidence_pose_prior != 0.0
+                    and imu_train_pose_only_steps > 0
+                    and len(imu_confidences) >= imu_train_pose_only_steps
+                ):
+                    # Index pose_only_steps-1 is the last output of the
+                    # strictly visual prefix. It has never entered full IMU
+                    # DBA, whereas the confidence is generated from the same
+                    # visual ConvGRU state and raw/preintegrated IMU features.
+                    core_model = model.module if hasattr(model, 'module') else model
+                    if args.use_learned_imu_residual_weights:
+                        pose_prior_pos_weight = core_model.get_imu_full_residual_weights()[0]
+                        pose_prior_vel_weight = core_model.get_imu_full_residual_weights()[1]
+                    else:
+                        pose_prior_pos_weight = args.imu_loss_pos_weight
+                        pose_prior_vel_weight = args.imu_loss_vel_weight
+                    quality_only_confidence = None
+                    if args.use_dvi_imu_quality_fusion:
+                        temporal_quality = temporal_imu_quality_features(
+                            imu_delta,
+                            imu_info,
+                            num_frames=poses_est[0].data.shape[1],
+                        )
+                        quality_only_confidence = (
+                            core_model.update.dvi_imu_quality_confidence(
+                                temporal_quality
+                            )
+                        )
+                    (
+                        confidence_pose_prior_loss,
+                        confidence_pose_prior_metrics,
+                    ) = losses.imu_confidence_pose_prior_ranking_loss(
+                        poses_est[imu_train_pose_only_steps - 1],
+                        imu_confidences[imu_train_pose_only_steps - 1],
+                        imu_delta,
+                        imu_valid=imu_valid,
+                        imu_info=imu_info,
+                        imu_info_reference=imu_info_reference,
+                        imu_bias_jacobian=imu_bias_jacobian,
+                        gyro_bias=gyro_bias,
+                        accel_bias=core_model.imu_acc_bias,
+                        gravity=args.imu_gravity,
+                        max_residual=None,
+                        pos_weight=pose_prior_pos_weight,
+                        vel_weight=pose_prior_vel_weight,
+                        rot_weight=args.imu_loss_rot_weight,
+                        imu_compose_order=args.imu_full_compose_order,
+                        imu_inverse=args.imu_full_inverse,
+                        imu_optimize_bias=not args.use_pose_velocity_imu_ba,
+                        augmented_mask=imu_confidence_augmented,
+                        absolute_weight=(
+                            args.imu_confidence_pose_prior_absolute_weight
+                        ),
+                        energy_log_reference=(
+                            core_model.imu_confidence_energy_log_reference
+                        ),
+                        energy_reference_momentum=(
+                            args.imu_confidence_pose_prior_ema_momentum
+                        ),
+                        energy_temperature=(
+                            args.imu_confidence_pose_prior_temperature
+                        ),
+                        absolute_target_mode=(
+                            args.imu_confidence_pose_prior_absolute_target_mode
+                        ),
+                        quality_only_confidence=quality_only_confidence,
+                    )
+
+                confidence_schedule_loss = torch.zeros((), device=images.device)
+                if (
+                    args.use_imu_ba
+                    and args.w_imu_confidence_schedule != 0.0
+                    and len(imu_loss_confidences) > 0
+                ):
+                    confidence_schedule_loss = imu_confidence_schedule_loss(
+                        imu_loss_confidences,
+                        args.imu_confidence_schedule_targets,
+                        imu_valid=imu_valid,
                     )
 
                 residual_weight_prior_loss = torch.zeros((), device=images.device)
@@ -1096,6 +1812,8 @@ def train(gpu, args):
                     + args.w_imu_bias * bias_loss
                     + args.w_imu_confidence_saturation * confidence_reg_loss
                     + args.w_imu_confidence_nll * confidence_nll_loss
+                    + args.w_imu_confidence_pose_prior * confidence_pose_prior_loss
+                    + args.w_imu_confidence_schedule * confidence_schedule_loss
                     + args.w_imu_residual_weight_prior * residual_weight_prior_loss
                 )
 
@@ -1122,6 +1840,7 @@ def train(gpu, args):
             metrics.update(flo_metrics)
             metrics.update(imu_metrics)
             metrics.update(confidence_nll_metrics)
+            metrics.update(confidence_pose_prior_metrics)
 
             # Log weighted contributions, not just raw component values.  The
             # relative magnitudes determine whether the IMU branch has enough
@@ -1137,10 +1856,32 @@ def train(gpu, args):
             metrics["loss_confidence_nll_weighted"] = (
                 args.w_imu_confidence_nll * confidence_nll_loss
             ).detach().item()
+            metrics["loss_confidence_pose_prior_weighted"] = (
+                args.w_imu_confidence_pose_prior * confidence_pose_prior_loss
+            ).detach().item()
+            metrics["loss_confidence_schedule_weighted"] = (
+                args.w_imu_confidence_schedule * confidence_schedule_loss
+            ).detach().item()
             metrics["loss_residual_weight_prior_weighted"] = (
                 args.w_imu_residual_weight_prior * residual_weight_prior_loss
             ).detach().item()
             metrics["loss_total"] = loss.detach().item()
+            metrics["imu_pose_only_unroll_steps"] = float(imu_train_pose_only_steps)
+            metrics["imu_full_unroll_steps"] = float(
+                args.iters - imu_train_pose_only_steps
+                if args.use_full_imu_ba
+                else 0
+            )
+            if imu_confidence_augmented is not None:
+                temporal_augmented = imu_confidence_augmented[:, 1:]
+                metrics["imu_confidence_augmented_fraction"] = float(
+                    temporal_augmented.float().mean().detach().item()
+                )
+                metrics["imu_confidence_dropout_fraction"] = float(
+                    imu_confidence_dropout[:, 1:].float().mean().detach().item()
+                    if imu_confidence_dropout is not None
+                    else 0.0
+                )
 
             ####################################################
             # 14-8. IMU bias metric 기록
@@ -1174,7 +1915,7 @@ def train(gpu, args):
                 # misleadingly makes every run look saturated.
                 active_conf = (
                     conf[:, 1:]
-                    if conf.ndim == 2 and conf.shape[1] > 1
+                    if conf.ndim in (2, 3) and conf.shape[1] > 1
                     else conf.reshape(1, -1)[:, :0]
                 )
                 if imu_valid is not None and active_conf.numel() > 0:
@@ -1196,18 +1937,33 @@ def train(gpu, args):
                     metrics["imu_conf_mean"] = active_conf.mean().item()
                     metrics["imu_conf_min"] = active_conf.min().item()
                     metrics["imu_conf_max"] = active_conf.max().item()
+                    if active_conf.ndim == 2 and active_conf.shape[-1] == 3:
+                        metrics["imu_conf_rot_mean"] = active_conf[:, 0].mean().item()
+                        metrics["imu_conf_vel_mean"] = active_conf[:, 1].mean().item()
+                        metrics["imu_conf_pos_mean"] = active_conf[:, 2].mean().item()
                 else:
                     metrics["imu_conf_mean"] = 0.0
                     metrics["imu_conf_min"] = 0.0
                     metrics["imu_conf_max"] = 0.0
                 metrics["imu_conf_active_edges"] = float(active_conf.numel())
 
-                # learnable global IMU BA weight
-                metrics["imu_ba_weight"] = (
+                # Report the factor strength that actually entered DBA.  The
+                # legacy checkpoint scalar is intentionally retained as a
+                # separate diagnostic in confidence-only mode, where it must
+                # not be mistaken for the effective IMU weight.
+                checkpoint_ba_weight = (
                     model.module.get_imu_ba_weight().detach().item()
                 )
+                metrics["imu_ba_weight"] = (
+                    1.0 if args.imu_confidence_only_weighting else checkpoint_ba_weight
+                )
+                if args.imu_confidence_only_weighting:
+                    metrics["imu_ba_checkpoint_weight_ignored"] = checkpoint_ba_weight
                 metrics["imu_conf_saturation_loss"] = confidence_reg_loss.detach().item()
                 metrics["imu_confidence_nll"] = confidence_nll_loss.detach().item()
+                metrics["imu_confidence_schedule_loss"] = (
+                    confidence_schedule_loss.detach().item()
+                )
 
                 if args.use_learned_imu_residual_weights:
                     learned_weights = model.module.get_imu_full_residual_weights().detach()
@@ -1276,12 +2032,27 @@ def train(gpu, args):
 
                 save_checkpoint(model, PATH)
                 print(f"[CKPT] saved {PATH}")
+                if args.save_training_state:
+                    train_state_path = 'checkpoints/%s_trainstate_%06d.pth' % (
+                        args.name,
+                        total_steps,
+                    )
+                    save_training_state(
+                        model,
+                        optimizer,
+                        scheduler,
+                        train_state_path,
+                        total_steps,
+                        sampler_epoch,
+                        rng,
+                    )
+                    print(f"[CKPT] saved training state {train_state_path}")
 
             ####################################################
             # 14-13. 종료 조건
             ####################################################
 
-            if total_steps >= args.steps:
+            if total_steps >= args.stop_after_steps:
                 should_keep_training = False
                 break
 
@@ -1342,12 +2113,30 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
+        '--euroc_camera_frame_stride',
+        type=int,
+        default=1,
+        help=(
+            'retain every Nth raw EuRoC camera frame before forming clips; '
+            'use 2 to train on EuRoC at 10 Hz while preserving all IMU samples'
+        ),
+    )
+    parser.add_argument(
+        '--euroc_keyframe_manifest_root',
+        default=None,
+        help=(
+            'directory of <EuRoC-sequence>.csv files exported by the actual '
+            'DROID MotionFilter; ordered clips use consecutive selected '
+            'keyframes while composing every raw IMU sample between them'
+        ),
+    )
+    parser.add_argument(
         '--imu_train_gyro_noise_density',
         type=float,
         default=None,
         help=(
-            'target gyro white-noise density for TartanAir V2 covariance; '
-            'use the target sensor calibration rather than assuming synthetic IMU is noiseless'
+            'optional gyro white-noise density override for ordered IMU readers; '
+            'EuRoC defaults to imu0/sensor.yaml calibration'
         ),
     )
     parser.add_argument(
@@ -1355,9 +2144,26 @@ if __name__ == '__main__':
         type=float,
         default=None,
         help=(
-            'target accelerometer white-noise density for TartanAir V2 covariance; '
-            'use the target sensor calibration rather than assuming synthetic IMU is noiseless'
+            'optional accelerometer white-noise density override for ordered IMU readers; '
+            'EuRoC defaults to imu0/sensor.yaml calibration'
         ),
+    )
+    parser.add_argument(
+        '--euroc_sequence_include',
+        nargs='+',
+        default=None,
+        metavar='PATTERN',
+        help=(
+            'raw EuRoC sequence-name/path glob(s) permitted for training, '
+            'for example V1_01_easy V1_02_medium; prevents held-out leakage'
+        ),
+    )
+    parser.add_argument(
+        '--euroc_sequence_exclude',
+        nargs='+',
+        default=None,
+        metavar='PATTERN',
+        help='raw EuRoC sequence-name/path glob(s) excluded from training',
     )
 
     ############################################################
@@ -1406,10 +2212,51 @@ if __name__ == '__main__':
             'IMU confidence, IMU BA scale, and IMU biases'
         ),
     )
+    parser.add_argument(
+        '--freeze_global_imu_bias',
+        action='store_true',
+        help=(
+            'keep checkpoint global gyro/accelerometer bias fixed during '
+            'fine-tuning; local 15DoF DBA bias states remain unchanged'
+        ),
+    )
+    parser.add_argument(
+        '--balance_sequence_sampling',
+        action='store_true',
+        help=(
+            'sample ordered multi-sequence datasets with equal expected mass '
+            'per sequence instead of proportional-to-sequence-length clips'
+        ),
+    )
 
     parser.add_argument('--log_freq', type=int, default=100)
     parser.add_argument('--save_freq', type=int, default=10000)
     parser.add_argument('--save_final', action='store_true')
+    parser.add_argument(
+        '--save_training_state',
+        action='store_true',
+        help=(
+            'save optimizer/scheduler/RNG continuation files at ordinary '
+            'checkpoint boundaries; model .pth files remain evaluation-compatible'
+        ),
+    )
+    parser.add_argument(
+        '--resume_training_state',
+        default=None,
+        help=(
+            'resume model, optimizer, scheduler, RNG, and step count from a '
+            'training-state file produced by --save_training_state'
+        ),
+    )
+    parser.add_argument(
+        '--stop_after_steps',
+        type=int,
+        default=None,
+        help=(
+            'exit cleanly once this absolute training step is reached; use '
+            'with --resume_training_state for externally validated segments'
+        ),
+    )
     parser.add_argument('--eval_only', action='store_true')
     parser.add_argument('--disable_flow_loss', action='store_true')
 
@@ -1424,6 +2271,15 @@ if __name__ == '__main__':
         '--use_full_imu_ba',
         action='store_true',
         help='extend training BA with pose+velocity+accel-bias+gyro-bias IMU residuals',
+    )
+    parser.add_argument(
+        '--imu_train_pose_only_steps',
+        type=int,
+        default=0,
+        help=(
+            'number of visual pose/depth-only DBA unrolls before full 15DoF '
+            'IMU DBA; zero preserves the legacy full-IMU-from-step-zero path'
+        ),
     )
     parser.add_argument(
         '--use_pose_velocity_imu_ba',
@@ -1444,6 +2300,31 @@ if __name__ == '__main__':
             'omitting it preserves the value from an IMU checkpoint'
         ),
     )
+    parser.add_argument(
+        '--freeze_imu_ba_weight',
+        action='store_true',
+        help=(
+            'keep the checkpoint global IMU BA scale fixed; useful when the '
+            'only trainable stage-3 parameter is a confidence head'
+        ),
+    )
+    parser.add_argument(
+        '--freeze_imu_confidence_head',
+        action='store_true',
+        help=(
+            'keep the active IMU-confidence head fixed while learning the '
+            'global IMU BA scale; use for a scale-only calibration run'
+        ),
+    )
+    parser.add_argument(
+        '--imu_confidence_only_weighting',
+        action='store_true',
+        help=(
+            'fix the global IMU BA factor weight to 1.0 and let the learned '
+            'temporal IMU-confidence head be the only learned attenuation; '
+            'the legacy imu_ba_log_weight remains in checkpoints but is ignored'
+        ),
+    )
 
     # learned IMU confidence에 최소값을 섞어줄 때 사용
     parser.add_argument(
@@ -1451,6 +2332,30 @@ if __name__ == '__main__':
         type=float,
         default=0.0,
         help='minimum value mixed into learned GRU IMU confidence',
+    )
+    parser.add_argument(
+        '--use_component_imu_confidence',
+        action='store_true',
+        help=(
+            'predict separate GRU confidence for IMU rotation, velocity, and '
+            'position residuals and fuse preintegration quality features'
+        ),
+    )
+    parser.add_argument(
+        '--use_dvi_imu_confidence',
+        action='store_true',
+        help=(
+            'train the DVI-style scalar confidence head: 1x1 GRU projection '
+            'followed by spatial average pooling'
+        ),
+    )
+    parser.add_argument(
+        '--use_dvi_imu_quality_fusion',
+        action='store_true',
+        help=(
+            'add direct preintegrated-IMU quality features to the DVI scalar '
+            'confidence logit; keeps one scalar confidence per temporal factor'
+        ),
     )
     parser.add_argument(
         '--w_imu_confidence_saturation',
@@ -1468,6 +2373,137 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
+        '--w_imu_confidence_pose_prior',
+        type=float,
+        default=0.0,
+        help=(
+            'pre-BA visual-pose/IMU confidence supervision; unlike '
+            '--w_imu_confidence_nll this never uses a full-IMU-BA pose'
+        ),
+    )
+    parser.add_argument(
+        '--imu_confidence_pose_prior_absolute_weight',
+        type=float,
+        default=0.0,
+        help=(
+            'relative weight of data-derived absolute pre-BA confidence '
+            'calibration inside the pose-prior supervisor; zero preserves '
+            'ranking-only behavior'
+        ),
+    )
+    parser.add_argument(
+        '--imu_confidence_pose_prior_ema_momentum',
+        type=float,
+        default=0.98,
+        help=(
+            'EMA momentum for the clean visual/IMU log-energy reference; '
+            'this is residual-unit normalization, not an IMU BA weight'
+        ),
+    )
+    parser.add_argument(
+        '--imu_confidence_pose_prior_temperature',
+        type=float,
+        default=0.75,
+        help='softness of the data-derived absolute confidence target',
+    )
+    parser.add_argument(
+        '--imu_confidence_pose_prior_absolute_target_mode',
+        choices=(
+            'median_residual',
+            'nominal_clean',
+            'split_nominal_quality',
+            'one_sided_nominal_quality',
+        ),
+        default='median_residual',
+        help=(
+            "absolute confidence convention: 'median_residual' centers clean "
+            "visual/IMU disagreement near 0.5; 'nominal_clean' treats the "
+            "provided clean IMU covariance as full information and supervises "
+            "only augmented intervals from residual energy; "
+            "'split_nominal_quality' applies that nominal convention only to "
+            "the raw-IMU quality path while the fused DVI confidence remains "
+            "residual-calibrated; 'one_sided_nominal_quality' preserves full "
+            "confidence in the normal clean residual range and attenuates "
+            "only its learned high-residual tail"
+        ),
+    )
+    parser.add_argument(
+        '--use_imu_confidence_augmentation',
+        action='store_true',
+        help=(
+            'inject train-only preintegration-equivalent gyro/accel noise, '
+            'bias drift, and short partial IMU dropout for confidence learning'
+        ),
+    )
+    parser.add_argument(
+        '--imu_confidence_aug_probability',
+        type=float,
+        default=0.35,
+        help='per-valid-interval probability of synthetic IMU noise corruption',
+    )
+    parser.add_argument(
+        '--imu_confidence_aug_gyro_noise_std',
+        type=float,
+        default=0.03,
+        help='synthetic raw-gyro white-noise density for confidence augmentation',
+    )
+    parser.add_argument(
+        '--imu_confidence_aug_accel_noise_std',
+        type=float,
+        default=0.30,
+        help='synthetic raw-accelerometer white-noise density for confidence augmentation',
+    )
+    parser.add_argument(
+        '--imu_confidence_aug_gyro_bias_drift_std',
+        type=float,
+        default=0.01,
+        help='synthetic gyro-bias random-walk density for confidence augmentation',
+    )
+    parser.add_argument(
+        '--imu_confidence_aug_accel_bias_drift_std',
+        type=float,
+        default=0.10,
+        help='synthetic accelerometer-bias random-walk density for confidence augmentation',
+    )
+    parser.add_argument(
+        '--imu_confidence_aug_dropout_probability',
+        type=float,
+        default=0.35,
+        help='per-clip probability of one contiguous partial-IMU dropout',
+    )
+    parser.add_argument(
+        '--imu_confidence_aug_dropout_max_length',
+        type=int,
+        default=2,
+        help='maximum selected camera intervals in a synthetic dropout run',
+    )
+    parser.add_argument(
+        '--imu_confidence_aug_dropout_info_scale',
+        type=float,
+        default=0.05,
+        help='remaining propagated information for a synthetic dropout interval',
+    )
+    parser.add_argument(
+        '--w_imu_confidence_schedule',
+        type=float,
+        default=0.0,
+        help=(
+            'weight of an optional weak mean-confidence curriculum applied '
+            'to successive full-IMU DBA unrolls'
+        ),
+    )
+    parser.add_argument(
+        '--imu_confidence_schedule_targets',
+        type=float,
+        nargs='+',
+        default=None,
+        metavar='C',
+        help=(
+            'manual confidence targets in [0,1] for full-IMU DBA unrolls; '
+            'for example: 0.25 0.50 0.75 1.00'
+        ),
+    )
+    parser.add_argument(
         '--imu_confidence_saturation_ceiling',
         type=float,
         default=0.95,
@@ -1482,7 +2518,11 @@ if __name__ == '__main__':
         '--imu_confidence_reset_value',
         type=float,
         default=0.5,
-        help='neutral sigmoid confidence used with --reset_imu_confidence_head',
+        help=(
+            'sigmoid confidence used with --reset_imu_confidence_head; '
+            'use about 0.95 with --imu_confidence_only_weighting so IMU '
+            'starts near full strength'
+        ),
     )
     parser.add_argument(
         '--use_adaptive_imu_gate',
@@ -1493,6 +2533,11 @@ if __name__ == '__main__':
         '--use_learned_imu_residual_weights',
         action='store_true',
         help='learn checkpointed relative position/velocity IMU weights while rotation anchors factor scale',
+    )
+    parser.add_argument(
+        '--reset_imu_residual_weights',
+        action='store_true',
+        help='initialize learned relative position/velocity IMU weights to the fixed (0.05, 0.05) reference',
     )
     parser.add_argument(
         '--w_imu_residual_weight_prior',
@@ -1638,6 +2683,28 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+    if args.stop_after_steps is None:
+        args.stop_after_steps = args.steps
+    if args.steps <= 0:
+        raise ValueError('--steps must be positive')
+    if args.stop_after_steps <= 0 or args.stop_after_steps > args.steps:
+        raise ValueError(
+            '--stop_after_steps must be positive and no greater than --steps'
+        )
+    if (
+        args.resume_training_state is not None
+        and not os.path.isfile(args.resume_training_state)
+    ):
+        raise FileNotFoundError(
+            f'--resume_training_state does not exist: {args.resume_training_state}'
+        )
+    if args.eval_only and (
+        args.resume_training_state is not None or args.save_training_state
+    ):
+        raise ValueError(
+            '--resume_training_state / --save_training_state are training-only options'
+        )
+
     # full IMU loss를 켜면 일반 IMU loss flag도 자동으로 켬
     if args.use_full_imu_loss:
         args.use_imu_loss = True
@@ -1650,8 +2717,68 @@ if __name__ == '__main__':
         args.use_full_imu_ba = True
         args.use_imu_ba = True
 
+    if args.iters <= 0:
+        raise ValueError('--iters must be positive')
+    if args.imu_train_pose_only_steps < 0:
+        raise ValueError('--imu_train_pose_only_steps must be non-negative')
+    if args.imu_train_pose_only_steps > 0 and not args.use_full_imu_ba:
+        raise ValueError(
+            '--imu_train_pose_only_steps requires --use_full_imu_ba'
+        )
+    if (
+        args.use_full_imu_ba
+        and args.imu_train_pose_only_steps >= args.iters
+    ):
+        raise ValueError(
+            '--imu_train_pose_only_steps must be smaller than --iters so at '
+            'least one full 15DoF IMU DBA step remains'
+        )
+
     if args.use_learned_imu_residual_weights and not args.use_full_imu_ba:
         raise ValueError('--use_learned_imu_residual_weights requires --use_full_imu_ba')
+    if args.reset_imu_residual_weights and not args.use_learned_imu_residual_weights:
+        raise ValueError(
+            '--reset_imu_residual_weights requires '
+            '--use_learned_imu_residual_weights'
+        )
+    if args.reset_imu_residual_weights and args.resume_training_state is not None:
+        raise ValueError(
+            '--reset_imu_residual_weights is incompatible with '
+            '--resume_training_state; a resumed run must retain its learned '
+            'relative weights'
+        )
+    if args.use_component_imu_confidence and not args.use_full_imu_ba:
+        raise ValueError('--use_component_imu_confidence requires --use_full_imu_ba')
+    if args.use_dvi_imu_confidence and not args.use_full_imu_ba:
+        raise ValueError('--use_dvi_imu_confidence requires --use_full_imu_ba')
+    if args.use_dvi_imu_confidence and args.use_component_imu_confidence:
+        raise ValueError('choose only one of --use_dvi_imu_confidence and --use_component_imu_confidence')
+    if args.use_dvi_imu_quality_fusion and not args.use_dvi_imu_confidence:
+        raise ValueError(
+            '--use_dvi_imu_quality_fusion requires --use_dvi_imu_confidence'
+        )
+    if args.imu_confidence_only_weighting:
+        if not args.use_full_imu_ba:
+            raise ValueError(
+                '--imu_confidence_only_weighting requires --use_full_imu_ba'
+            )
+        if not (args.use_dvi_imu_confidence or args.use_component_imu_confidence):
+            raise ValueError(
+                '--imu_confidence_only_weighting requires a learned IMU '
+                'confidence head (--use_dvi_imu_confidence or '
+                '--use_component_imu_confidence)'
+            )
+        if args.imu_ba_weight is not None:
+            raise ValueError(
+                '--imu_ba_weight is incompatible with '
+                '--imu_confidence_only_weighting; the global factor weight '
+                'is fixed to 1.0'
+            )
+        if args.freeze_imu_confidence_head:
+            raise ValueError(
+                '--freeze_imu_confidence_head is incompatible with '
+                '--imu_confidence_only_weighting'
+            )
     if args.use_imu_noise_model and not (args.use_full_imu_ba or args.use_full_imu_loss):
         raise ValueError('--use_imu_noise_model requires full IMU BA or full IMU loss')
     if args.w_imu_residual_weight_prior < 0.0:
@@ -1659,6 +2786,8 @@ if __name__ == '__main__':
     if any(value <= 0 for value in args.imu_train_frame_strides):
         raise ValueError('--imu_train_frame_strides must contain positive integers')
     args.imu_train_frame_strides = sorted(set(args.imu_train_frame_strides))
+    if args.euroc_camera_frame_stride <= 0:
+        raise ValueError('--euroc_camera_frame_stride must be positive')
     for option in (
         'imu_train_gyro_noise_density',
         'imu_train_accel_noise_density',
@@ -1677,6 +2806,118 @@ if __name__ == '__main__':
         raise ValueError('--w_imu_confidence_saturation must be non-negative')
     if args.w_imu_confidence_nll < 0.0:
         raise ValueError('--w_imu_confidence_nll must be non-negative')
+    if args.w_imu_confidence_pose_prior < 0.0:
+        raise ValueError('--w_imu_confidence_pose_prior must be non-negative')
+    if args.imu_confidence_pose_prior_absolute_weight < 0.0:
+        raise ValueError(
+            '--imu_confidence_pose_prior_absolute_weight must be non-negative'
+        )
+    if not 0.0 <= args.imu_confidence_pose_prior_ema_momentum < 1.0:
+        raise ValueError(
+            '--imu_confidence_pose_prior_ema_momentum must lie in [0, 1)'
+        )
+    if args.imu_confidence_pose_prior_temperature <= 0.0:
+        raise ValueError(
+            '--imu_confidence_pose_prior_temperature must be positive'
+        )
+    if args.w_imu_confidence_schedule < 0.0:
+        raise ValueError('--w_imu_confidence_schedule must be non-negative')
+    if args.w_imu_confidence_schedule > 0.0:
+        if not args.imu_confidence_schedule_targets:
+            raise ValueError(
+                '--w_imu_confidence_schedule requires '
+                '--imu_confidence_schedule_targets'
+            )
+        if any(
+            value < 0.0 or value > 1.0
+            for value in args.imu_confidence_schedule_targets
+        ):
+            raise ValueError(
+                '--imu_confidence_schedule_targets values must lie in [0,1]'
+            )
+    if args.w_imu_confidence_pose_prior > 0.0:
+        if not args.use_full_imu_ba:
+            raise ValueError(
+                '--w_imu_confidence_pose_prior requires --use_full_imu_ba'
+            )
+        if args.imu_train_pose_only_steps <= 0:
+            raise ValueError(
+                '--w_imu_confidence_pose_prior requires at least one '
+                'visual-only unroll via --imu_train_pose_only_steps'
+            )
+        if not args.use_dvi_imu_confidence:
+            raise ValueError(
+                '--w_imu_confidence_pose_prior currently supervises the '
+                'single DVI scalar confidence; add --use_dvi_imu_confidence'
+            )
+        if args.w_imu_confidence_nll != 0.0:
+            raise ValueError(
+                'choose exactly one confidence supervisor: pose-prior ranking '
+                'uses pre-BA visual poses, so --w_imu_confidence_nll must be 0'
+            )
+    elif args.imu_confidence_pose_prior_absolute_weight != 0.0:
+        raise ValueError(
+            '--imu_confidence_pose_prior_absolute_weight requires '
+            '--w_imu_confidence_pose_prior > 0'
+        )
+    if args.use_imu_confidence_augmentation:
+        if args.w_imu_confidence_pose_prior <= 0.0:
+            raise ValueError(
+                '--use_imu_confidence_augmentation requires '
+                '--w_imu_confidence_pose_prior so degradation has the '
+                'intended pre-BA confidence supervision'
+            )
+        if not args.use_imu_ba:
+            raise ValueError('--use_imu_confidence_augmentation requires --use_imu_ba')
+        probability_options = (
+            'imu_confidence_aug_probability',
+            'imu_confidence_aug_dropout_probability',
+        )
+        for option in probability_options:
+            value = float(getattr(args, option))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f'--{option} must lie in [0, 1]')
+        nonnegative_options = (
+            'imu_confidence_aug_gyro_noise_std',
+            'imu_confidence_aug_accel_noise_std',
+            'imu_confidence_aug_gyro_bias_drift_std',
+            'imu_confidence_aug_accel_bias_drift_std',
+        )
+        for option in nonnegative_options:
+            if float(getattr(args, option)) < 0.0:
+                raise ValueError(f'--{option} must be non-negative')
+        if args.imu_confidence_aug_dropout_max_length <= 0:
+            raise ValueError('--imu_confidence_aug_dropout_max_length must be positive')
+        if not 0.0 < args.imu_confidence_aug_dropout_info_scale <= 1.0:
+            raise ValueError(
+                '--imu_confidence_aug_dropout_info_scale must lie in (0, 1]'
+            )
+    if args.imu_confidence_only_weighting:
+        if args.w_imu_confidence_saturation != 0.0:
+            raise ValueError(
+                '--imu_confidence_only_weighting must not use '
+                '--w_imu_confidence_saturation: confidence=1 is the full-IMU '
+                'reference, not a saturation error'
+            )
+        if args.w_imu_confidence_schedule != 0.0:
+            raise ValueError(
+                '--imu_confidence_only_weighting must not use a manual '
+                'mean-confidence schedule'
+            )
+        if (
+            args.w_imu_confidence_nll <= 0.0
+            and args.w_imu_confidence_pose_prior <= 0.0
+        ):
+            raise ValueError(
+                '--imu_confidence_only_weighting requires a positive '
+                'confidence supervisor (--w_imu_confidence_nll or '
+                '--w_imu_confidence_pose_prior) to prevent collapse'
+            )
+        if args.imu_conf_floor != 0.0:
+            raise ValueError(
+                '--imu_confidence_only_weighting requires --imu_conf_floor 0; '
+                'the predicted confidence must be used directly'
+            )
     if not 0.0 < args.imu_confidence_saturation_ceiling < 1.0:
         raise ValueError('--imu_confidence_saturation_ceiling must be in (0, 1)')
     if not 0.0 < args.imu_confidence_reset_value < 1.0:

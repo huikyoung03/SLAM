@@ -56,9 +56,13 @@ from geom.imu_factor import (
 
     compute_imu_adaptive_gate,
 
+    edge_imu_quality_features,
+
     imu_center_from_pose_data,
 
     temporal_imu_confidence_from_edges,
+
+    temporal_imu_quality_features,
 
 )
 
@@ -149,7 +153,26 @@ def initialize_imu_motion(
     return motion
 
 
+def full_imu_unroll_schedule(num_steps, use_full_imu_ba, pose_only_steps=0):
+    """Return whether each unrolled DBA step uses the full IMU state.
 
+    A two-stage local solve first gives visual DBA iterations to establish a
+    pose/depth estimate. Only then are velocity and local bias states added.
+    ``pose_only_steps=0`` preserves the previous full-IMU behavior.
+    """
+
+    num_steps = int(num_steps)
+    pose_only_steps = int(pose_only_steps)
+    if num_steps < 0:
+        raise ValueError(f"num_steps must be non-negative, got {num_steps}")
+    if pose_only_steps < 0:
+        raise ValueError(
+            f"pose_only_steps must be non-negative, got {pose_only_steps}"
+        )
+    if not use_full_imu_ba:
+        return [False] * num_steps
+
+    return [step >= pose_only_steps for step in range(num_steps)]
 
 
 @torch.no_grad()
@@ -176,9 +199,13 @@ def temporal_visual_confidence(weight, ii, jj, num_frames):
 
 
 
+    # Visual DBA has two per-pixel channels, unlike IMU component confidence.
+    # Reduce them first so the generic temporal helper keeps a scalar channel.
+    visual_weight = weight.detach().float().mean(dim=-1, keepdim=True)
+
     return temporal_imu_confidence_from_edges(
 
-        weight.detach().float(),
+        visual_weight,
 
         ii,
 
@@ -411,6 +438,58 @@ class UpdateModule(nn.Module):
 
             nn.Sigmoid())
 
+        # DVI-SLAM scalar confidence head.  Keep it independent from the
+        # legacy 3x3 head and from the later component-confidence experiment:
+        # DVI uses a 1x1 projection of the visual recurrent state followed by
+        # spatial average pooling to obtain one confidence per graph edge.
+        # The zero logit initialization makes its pre-training output exactly
+        # 0.5, so the learned arm has a documented neutral starting point.
+        self.dvi_imu_confidence = nn.Conv2d(128, 1, kernel_size=1)
+        nn.init.zeros_(self.dvi_imu_confidence.weight)
+        nn.init.zeros_(self.dvi_imu_confidence.bias)
+
+        # Add direct preintegrated-IMU quality to the DVI scalar confidence
+        # without changing the scalar factor contract. The final projection
+        # starts at zero, so old scalar-DVI behaviour is preserved until this
+        # branch is explicitly enabled and trained.
+        self.dvi_imu_quality_fusion = nn.Sequential(
+
+            nn.Linear(7, 32),
+
+            nn.ReLU(inplace=True),
+
+            nn.Linear(32, 1))
+        nn.init.zeros_(self.dvi_imu_quality_fusion[2].weight)
+        nn.init.zeros_(self.dvi_imu_quality_fusion[2].bias)
+
+        # Component-wise IMU confidence.  The output channel order is fixed
+        # as [rotation, velocity, position].  It is intentionally separate
+        # from the legacy scalar head so old checkpoints and ablations remain
+        # reproducible unless the new path is explicitly enabled.
+        self.imu_component_confidence = nn.Sequential(
+
+            nn.Conv2d(128, 128, 3, padding=1),
+
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 3, 3, padding=1),
+
+            GradientClip())
+
+        # Preintegrated interval quality is available at training and runtime:
+        # [dt, angular rate, acceleration proxy, position proxy,
+        #  rotation/velocity/position information].  The final layer is reset
+        # to zero when component mode is initialized from a scalar checkpoint,
+        # which preserves the scalar output at step zero while retaining a
+        # nonzero hidden representation for gradient flow.
+        self.imu_quality_fusion = nn.Sequential(
+
+            nn.Linear(7, 32),
+
+            nn.ReLU(inplace=True),
+
+            nn.Linear(32, 3))
+
 
 
         self.gru = ConvGRU(128, 128+128+64)
@@ -419,7 +498,94 @@ class UpdateModule(nn.Module):
 
 
 
-    def forward(self, net, inp, corr, flow=None, ii=None, jj=None, return_imu_confidence=False):
+    def initialize_component_imu_confidence_from_scalar(self):
+        """Seed the three confidence channels from a trained scalar head.
+
+        This compatibility initializer gives a component-confidence fine-tune
+        the exact old behavior at step zero. The quality MLP output starts
+        neutral, but its first layer keeps its standard nonzero initialization
+        so the final layer can learn from IMU-quality features immediately.
+        """
+
+        with torch.no_grad():
+            self.imu_component_confidence[0].weight.copy_(self.imu_confidence[0].weight)
+            self.imu_component_confidence[0].bias.copy_(self.imu_confidence[0].bias)
+            self.imu_component_confidence[2].weight.copy_(
+                self.imu_confidence[2].weight.expand_as(
+                    self.imu_component_confidence[2].weight
+                )
+            )
+            self.imu_component_confidence[2].bias.copy_(
+                self.imu_confidence[2].bias.expand_as(
+                    self.imu_component_confidence[2].bias
+                )
+            )
+            # Do not zero both MLP layers: an all-zero two-layer ReLU MLP has
+            # zero gradients everywhere and can never use IMU-quality inputs.
+            # Zeroing only the output projection keeps its initial additive
+            # logit exactly zero while allowing that projection to learn.
+            self.imu_quality_fusion[2].weight.zero_()
+            self.imu_quality_fusion[2].bias.zero_()
+
+
+    def initialize_dvi_imu_quality_fusion(self):
+        """Reset only the scalar DVI quality contribution to neutral.
+
+        The first layer remains randomly initialized so the output projection
+        receives a nonzero gradient on the first learning step.
+        """
+
+        with torch.no_grad():
+            self.dvi_imu_quality_fusion[2].weight.zero_()
+            self.dvi_imu_quality_fusion[2].bias.zero_()
+
+
+    def dvi_imu_quality_logits(self, imu_quality):
+        """Predict one scalar reliability logit from each IMU interval.
+
+        This path is used when an otherwise-valid temporal IMU factor has no
+        direct visual graph edge. It reuses the trained DVI quality MLP and
+        is not a second confidence head or a global IMU multiplier.
+        """
+
+        if imu_quality is None:
+            return None
+        quality = imu_quality
+        if quality.ndim == 2:
+            quality = quality.unsqueeze(0)
+        if quality.ndim != 3 or quality.shape[-1] != 7:
+            raise ValueError(
+                "imu_quality must be [B, N, 7] for DVI scalar quality "
+                f"confidence, got {tuple(imu_quality.shape)}"
+            )
+        quality = quality.to(
+            device=self.dvi_imu_confidence.weight.device,
+            dtype=self.dvi_imu_confidence.weight.dtype,
+        )
+        return self.dvi_imu_quality_fusion(quality)
+
+
+    def dvi_imu_quality_confidence(self, imu_quality):
+        """Return one quality-only confidence for each temporal IMU row."""
+
+        logits = self.dvi_imu_quality_logits(imu_quality)
+        return None if logits is None else torch.sigmoid(logits)
+
+
+    def forward(
+        self,
+        net,
+        inp,
+        corr,
+        flow=None,
+        ii=None,
+        jj=None,
+        return_imu_confidence=False,
+        return_component_imu_confidence=False,
+        use_dvi_imu_confidence=False,
+        use_dvi_imu_quality_fusion=False,
+        imu_quality=None,
+    ):
 
         """ RaftSLAM update operator """
 
@@ -439,7 +605,7 @@ class UpdateModule(nn.Module):
 
         net = net.view(batch*num, -1, ht, wd)
 
-        inp = inp.view(batch*num, -1, ht, wd)        
+        inp = inp.view(batch*num, -1, ht, wd)
 
         corr = corr.view(batch*num, -1, ht, wd)
 
@@ -461,7 +627,55 @@ class UpdateModule(nn.Module):
 
         weight = self.weight(net).view(*output_dim)
 
-        imu_confidence = self.imu_confidence(net).view(*output_dim)
+        if return_component_imu_confidence:
+            component_logits = self.imu_component_confidence(net).view(*output_dim)
+            component_logits = component_logits.permute(0, 1, 3, 4, 2).contiguous()
+            if imu_quality is None:
+                quality_logits = torch.zeros(
+                    (batch, num, 1, 1, 3),
+                    device=net.device,
+                    dtype=component_logits.dtype,
+                )
+            else:
+                quality = imu_quality.to(device=net.device, dtype=component_logits.dtype)
+                if quality.ndim == 2:
+                    quality = quality.unsqueeze(0)
+                if quality.shape[:2] != (batch, num) or quality.shape[-1] != 7:
+                    raise ValueError(
+                        "imu_quality must be [B, E, 7] for component confidence, "
+                        f"got {tuple(imu_quality.shape)} for B={batch}, E={num}"
+                    )
+                quality_logits = self.imu_quality_fusion(quality).unsqueeze(2).unsqueeze(2)
+            imu_confidence = torch.sigmoid(component_logits + quality_logits)
+        elif use_dvi_imu_confidence:
+            # [B*E, 1, H, W] -> one DVI scalar per edge.  Retaining the two
+            # singleton spatial dimensions keeps the tensor compatible with
+            # the existing edge-to-temporal confidence aggregation helper.
+            dvi_logits = self.dvi_imu_confidence(net)
+            dvi_logits = dvi_logits.mean(dim=(2, 3), keepdim=True).view(
+                batch, num, 1, 1, 1
+            )
+            if use_dvi_imu_quality_fusion:
+                if imu_quality is None:
+                    quality_logits = torch.zeros_like(dvi_logits)
+                else:
+                    quality_logits = self.dvi_imu_quality_logits(imu_quality)
+                    if quality_logits.shape[:2] != (batch, num):
+                        raise ValueError(
+                            "imu_quality must be [B, E, 7] for DVI scalar "
+                            f"quality fusion, got {tuple(imu_quality.shape)} for "
+                            f"B={batch}, E={num}"
+                        )
+                    quality_logits = quality_logits.to(
+                        device=net.device, dtype=net.dtype
+                    ).view(
+                        batch, num, 1, 1, 1
+                    )
+                imu_confidence = torch.sigmoid(dvi_logits + quality_logits)
+            else:
+                imu_confidence = torch.sigmoid(dvi_logits)
+        else:
+            imu_confidence = self.imu_confidence(net).view(*output_dim)
 
 
 
@@ -469,7 +683,8 @@ class UpdateModule(nn.Module):
 
         weight = weight.permute(0,1,3,4,2)[...,:2].contiguous()
 
-        imu_confidence = imu_confidence.permute(0,1,3,4,2)[...,:1].contiguous()
+        if not return_component_imu_confidence:
+            imu_confidence = imu_confidence.permute(0,1,3,4,2)[...,:1].contiguous()
 
 
 
@@ -544,6 +759,14 @@ class DroidNet(nn.Module):
         # log-domain parameter를 Softplus로 양수 weight로 변환한다.
         self.imu_ba_log_weight = nn.Parameter(torch.tensor(-3.0))
 
+        # Data-derived scale for the pre-BA visual/IMU calibration loss. This
+        # is deliberately not a BA factor multiplier or a fixed confidence
+        # schedule; it merely makes the pose/IMU energy dimensionless while
+        # preserving the same reference across resumed training segments.
+        self.register_buffer(
+            "imu_confidence_energy_log_reference", torch.tensor(float("nan"))
+        )
+
         # Relative translation terms are learned independently from the global
 
         # IMU factor strength. Rotation remains the reference term, preventing
@@ -599,6 +822,21 @@ class DroidNet(nn.Module):
             [F.softplus(self.imu_pos_log_weight), F.softplus(self.imu_vel_log_weight)]
 
         )
+
+
+    def initialize_component_imu_confidence_from_scalar(self):
+        self.update.initialize_component_imu_confidence_from_scalar()
+
+
+    def initialize_dvi_imu_quality_fusion(self):
+        self.update.initialize_dvi_imu_quality_fusion()
+
+
+    def reset_imu_confidence_calibration(self):
+        """Forget an old run's pre-BA residual reference for a fresh run."""
+
+        with torch.no_grad():
+            self.imu_confidence_energy_log_reference.fill_(float("nan"))
 
 
 
@@ -674,13 +912,23 @@ class DroidNet(nn.Module):
 
         imu_ba_weight=None,
 
+        imu_confidence_only_weighting=False,
+
         imu_ba_max_residual=0.5,
 
         imu_confidence_floor=0.0,
 
         return_imu_confidence=False,
 
+        use_component_imu_confidence=False,
+
+        use_dvi_imu_confidence=False,
+
+        use_dvi_imu_quality_fusion=False,
+
         use_full_imu_ba=False,
+
+        imu_pose_only_steps=0,
 
         imu_full_pos_weight=0.05,
 
@@ -780,11 +1028,34 @@ class DroidNet(nn.Module):
         # imu_delta가 전달된 경우 visual-only BA가 아니라 IMU factor도 활성화
         use_imu_ba = imu_delta is not None
 
+        use_component_imu_confidence = bool(
+            use_component_imu_confidence and (return_imu_confidence or use_imu_ba)
+        )
+        use_dvi_imu_confidence = bool(
+            use_dvi_imu_confidence
+            and not use_component_imu_confidence
+            and (return_imu_confidence or use_imu_ba)
+        )
+        use_dvi_imu_quality_fusion = bool(
+            use_dvi_imu_quality_fusion and use_dvi_imu_confidence
+        )
+
         use_full_imu_ba = bool(use_full_imu_ba and use_imu_ba)
 
         if use_imu_ba:
 
-            imu_ba_weight_value = self.get_imu_ba_weight() if imu_ba_weight is None else imu_ba_weight
+            # In this mode confidence is the only learned attenuation of a
+            # temporal IMU factor.  Keep ``imu_ba_log_weight`` in the module
+            # for old checkpoint compatibility, but do not read it here.
+            # This makes c=1 mean full covariance-relative IMU strength.
+            if imu_confidence_only_weighting:
+                imu_ba_weight_value = 1.0
+            else:
+                imu_ba_weight_value = (
+                    self.get_imu_ba_weight()
+                    if imu_ba_weight is None
+                    else imu_ba_weight
+                )
 
         else:
 
@@ -802,38 +1073,75 @@ class DroidNet(nn.Module):
 
 
 
+        # Delay the full inertial state initialization until the visual-only
+        # prefix has refined pose/depth. This matches the runtime two-stage
+        # local DBA instead of deriving velocity from the raw pose seed.
+        full_imu_schedule = full_imu_unroll_schedule(
+            num_steps,
+            use_full_imu_ba,
+            pose_only_steps=imu_pose_only_steps,
+        )
         imu_motion = None
-
         imu_motion_prior = None
-
-        if use_full_imu_ba:
-
-            imu_motion = initialize_imu_motion(
-
-                Gs,
-
-                imu_delta,
-
-                mode=imu_velocity_init,
-
-                imu_camera_translation=imu_camera_translation,
-
-            )
-
-            imu_motion_prior = imu_motion.clone()
 
 
 
         Gs_list, disp_list, residual_list = [], [], []
 
         imu_confidence_list, imu_adaptive_gate_list, imu_motion_list = [], [], []
+        imu_edge_quality = (
+            edge_imu_quality_features(
+                imu_delta,
+                imu_info,
+                ii,
+                jj,
+                num_frames=Gs.data.shape[1],
+            )
+            if use_component_imu_confidence or use_dvi_imu_quality_fusion
+            else None
+        )
+        # In a streaming factor graph, an IMU interval may remain valid while
+        # its direct visual edge is absent.  Prepare a quality-only confidence
+        # for those rows now; direct temporal edges still receive the normal
+        # visual-GRU + quality prediction below.
+        imu_temporal_quality = (
+            temporal_imu_quality_features(
+                imu_delta,
+                imu_info,
+                num_frames=Gs.data.shape[1],
+            )
+            if use_dvi_imu_quality_fusion
+            else None
+        )
+        imu_quality_fallback = (
+            self.update.dvi_imu_quality_confidence(imu_temporal_quality)
+            if imu_temporal_quality is not None
+            else None
+        )
 
         # DROID는 한 번에 pose를 예측하지 않고 ConvGRU -> BA를 여러 번 unroll한다.
         for step in range(num_steps):
 
+            step_use_full_imu_ba = full_imu_schedule[step]
+            # A pose-only prefix must be genuinely visual-only: passing
+            # imu_delta to BA would otherwise activate the legacy rotation
+            # factor even while full IMU BA is disabled for this step.
+            step_use_imu_ba = use_imu_ba and (
+                not use_full_imu_ba or step_use_full_imu_ba
+            )
+
             Gs = Gs.detach()
 
             disps = disps.detach()
+
+            if step_use_full_imu_ba and imu_motion is None:
+                imu_motion = initialize_imu_motion(
+                    Gs,
+                    imu_delta,
+                    mode=imu_velocity_init,
+                    imu_camera_translation=imu_camera_translation,
+                )
+                imu_motion_prior = imu_motion.clone()
 
             if imu_motion is not None:
 
@@ -890,13 +1198,21 @@ class DroidNet(nn.Module):
 
                 jj,
 
-                return_imu_confidence=return_imu_confidence or use_imu_ba,
+                return_imu_confidence=return_imu_confidence or step_use_imu_ba,
+
+                return_component_imu_confidence=use_component_imu_confidence,
+
+                use_dvi_imu_confidence=use_dvi_imu_confidence,
+
+                use_dvi_imu_quality_fusion=use_dvi_imu_quality_fusion,
+
+                imu_quality=imu_edge_quality,
 
             )
 
 
 
-            if return_imu_confidence or use_imu_ba:
+            if return_imu_confidence or step_use_imu_ba:
 
                 net, delta, weight, eta, upmask, imu_edge_confidence = update_out
 
@@ -910,7 +1226,11 @@ class DroidNet(nn.Module):
 
                     num_frames=Gs.data.shape[1],
 
-                    fallback=1.0,
+                    fallback=(
+                        imu_quality_fallback
+                        if imu_quality_fallback is not None
+                        else 1.0
+                    ),
 
                 )
 
@@ -930,7 +1250,7 @@ class DroidNet(nn.Module):
 
             imu_adaptive_gate = None
 
-            if use_imu_ba and use_adaptive_imu_gate:
+            if step_use_imu_ba and use_adaptive_imu_gate:
 
                 visual_confidence = temporal_visual_confidence(
 
@@ -964,9 +1284,13 @@ class DroidNet(nn.Module):
 
                     imu_optimize_bias=imu_optimize_bias,
 
-                    compose_order=imu_full_compose_order if use_full_imu_ba else "prev_dq",
+                    compose_order=(
+                        imu_full_compose_order
+                        if step_use_full_imu_ba
+                        else "prev_dq"
+                    ),
 
-                    inverse_imu=imu_full_inverse if use_full_imu_ba else False,
+                    inverse_imu=imu_full_inverse if step_use_full_imu_ba else False,
 
                     gate_min=imu_gate_min,
 
@@ -1017,25 +1341,35 @@ class DroidNet(nn.Module):
 
                     jj,
 
-                    fixedp=2,
+                    fixedp=fixedp,
 
-                    imu_delta=imu_delta,
+                    imu_delta=imu_delta if step_use_imu_ba else None,
 
-                    imu_valid=imu_valid,
+                    imu_valid=imu_valid if step_use_imu_ba else None,
 
-                    imu_info=imu_info,
+                    imu_info=imu_info if step_use_imu_ba else None,
 
-                    imu_info_reference=imu_info_reference,
+                    imu_info_reference=(
+                        imu_info_reference if step_use_imu_ba else None
+                    ),
 
-                    imu_bias_jacobian=imu_bias_jacobian,
+                    imu_bias_jacobian=(
+                        imu_bias_jacobian if step_use_imu_ba else None
+                    ),
 
                     gyro_bias=self.imu_gyro_bias,
 
-                    imu_factor_weight=imu_ba_weight_value,
+                    imu_factor_weight=(
+                        imu_ba_weight_value if step_use_imu_ba else 0.0
+                    ),
 
-                    imu_confidence=imu_confidence,
+                    imu_confidence=(
+                        imu_confidence if step_use_imu_ba else None
+                    ),
 
-                    imu_adaptive_gate=imu_adaptive_gate,
+                    imu_adaptive_gate=(
+                        imu_adaptive_gate if step_use_imu_ba else None
+                    ),
 
                     imu_max_residual=imu_ba_max_residual,
 
@@ -1047,7 +1381,7 @@ class DroidNet(nn.Module):
 
                     imu_camera_translation=imu_camera_translation,
 
-                    use_full_imu=use_full_imu_ba,
+                    use_full_imu=step_use_full_imu_ba,
 
                     imu_full_pos_weight=imu_full_pos_weight,
 
@@ -1075,7 +1409,7 @@ class DroidNet(nn.Module):
 
                 )
 
-                if use_full_imu_ba:
+                if step_use_full_imu_ba:
 
                     Gs, disps, imu_motion = ba_out
 
@@ -1105,7 +1439,10 @@ class DroidNet(nn.Module):
 
                 imu_adaptive_gate_list.append(imu_adaptive_gate)
 
-            if return_imu_motion and imu_motion is not None:
+            # This list deliberately begins at the full-IMU stage. Training
+            # slices pose/confidence outputs by the same prefix before
+            # evaluating r_p, r_v, r_R, r_ba, r_bg.
+            if return_imu_motion and step_use_full_imu_ba and imu_motion is not None:
 
                 imu_motion_list.append(imu_motion)
 

@@ -18,6 +18,13 @@ import torch
 
 IMU_BIAS_JACOBIAN_NAMES = ("J_R_bg", "J_v_ba", "J_v_bg", "J_p_ba", "J_p_bg")
 
+# The learned confidence head uses one value for each physical part of a full
+# preintegrated IMU factor.  Keep this order shared by the network, training
+# loss, and both DBA implementations; residuals themselves remain ordered as
+# [position, velocity, rotation, accel-bias, gyro-bias].
+IMU_CONFIDENCE_COMPONENTS = ("rotation", "velocity", "position")
+IMU_QUALITY_FEATURE_DIM = 7
+
 
 def quat_normalize(q: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     return q / q.norm(dim=-1, keepdim=True).clamp_min(eps)
@@ -357,7 +364,7 @@ def temporal_imu_confidence_from_edges(
     ii: torch.Tensor,
     jj: torch.Tensor,
     num_frames: int,
-    fallback: float = 1.0,
+    fallback: Union[float, torch.Tensor] = 1.0,
     return_coverage: bool = False,
 ):
     """Convert GRU edge confidence maps into confidence for temporal IMU factors.
@@ -369,9 +376,11 @@ def temporal_imu_confidence_from_edges(
     forward/reverse graph edges for each temporal pair and averages the two
     directions when both exist.
 
-    Missing temporal visual edges receive a neutral constant confidence.  They
-    remain valid IMU constraints, but do not inject an unrelated visual edge's
-    learned confidence into the factor.
+    Missing temporal visual edges receive ``fallback``.  This is normally a
+    neutral constant for legacy callers.  The scalar DVI quality-fusion path
+    instead supplies its IMU-quality-only confidence for every temporal row,
+    so a factor never silently becomes full-strength merely because the
+    current visual graph lacks the direct ``(j-1, j)`` edge.
     """
 
     if edge_confidence is None:
@@ -382,12 +391,16 @@ def temporal_imu_confidence_from_edges(
 
     confidence = edge_confidence
     if confidence.ndim == 1:
-        confidence = confidence.unsqueeze(0)
-    elif confidence.ndim > 2:
-        confidence = confidence.mean(dim=tuple(range(2, confidence.ndim)))
-    if confidence.ndim != 2:
+        confidence = confidence.unsqueeze(0).unsqueeze(-1)
+    elif confidence.ndim == 2:
+        confidence = confidence.unsqueeze(-1)
+    elif confidence.ndim > 3:
+        # UpdateModule emits [B, E, H, W, C].  Spatially pool every axis
+        # between edge and component while preserving the final C channels.
+        confidence = confidence.mean(dim=tuple(range(2, confidence.ndim - 1)))
+    if confidence.ndim != 3:
         raise ValueError(
-            "edge_confidence must be [E], [B, E], or [B, E, ...], "
+            "edge_confidence must be [E], [B, E], or [B, E, ..., C], "
             f"got {tuple(edge_confidence.shape)}"
         )
 
@@ -400,7 +413,37 @@ def temporal_imu_confidence_from_edges(
         )
 
     num_frames = int(num_frames)
-    temporal = confidence.new_full((confidence.shape[0], num_frames), float(fallback))
+    if torch.is_tensor(fallback):
+        fallback_tensor = fallback.to(device=confidence.device, dtype=confidence.dtype)
+        if fallback_tensor.ndim == 1:
+            fallback_tensor = fallback_tensor.unsqueeze(0).unsqueeze(-1)
+        elif fallback_tensor.ndim == 2:
+            fallback_tensor = fallback_tensor.unsqueeze(-1)
+        if fallback_tensor.ndim != 3:
+            raise ValueError(
+                "tensor fallback must be [N], [B, N], or [B, N, C], got "
+                f"{tuple(fallback.shape)}"
+            )
+        if fallback_tensor.shape[0] == 1 and confidence.shape[0] > 1:
+            fallback_tensor = fallback_tensor.expand(confidence.shape[0], -1, -1)
+        if (
+            fallback_tensor.shape[0] != confidence.shape[0]
+            or fallback_tensor.shape[1] < num_frames
+            or fallback_tensor.shape[-1] not in (1, confidence.shape[-1])
+        ):
+            raise ValueError(
+                "tensor fallback must cover the temporal confidence layout: "
+                f"fallback={tuple(fallback_tensor.shape)}, confidence="
+                f"{tuple(confidence.shape)}, num_frames={num_frames}"
+            )
+        fallback_tensor = fallback_tensor[:, :num_frames]
+        if fallback_tensor.shape[-1] == 1 and confidence.shape[-1] > 1:
+            fallback_tensor = fallback_tensor.expand(-1, -1, confidence.shape[-1])
+        temporal = fallback_tensor.clone()
+    else:
+        temporal = confidence.new_full(
+            (confidence.shape[0], num_frames, confidence.shape[-1]), float(fallback)
+        )
     coverage = torch.zeros(num_frames, dtype=torch.bool, device=confidence.device)
     for dst in range(1, num_frames):
         src = dst - 1
@@ -410,9 +453,129 @@ def temporal_imu_confidence_from_edges(
             coverage[dst] = True
 
     temporal = temporal.clamp(0.0, 1.0)
+    if temporal.shape[-1] == 1:
+        temporal = temporal[..., 0]
     if return_coverage:
         return temporal, coverage
     return temporal
+
+
+def temporal_imu_quality_features(
+    imu_delta: Optional[torch.Tensor],
+    imu_info: Optional[torch.Tensor],
+    num_frames: int,
+    eps: float = 1e-6,
+) -> Optional[torch.Tensor]:
+    """Build normalized per-interval quality features from preintegration.
+
+    The descriptor intentionally contains only quantities available for both
+    offline training and streaming inference.  It is not a hand-written gate:
+    a zero-initialized MLP learns how each quantity should alter the GRU's
+    visual confidence during fine-tuning.
+
+    Output layout is ``[B, N, 7]``:
+    ``log(1 + dt/0.05)``, angular-rate proxy, acceleration proxy,
+    position-change proxy, and covariance-information terms for rotation,
+    velocity, and position.  Frame zero and invalid/missing rows are neutral
+    zeros.
+    """
+
+    if imu_delta is None:
+        return None
+
+    delta = imu_delta
+    if delta.ndim == 2:
+        delta = delta.unsqueeze(0)
+    if delta.ndim != 3 or delta.shape[-1] < 10:
+        raise ValueError(
+            "imu_delta must have shape [N, >=10] or [B, N, >=10], "
+            f"got {tuple(imu_delta.shape)}"
+        )
+
+    count = min(int(num_frames), int(delta.shape[1]))
+    output = delta.new_zeros((delta.shape[0], int(num_frames), IMU_QUALITY_FEATURE_DIM))
+    if count <= 1:
+        return output
+
+    dt = delta[:, :count, 0:1].clamp_min(0.0)
+    safe_dt = dt.clamp_min(float(eps))
+    dr = delta[:, :count, 1:4].norm(dim=-1, keepdim=True)
+    dv = delta[:, :count, 4:7].norm(dim=-1, keepdim=True)
+    dp = delta[:, :count, 7:10].norm(dim=-1, keepdim=True)
+    motion = torch.cat(
+        [
+            torch.log1p(dt / 0.05),
+            torch.log1p(dr / safe_dt),
+            torch.log1p(dv / safe_dt),
+            torch.log1p(dp / (safe_dt * safe_dt)),
+        ],
+        dim=-1,
+    )
+
+    info_features = delta.new_zeros((delta.shape[0], count, 3))
+    if imu_info is not None:
+        info = imu_info.to(device=delta.device, dtype=delta.dtype)
+        if info.ndim == 2:
+            info = info.unsqueeze(0)
+        if info.ndim != 3 or info.shape[-1] < 3:
+            raise ValueError(
+                "imu_info must have shape [N, 3] or [B, N, 3], "
+                f"got {tuple(imu_info.shape)}"
+            )
+        if info.shape[0] == 1 and delta.shape[0] > 1:
+            info = info.expand(delta.shape[0], -1, -1)
+        if info.shape[0] != delta.shape[0]:
+            raise ValueError(
+                "imu_info batch must match imu_delta batch, "
+                f"got info={tuple(info.shape)}, delta={tuple(delta.shape)}"
+            )
+        values = info[:, :count, :3].clamp_min(float(eps))
+        valid = (dt > float(eps)).expand_as(values)
+        masked = torch.where(valid, values, torch.full_like(values, float("nan")))
+        reference = torch.nanmedian(masked, dim=1, keepdim=True).values
+        reference = torch.where(
+            torch.isfinite(reference), reference, torch.ones_like(reference)
+        ).clamp_min(float(eps))
+        info_features = torch.log(values / reference).clamp(-6.0, 6.0)
+        info_features = torch.where(valid, info_features, torch.zeros_like(info_features))
+
+    output[:, :count] = torch.cat([motion, info_features], dim=-1)
+    output[:, 0] = 0.0
+    return output
+
+
+def edge_imu_quality_features(
+    imu_delta: Optional[torch.Tensor],
+    imu_info: Optional[torch.Tensor],
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    num_frames: int,
+) -> Optional[torch.Tensor]:
+    """Select a temporal IMU descriptor for direct visual graph edges.
+
+    A non-temporal/proximity edge has no one-to-one preintegrated interval, so
+    it receives neutral zeros instead of incorrectly borrowing an adjacent
+    interval's sensor quality.
+    """
+
+    temporal = temporal_imu_quality_features(imu_delta, imu_info, num_frames)
+    if temporal is None:
+        return None
+
+    ii = ii.to(device=temporal.device, dtype=torch.long).reshape(-1)
+    jj = jj.to(device=temporal.device, dtype=torch.long).reshape(-1)
+    if ii.numel() != jj.numel():
+        raise ValueError("ii and jj must have matching edge counts")
+
+    features = temporal.new_zeros((temporal.shape[0], ii.numel(), IMU_QUALITY_FEATURE_DIM))
+    direct = (ii - jj).abs() == 1
+    if bool(direct.any().item()):
+        dst = torch.maximum(ii[direct], jj[direct])
+        in_range = dst < temporal.shape[1]
+        if bool(in_range.any().item()):
+            edge_indices = torch.nonzero(direct, as_tuple=False).reshape(-1)[in_range]
+            features[:, edge_indices] = temporal[:, dst[in_range]]
+    return features
 
 
 def quat_to_rotvec(q: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:

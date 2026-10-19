@@ -355,14 +355,22 @@ class ImuRotationResidual:
         try:
             if torch.is_tensor(imu_confidence):
                 conf = imu_confidence.detach()
-                if conf.ndim == 2:
+                if conf.ndim == 3:
+                    value = conf[0, pose_ix, 0]
+                elif conf.ndim == 2 and conf.shape[-1] == 3:
+                    value = conf[pose_ix, 0]
+                elif conf.ndim == 2:
                     value = conf[0, pose_ix]
                 else:
                     value = conf.reshape(-1)[pose_ix]
                 out = float(value.detach().cpu().item())
             else:
                 conf = np.asarray(imu_confidence, dtype=np.float64)
-                if conf.ndim == 2:
+                if conf.ndim == 3:
+                    out = float(conf[0, pose_ix, 0])
+                elif conf.ndim == 2 and conf.shape[-1] == 3:
+                    out = float(conf[pose_ix, 0])
+                elif conf.ndim == 2:
                     out = float(conf[0, pose_ix])
                 else:
                     out = float(conf.reshape(-1)[pose_ix])

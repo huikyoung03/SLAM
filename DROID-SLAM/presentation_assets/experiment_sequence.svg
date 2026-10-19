@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="640" viewBox="0 0 1600 640" role="img" aria-labelledby="title desc">
+  <title id="title">Experiment sequence from initial IMU integration to parity learned confidence</title>
+  <desc id="desc">Six connected steps: baseline and IMU connection, diagnosis, 9DoF factor test, 15DoF two-stage expansion, stage three confidence training, and parity paired ablation.</desc>
+  <defs>
+    <style>
+      .title { font: 700 32px Arial, sans-serif; fill: #18212f; }
+      .num { font: 700 19px Arial, sans-serif; fill: #ffffff; }
+      .head { font: 700 20px Arial, sans-serif; fill: #18212f; }
+      .body { font: 500 15px Arial, sans-serif; fill: #425466; }
+      .note { font: 600 15px Arial, sans-serif; fill: #293a4b; }
+      .arrow { stroke: #8da0b3; stroke-width: 3; fill: none; marker-end: url(#end); }
+    </style>
+    <marker id="end" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8Z" fill="#8da0b3"/></marker>
+  </defs>
+  <rect width="1600" height="640" fill="#ffffff"/>
+  <text x="800" y="55" text-anchor="middle" class="title">Experiment sequence: failure analysis → design revision → paired validation</text>
+
+  <path d="M265 220 H315 M525 220 H575 M785 220 H835 M1045 220 H1095 M1305 220 H1355" class="arrow"/>
+
+  <g>
+    <rect x="55" y="130" width="210" height="180" rx="18" fill="#e8f1ff" stroke="#4b84cf" stroke-width="2"/>
+    <circle cx="85" cy="160" r="19" fill="#4b84cf"/><text x="85" y="167" text-anchor="middle" class="num">1</text>
+    <text x="160" y="174" text-anchor="middle" class="head">Baseline + IMU link</text>
+    <text x="160" y="208" text-anchor="middle" class="body">data-only vs factor</text>
+    <text x="160" y="232" text-anchor="middle" class="body">control experiment</text>
+    <text x="160" y="272" text-anchor="middle" class="note">No gain: factor use ≠ quality</text>
+  </g>
+  <g>
+    <rect x="315" y="130" width="210" height="180" rx="18" fill="#fff1de" stroke="#d98a31" stroke-width="2"/>
+    <circle cx="345" cy="160" r="19" fill="#d98a31"/><text x="345" y="167" text-anchor="middle" class="num">2</text>
+    <text x="420" y="174" text-anchor="middle" class="head">Diagnosis</text>
+    <text x="420" y="208" text-anchor="middle" class="body">axis / velocity / units</text>
+    <text x="420" y="232" text-anchor="middle" class="body">fix and test each cause</text>
+    <text x="420" y="272" text-anchor="middle" class="note">rotation mismatch: 6.98° → 0.385°</text>
+  </g>
+  <g>
+    <rect x="575" y="130" width="210" height="180" rx="18" fill="#edf9f1" stroke="#43a36b" stroke-width="2"/>
+    <circle cx="605" cy="160" r="19" fill="#43a36b"/><text x="605" y="167" text-anchor="middle" class="num">3</text>
+    <text x="680" y="174" text-anchor="middle" class="head">9DoF verification</text>
+    <text x="680" y="208" text-anchor="middle" class="body">pose + velocity</text>
+    <text x="680" y="232" text-anchor="middle" class="body">preintegration in DBA</text>
+    <text x="680" y="272" text-anchor="middle" class="note">factor coverage ≈ 100%</text>
+  </g>
+  <g>
+    <rect x="835" y="130" width="210" height="180" rx="18" fill="#e8f1ff" stroke="#4b84cf" stroke-width="2"/>
+    <circle cx="865" cy="160" r="19" fill="#4b84cf"/><text x="865" y="167" text-anchor="middle" class="num">4</text>
+    <text x="940" y="174" text-anchor="middle" class="head">15DoF two-stage</text>
+    <text x="940" y="208" text-anchor="middle" class="body">visual warm-up → VI init</text>
+    <text x="940" y="232" text-anchor="middle" class="body">pose / v / bias joint BA</text>
+    <text x="940" y="272" text-anchor="middle" class="note">metric VIO state enabled</text>
+  </g>
+  <g>
+    <rect x="1095" y="130" width="210" height="180" rx="18" fill="#f3ecff" stroke="#8b64c7" stroke-width="2"/>
+    <circle cx="1125" cy="160" r="19" fill="#8b64c7"/><text x="1125" y="167" text-anchor="middle" class="num">5</text>
+    <text x="1200" y="174" text-anchor="middle" class="head">Stage-3 training</text>
+    <text x="1200" y="208" text-anchor="middle" class="body">MH_03 real IMU</text>
+    <text x="1200" y="232" text-anchor="middle" class="body">learn 129-param wᵘ head</text>
+    <text x="1200" y="272" text-anchor="middle" class="note">old wᵘ saturation detected</text>
+  </g>
+  <g>
+    <rect x="1355" y="130" width="210" height="180" rx="18" fill="#fff0f3" stroke="#ca5974" stroke-width="2"/>
+    <circle cx="1385" cy="160" r="19" fill="#ca5974"/><text x="1385" y="167" text-anchor="middle" class="num">6</text>
+    <text x="1460" y="174" text-anchor="middle" class="head">Parity ablation</text>
+    <text x="1460" y="208" text-anchor="middle" class="body">same λ=0.002</text>
+    <text x="1460" y="232" text-anchor="middle" class="body">fixed / tuned / learned</text>
+    <text x="1460" y="272" text-anchor="middle" class="note">learned ATE: −3.36% vs fixed</text>
+  </g>
+
+  <rect x="135" y="405" width="1330" height="122" rx="18" fill="#f5f7fa" stroke="#d4dde6" stroke-width="2"/>
+  <text x="800" y="447" text-anchor="middle" class="head">What the process proves</text>
+  <text x="800" y="481" text-anchor="middle" class="body">Not “IMU always improves DROID”, but a reproducible chain: solver integration → correctness diagnosis → state design → calibrated confidence learning.</text>
+  <text x="800" y="508" text-anchor="middle" class="note">Final claim: parity-trained learned confidence improves metric ATE by 3.36% over the fixed 15DoF control on common V2_03 frames.</text>
+</svg>

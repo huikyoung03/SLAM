@@ -22,11 +22,18 @@ from geom.imu_factor import (
     skew_symmetric,
     so3_left_jacobian,
     so3_left_jacobian_inv,
+    edge_imu_quality_features,
     temporal_imu_confidence_from_edges,
+    temporal_imu_quality_features,
 )
 
 from cuda_timer import CudaTimer
 from functools import partial
+
+try:
+    from imu_prior import compose_imu_prior_rows
+except ImportError:
+    from droid_slam.imu_prior import compose_imu_prior_rows
 
 
 '''
@@ -98,7 +105,11 @@ class FactorGraph:
         imu_regularizer=None,
         apply_imu_residual=None,
         use_learned_imu_confidence=False,
+        use_component_imu_confidence=False,
+        use_dvi_imu_confidence=False,
+        use_dvi_imu_quality_fusion=False,
         imu_confidence_floor=0.0,
+        imu_tuned_confidence_schedule=None,
         use_imu_ba_prior=False,
         imu_ba_prior_weight=0.0,
         imu_ba_prior_max_deg=45.0,
@@ -221,7 +232,31 @@ class FactorGraph:
             else bool(apply_imu_residual)
         )
         self.use_learned_imu_confidence = bool(use_learned_imu_confidence)
+        self.use_component_imu_confidence = bool(
+            use_component_imu_confidence and self.use_learned_imu_confidence
+        )
+        self.use_dvi_imu_confidence = bool(
+            use_dvi_imu_confidence
+            and self.use_learned_imu_confidence
+            and not self.use_component_imu_confidence
+        )
+        self.use_dvi_imu_quality_fusion = bool(
+            use_dvi_imu_quality_fusion and self.use_dvi_imu_confidence
+        )
         self.imu_confidence_floor = float(imu_confidence_floor)
+        if imu_tuned_confidence_schedule is None:
+            self.imu_tuned_confidence_schedule = None
+        else:
+            schedule = tuple(float(value) for value in imu_tuned_confidence_schedule)
+            if not schedule or any(not np.isfinite(value) or value < 0.0 or value > 1.0 for value in schedule):
+                raise ValueError(
+                    "imu_tuned_confidence_schedule must contain finite values in [0, 1]"
+                )
+            self.imu_tuned_confidence_schedule = schedule
+        # The schedule advances once per outer GRU/DBA update, never per
+        # inner CUDA-LM iteration.  This is the manual-iteration control in
+        # the DVI four-way ablation, not an extra optimization mechanism.
+        self._imu_tuned_confidence_iteration = 0
         self.use_imu_ba_prior = bool(use_imu_ba_prior)
         self.imu_ba_prior_weight = float(imu_ba_prior_weight)
         self.imu_ba_prior_max_deg = float(imu_ba_prior_max_deg)
@@ -255,6 +290,11 @@ class FactorGraph:
         self.imu_gate_residual_pos_soft = float(imu_gate_residual_pos_soft)
         self.imu_gate_residual_vel_soft = float(imu_gate_residual_vel_soft)
         self.imu_optimize_bias = bool(imu_optimize_bias)
+        # Preserve the requested full-IMU configuration while the frontend
+        # temporarily disables every inertial term for its visual stage.
+        self._configured_full_imu_ba = self.use_full_imu_ba
+        self._configured_imu_ba_prior = self.use_imu_ba_prior
+        self._configured_imu_optimize_bias = self.imu_optimize_bias
         self.imu_gyro_bias = imu_gyro_bias
         self.imu_acc_bias = imu_acc_bias
         # Keep one shared accelerometer/gyroscope bias inside each local
@@ -425,7 +465,41 @@ class FactorGraph:
             dtype=torch.float
         )
 
-    def _edge_confidence_to_frame_confidence(self, edge_confidence, ii=None, jj=None):
+    def set_imu_ba_stage(self, stage):
+        """Switch a local graph between visual-only and full 15DoF DBA."""
+
+        if stage == "pose_only":
+            # Stage one must not admit either the legacy fixed-bias 9DoF
+            # factor or the post-DBA rotation residual.
+            self.use_full_imu_ba = False
+            self.use_imu_ba_prior = False
+            self.imu_optimize_bias = False
+            self.apply_imu_residual = False
+            return
+
+        if stage == "full_15dof":
+            if not (
+                self._configured_full_imu_ba
+                and self._configured_imu_ba_prior
+                and self._configured_imu_optimize_bias
+            ):
+                raise RuntimeError(
+                    "full_15dof stage requires configured full IMU BA with "
+                    "per-keyframe bias optimization"
+                )
+            self.use_full_imu_ba = True
+            self.use_imu_ba_prior = True
+            self.imu_optimize_bias = True
+            # The full preintegration factor already contains rotation.
+            self.apply_imu_residual = False
+            self._imu_tuned_confidence_iteration = 0
+            return
+
+        raise ValueError(f"unknown IMU BA stage: {stage}")
+
+    def _edge_confidence_to_frame_confidence(
+        self, edge_confidence, ii=None, jj=None, return_coverage=False
+    ):
         """
         Convert update-head confidence maps into temporal IMU-factor confidence.
 
@@ -438,31 +512,122 @@ class FactorGraph:
         """
 
         if edge_confidence is None:
-            return None
+            return (None, None) if return_coverage else None
 
         ii = self.ii if ii is None else ii
         jj = self.jj if jj is None else jj
 
         if ii.numel() == 0 or jj.numel() == 0:
-            return None
+            return (None, None) if return_coverage else None
 
         num_frames = max(
             int(self.video.counter.value),
             int(torch.maximum(ii.max(), jj.max()).item()) + 1,
         )
-        frame_confidence = temporal_imu_confidence_from_edges(
+        quality_fallback = self._temporal_dvi_quality_confidence(num_frames)
+        frame_confidence, coverage = temporal_imu_confidence_from_edges(
             edge_confidence.to(device=self.device, dtype=torch.float),
             ii,
             jj,
             num_frames=num_frames,
-            fallback=1.0,
+            fallback=quality_fallback if quality_fallback is not None else 1.0,
+            return_coverage=True,
         )
 
         if self.imu_confidence_floor > 0.0:
             floor = float(self.imu_confidence_floor)
             frame_confidence = floor + (1.0 - floor) * frame_confidence
 
-        return frame_confidence.clamp(0.0, 1.0)
+        frame_confidence = frame_confidence.clamp(0.0, 1.0)
+        if return_coverage:
+            return frame_confidence, coverage
+        return frame_confidence
+
+    def _persist_imu_confidence(self, frame_confidence, coverage):
+        """Cache only direct temporal predictions for terminal VI refinement."""
+
+        if frame_confidence is None or coverage is None:
+            return 0
+
+        if not hasattr(self.video, "update_imu_learned_confidence"):
+            return 0
+
+        try:
+            return self.video.update_imu_learned_confidence(
+                frame_confidence,
+                coverage=coverage,
+                count=int(self.video.counter.value),
+            )
+        except Exception as exc:
+            print(f"[IMU-CONFIDENCE WARNING] cache update failed: {exc}")
+            return 0
+
+    def _edge_imu_quality(self, ii, jj):
+        """Return direct temporal IMU quality descriptors for GRU edges."""
+
+        # Scalar DVI confidence and component confidence use the same
+        # preintegrated IMU descriptor.  Previously this branch admitted only
+        # component mode, so a runtime DVI-quality-fusion run silently passed
+        # ``None`` to the MLP even though training supplied its seven IMU
+        # quality features.  That creates a train/runtime input mismatch and
+        # turns the learned scalar quality contribution into an all-zero logit.
+        if not (
+            self.use_component_imu_confidence
+            or self.use_dvi_imu_quality_fusion
+        ):
+            return None
+        count = max(
+            int(self.video.counter.value),
+            int(torch.maximum(ii.max(), jj.max()).item()) + 1 if ii.numel() else 0,
+        )
+        if count <= 0:
+            return None
+        return edge_imu_quality_features(
+            self.video.imu_delta[:count],
+            self.video.imu_info[:count],
+            ii,
+            jj,
+            num_frames=count,
+        )
+
+    def _temporal_dvi_quality_confidence(self, count):
+        """Predict fallback confidence for temporal rows lacking visual edges.
+
+        A direct GRU edge remains the preferred prediction.  When it is not
+        present, using 1.0 would silently restore a full-strength IMU factor
+        and bypass the learned quality model.  The scalar DVI quality MLP is
+        available for every preintegrated interval, so it supplies that
+        fallback without borrowing an unrelated visual/proximity edge.
+        """
+
+        if not self.use_dvi_imu_quality_fusion or count <= 0:
+            return None
+        predictor = getattr(self.update_op, "dvi_imu_quality_confidence", None)
+        if predictor is None:
+            return None
+        quality = temporal_imu_quality_features(
+            self.video.imu_delta[:count],
+            self.video.imu_info[:count],
+            num_frames=count,
+        )
+        if quality is None:
+            return None
+        confidence = predictor(quality)
+        if confidence is None:
+            return None
+        if confidence.ndim == 2:
+            confidence = confidence.unsqueeze(-1)
+        if (
+            confidence.ndim != 3
+            or confidence.shape[0] != 1
+            or confidence.shape[1] < count
+            or confidence.shape[-1] != 1
+        ):
+            raise ValueError(
+                "DVI quality fallback must be [1, N, 1], got "
+                f"{tuple(confidence.shape)} for N={count}"
+            )
+        return confidence[:, :count]
 
     def _apply_imu_residual(self, stage):
         if self.imu_regularizer is None or not self.apply_imu_residual:
@@ -484,24 +649,80 @@ class FactorGraph:
         except Exception as e:
             print(f"[IMU-RESIDUAL WARNING] stage={stage}, failed: {e}")
 
-    def _confidence_for_pose_index(self, pose_ix):
+    def _confidence_components_for_pose_index(self, pose_ix):
+        """Return `[rotation, velocity, position]` confidence for one row."""
+
+        if self.imu_tuned_confidence_schedule is not None:
+            schedule_ix = min(
+                self._imu_tuned_confidence_iteration,
+                len(self.imu_tuned_confidence_schedule) - 1,
+            )
+            value = self.imu_tuned_confidence_schedule[schedule_ix]
+            return np.full(3, value, dtype=np.float64)
+
         if not self.use_learned_imu_confidence or self.last_imu_confidence is None:
-            return 1.0
+            return np.ones(3, dtype=np.float64)
 
         try:
             conf = self.last_imu_confidence
-            if conf.ndim == 2:
+            if conf.ndim == 3:
+                value = conf[0, pose_ix]
+            elif (
+                conf.ndim == 2
+                and self.use_component_imu_confidence
+                and conf.shape[-1] == 3
+                and conf.shape[0] > pose_ix
+            ):
+                # Compatibility for an unbatched component cache [N, 3].
+                # A scalar cache is [B, N]; do not misread its N=3 case as
+                # three components.
+                value = conf[pose_ix]
+            elif conf.ndim == 2:
                 value = conf[0, pose_ix]
             else:
                 value = conf.reshape(-1)[pose_ix]
-            out = float(value.detach().cpu().item())
+            values = np.asarray(value.detach().cpu().reshape(-1).tolist(), dtype=np.float64)
         except Exception:
-            return 1.0
+            return np.ones(3, dtype=np.float64)
 
-        if not np.isfinite(out):
-            return 1.0
+        if values.size == 1:
+            values = np.repeat(values, 3)
+        if values.size < 3 or not np.all(np.isfinite(values[:3])):
+            return np.ones(3, dtype=np.float64)
 
-        return float(np.clip(out, 0.0, 1.0))
+        return np.clip(values[:3], 0.0, 1.0)
+
+    def _confidence_for_pose_index(self, pose_ix):
+        """Legacy scalar confidence for rotation-only residual consumers."""
+
+        return float(self._confidence_components_for_pose_index(pose_ix)[0])
+
+    def _imu_confidence_mode(self):
+        if self.imu_tuned_confidence_schedule is not None:
+            return "tuned"
+        if self.use_learned_imu_confidence:
+            return "learned"
+        return "fixed"
+
+    def _current_tuned_confidence_value(self):
+        if self.imu_tuned_confidence_schedule is None:
+            return 1.0
+        schedule_ix = min(
+            self._imu_tuned_confidence_iteration,
+            len(self.imu_tuned_confidence_schedule) - 1,
+        )
+        return float(self.imu_tuned_confidence_schedule[schedule_ix])
+
+    def _advance_tuned_confidence_schedule(self):
+        """Advance after one full outer IMU DBA update, if one actually ran."""
+
+        if (
+            self.imu_tuned_confidence_schedule is not None
+            and self.use_full_imu_ba
+            and self.use_imu_ba_prior
+            and (not self.require_imu_alignment or self._has_imu_alignment())
+        ):
+            self._imu_tuned_confidence_iteration += 1
 
     def _visual_confidence_for_pose_pair(self, prev_ix, curr_ix):
         """Return the visual DBA confidence around one temporal IMU edge."""
@@ -622,7 +843,12 @@ class FactorGraph:
         if len(self._imu_ba_debug_rows) >= self.imu_ba_debug_max_rows:
             return
 
-        clean = {"stage": self.imu_ba_debug_stage}
+        clean = {
+            "stage": self.imu_ba_debug_stage,
+            "confidence_mode": self._imu_confidence_mode(),
+            "confidence_iteration": int(self._imu_tuned_confidence_iteration),
+            "confidence_schedule_value": self._current_tuned_confidence_value(),
+        }
         for key, value in row.items():
             if torch.is_tensor(value):
                 value = value.detach().cpu().item() if value.numel() == 1 else value.detach().cpu().tolist()
@@ -1019,6 +1245,11 @@ class FactorGraph:
         confidence = (
             self.last_imu_confidence if self.use_learned_imu_confidence else None
         )
+        # The legacy shared-bias refiner has one scalar likelihood per edge.
+        # Use the component mean there; full DBA still receives all three
+        # component weights directly.
+        if confidence is not None and confidence.ndim == 3:
+            confidence = confidence.mean(dim=-1)
         return refine_window_biases(
             self.video,
             compose_order=self.imu_full_compose_order,
@@ -1125,25 +1356,57 @@ class FactorGraph:
                 dt=dt_edges,
             )[0]
 
-            J_R_bg_ab, J_v_ba_ab, J_v_bg_ab, J_p_ba_ab, J_p_bg_ab = bias_jac[0]
-            J_R_bg_bc, J_v_ba_bc, J_v_bg_bc, J_p_ba_bc, J_p_bg_bc = bias_jac[1]
-            R_ab = quat_to_rotmat(q_ab)
+            # Keep keyframe-removal composition in the same representation as
+            # MotionFilter.  `J_R_bg` is stored as a rotation-vector derivative
+            # downstream, so mixing a left-tangent rotation formula here with
+            # the right-tangent dv/dp terms would create a wrong bias Jacobian
+            # after a keyframe is removed.  The shared CPU helper applies each
+            # row's correction and relinearizes the composed delta directly.
+            def as_prior_row(delta, jacobian):
+                row = {
+                    "dt": float(delta[0].detach().cpu().item()),
+                    "dr_x": float(delta[1].detach().cpu().item()),
+                    "dr_y": float(delta[2].detach().cpu().item()),
+                    "dr_z": float(delta[3].detach().cpu().item()),
+                    "dv_x": float(delta[4].detach().cpu().item()),
+                    "dv_y": float(delta[5].detach().cpu().item()),
+                    "dv_z": float(delta[6].detach().cpu().item()),
+                    "dp_x": float(delta[7].detach().cpu().item()),
+                    "dp_y": float(delta[8].detach().cpu().item()),
+                    "dp_z": float(delta[9].detach().cpu().item()),
+                }
+                prefixes = ("J_R_bg", "J_v_ba", "J_v_bg", "J_p_ba", "J_p_bg")
+                values = jacobian.detach().cpu()
+                for prefix_ix, prefix in enumerate(prefixes):
+                    for row_ix in range(3):
+                        for col_ix in range(3):
+                            row[f"{prefix}_{row_ix}{col_ix}"] = float(
+                                values[prefix_ix, row_ix, col_ix].item()
+                            )
+                return row
 
-            bias_jac_ac = torch.zeros_like(bias_jac[0])
-            bias_jac_ac[0] = J_R_bg_ab + R_ab @ J_R_bg_bc
-            bias_jac_ac[1] = J_v_ba_ab + R_ab @ J_v_ba_bc
-            bias_jac_ac[2] = (
-                J_v_bg_ab
-                + R_ab @ J_v_bg_bc
-                - R_ab @ skew_symmetric(dv_bc) @ J_R_bg_ab
+            composed_rows = compose_imu_prior_rows(
+                [
+                    as_prior_row(delta_ab, bias_jac[0]),
+                    as_prior_row(delta_bc, bias_jac[1]),
+                ]
             )
-            bias_jac_ac[3] = J_p_ba_ab + J_v_ba_ab * dt_bc + R_ab @ J_p_ba_bc
-            bias_jac_ac[4] = (
-                J_p_bg_ab
-                + J_v_bg_ab * dt_bc
-                + R_ab @ J_p_bg_bc
-                - R_ab @ skew_symmetric(dp_bc) @ J_R_bg_ab
-            )
+            if composed_rows is not None:
+                prefixes = ("J_R_bg", "J_v_ba", "J_v_bg", "J_p_ba", "J_p_bg")
+                bias_jac_ac = torch.as_tensor(
+                    [
+                        [
+                            [
+                                float(composed_rows[f"{prefix}_{row_ix}{col_ix}"])
+                                for col_ix in range(3)
+                            ]
+                            for row_ix in range(3)
+                        ]
+                        for prefix in prefixes
+                    ],
+                    device=delta_ab.device,
+                    dtype=delta_ab.dtype,
+                )
 
         bias_random_walk = torch.maximum(
             self.video.imu_bias_random_walk[first_ix],
@@ -1377,6 +1640,9 @@ class FactorGraph:
             row_weight=0.0,
             row_scale=0.0,
             confidence=0.0,
+            confidence_rot=1.0,
+            confidence_vel=1.0,
+            confidence_pos=1.0,
             weight=0.0,
             dr_norm=0.0,
             dv_norm=0.0,
@@ -1412,6 +1678,9 @@ class FactorGraph:
                 "row_weight": float(row_weight),
                 "row_scale": float(row_scale),
                 "confidence": float(confidence),
+                "confidence_rot": float(confidence_rot),
+                "confidence_vel": float(confidence_vel),
+                "confidence_pos": float(confidence_pos),
                 "weight": float(weight),
                 "metric_scale": float(metric_scale.detach().cpu().item()),
                 "alignment_ready": int(self._has_imu_alignment()),
@@ -1659,7 +1928,11 @@ class FactorGraph:
 
             rp_norm = float(torch.linalg.norm(r_p).detach().cpu().item())
             rv_norm = float(torch.linalg.norm(r_v).detach().cpu().item())
-            confidence = self._confidence_for_pose_index(curr_ix)
+            confidence_components = self._confidence_components_for_pose_index(curr_ix)
+            confidence_rot = float(confidence_components[0])
+            confidence_vel = float(confidence_components[1])
+            confidence_pos = float(confidence_components[2])
+            confidence = float(np.mean(confidence_components))
             adaptive_gate, gate_parts = self._adaptive_imu_gate(
                 prev_ix,
                 curr_ix,
@@ -1671,10 +1944,13 @@ class FactorGraph:
             weight = (
                 float(self.imu_ba_prior_weight)
                 * row_scale
-                * confidence
                 * adaptive_gate
             )
-            if weight <= 0.0 or not np.isfinite(weight):
+            if (
+                weight <= 0.0
+                or not np.isfinite(weight)
+                or max(confidence_rot, confidence_vel, confidence_pos) <= 0.0
+            ):
                 record_edge(
                     "skip_weight",
                     prev_ix,
@@ -1683,6 +1959,9 @@ class FactorGraph:
                     row_weight=row_weight,
                     row_scale=row_scale,
                     confidence=confidence,
+                    confidence_rot=confidence_rot,
+                    confidence_vel=confidence_vel,
+                    confidence_pos=confidence_pos,
                     weight=weight,
                     dr_norm=dr_norm,
                     dv_norm=dv_norm,
@@ -1777,7 +2056,19 @@ class FactorGraph:
                 Ji[12:15, 12:15] = eye3
                 Jj[12:15, 12:15] = -eye3
 
-            scale = base_scale * info_term_scale
+            # Residual rows are [p, v, R, ba, bg] while learned confidence is
+            # [R, v, p].  Scaling both r and J by sqrt(c) adds the intended
+            # component-wise Mahalanobis weight directly to the normal system.
+            bias_confidence = float(np.mean(confidence_components))
+            component_scale = torch.as_tensor(
+                [confidence_pos] * 3
+                + [confidence_vel] * 3
+                + [confidence_rot] * 3
+                + ([bias_confidence] * 6 if optimize_bias else []),
+                device=device,
+                dtype=dtype,
+            ).clamp(0.0, 1.0).sqrt()
+            scale = base_scale * info_term_scale * component_scale
             residual = residual * scale
             Ji = Ji * scale.view(residual_dim, 1)
             Jj = Jj * scale.view(residual_dim, 1)
@@ -1838,6 +2129,9 @@ class FactorGraph:
                 row_weight=row_weight,
                 row_scale=row_scale,
                 confidence=confidence,
+                confidence_rot=confidence_rot,
+                confidence_vel=confidence_vel,
+                confidence_pos=confidence_pos,
                 weight=weight,
                 dr_norm=dr_norm,
                 dv_norm=dv_norm,
@@ -2603,6 +2897,12 @@ class FactorGraph:
         self.video.imu_weight[ix : t - 1] = self.video.imu_weight[ix + 1 : t].clone()
         self.video.imu_used_steps[ix : t - 1] = self.video.imu_used_steps[ix + 1 : t].clone()
         self.video.imu_info[ix : t - 1] = self.video.imu_info[ix + 1 : t].clone()
+        self.video.imu_learned_confidence[ix : t - 1] = (
+            self.video.imu_learned_confidence[ix + 1 : t].clone()
+        )
+        self.video.imu_learned_confidence_valid[ix : t - 1] = (
+            self.video.imu_learned_confidence_valid[ix + 1 : t].clone()
+        )
         self.video.imu_bias_random_walk[ix : t - 1] = (
             self.video.imu_bias_random_walk[ix + 1 : t].clone()
         )
@@ -2627,6 +2927,13 @@ class FactorGraph:
             self.video.imu_bias_random_walk[ix] = bias_random_walk_ac
             if bias_jac_ac is not None:
                 self.video.imu_bias_jacobian[ix] = bias_jac_ac
+        # The successor now occupies ix. Whether its IMU row was composed or
+        # merely shifted, the old direct visual temporal edge is no longer the
+        # same interval. Re-estimate it later or retain neutral IMU weighting.
+        self.video.imu_learned_confidence[ix] = 1.0
+        self.video.imu_learned_confidence_valid[ix] = False
+        self.video.imu_learned_confidence[t - 1] = 1.0
+        self.video.imu_learned_confidence_valid[t - 1] = False
         self.video.disps[ix : t - 1] = self.video.disps[ix + 1 : t].clone()
         self.video.disps_sens[ix : t - 1] = self.video.disps_sens[ix + 1 : t].clone()
         self.video.intrinsics[ix : t - 1] = self.video.intrinsics[ix + 1 : t].clone()
@@ -2773,11 +3080,20 @@ class FactorGraph:
             self.ii,
             self.jj,
             return_imu_confidence=self.use_learned_imu_confidence,
+            return_component_imu_confidence=self.use_component_imu_confidence,
+            use_dvi_imu_confidence=self.use_dvi_imu_confidence,
+            use_dvi_imu_quality_fusion=self.use_dvi_imu_quality_fusion,
+            imu_quality=self._edge_imu_quality(self.ii, self.jj),
         )
         if self.use_learned_imu_confidence:
             self.net, delta, weight, damping, upmask, imu_edge_confidence = update_out
-            self.last_imu_confidence = self._edge_confidence_to_frame_confidence(
-                imu_edge_confidence
+            self.last_imu_confidence, confidence_coverage = (
+                self._edge_confidence_to_frame_confidence(
+                    imu_edge_confidence, return_coverage=True
+                )
+            )
+            self._persist_imu_confidence(
+                self.last_imu_confidence, confidence_coverage
             )
         else:
             self.net, delta, weight, damping, upmask = update_out
@@ -2922,6 +3238,8 @@ class FactorGraph:
                 outer_relinearize=outer_relinearize,
             )
 
+            self._advance_tuned_confidence_schedule()
+
             self._apply_imu_residual("frontend")
 
             ########################################################
@@ -3025,8 +3343,9 @@ class FactorGraph:
                 s = 8
                 edge_confidence = None
                 if self.use_learned_imu_confidence:
+                    confidence_channels = 3 if self.use_component_imu_confidence else 1
                     edge_confidence = torch.zeros(
-                        (1, self.ii.numel()),
+                        (1, self.ii.numel(), confidence_channels),
                         device=self.device,
                         dtype=torch.float,
                     )
@@ -3070,6 +3389,10 @@ class FactorGraph:
                             iis,
                             jjs,
                             return_imu_confidence=self.use_learned_imu_confidence,
+                            return_component_imu_confidence=self.use_component_imu_confidence,
+                            use_dvi_imu_confidence=self.use_dvi_imu_confidence,
+                            use_dvi_imu_quality_fusion=self.use_dvi_imu_quality_fusion,
+                            imu_quality=self._edge_imu_quality(iis, jjs),
                         )
                         if self.use_learned_imu_confidence:
                             net, delta, weight, damping, upmask, imu_edge_confidence = update_out
@@ -3090,13 +3413,19 @@ class FactorGraph:
                     self.damping[torch.unique(iis)] = damping
 
                     if self.use_learned_imu_confidence:
-                        edge_confidence[:, v] = imu_edge_confidence.float().mean(
-                            dim=(2, 3, 4)
-                        )
+                        pooled_confidence = imu_edge_confidence.float().mean(dim=(2, 3))
+                        if not self.use_component_imu_confidence:
+                            pooled_confidence = pooled_confidence[..., :1]
+                        edge_confidence[:, v] = pooled_confidence
 
                 if self.use_learned_imu_confidence:
-                    self.last_imu_confidence = self._edge_confidence_to_frame_confidence(
-                        edge_confidence
+                    self.last_imu_confidence, confidence_coverage = (
+                        self._edge_confidence_to_frame_confidence(
+                            edge_confidence, return_coverage=True
+                        )
+                    )
+                    self._persist_imu_confidence(
+                        self.last_imu_confidence, confidence_coverage
                     )
 
                 ####################################################
@@ -3179,6 +3508,8 @@ class FactorGraph:
                     joint_bias_requested=joint_bias_active,
                     outer_relinearize=outer_relinearize,
                 )
+
+                self._advance_tuned_confidence_schedule()
 
                 self._apply_imu_residual("backend")
 

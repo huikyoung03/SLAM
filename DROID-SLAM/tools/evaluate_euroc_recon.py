@@ -11,6 +11,8 @@ import torch
 
 
 TRAJ_KEYS = [
+    "trajectory_source",
+    "pose_representation",
     "raw_n_poses",
     "n_poses",
     "path_len",
@@ -139,6 +141,15 @@ def qxyzw_to_rotmat(q):
     R[..., 2, 1] = 2.0 * (y * z + x * w)
     R[..., 2, 2] = 1.0 - 2.0 * (x * x + y * y)
     return R
+
+
+def qwxyz_to_rotmat(q):
+    """Convert [qw, qx, qy, qz] quaternions to rotation matrices."""
+
+    q = np.asarray(q, dtype=np.float64)
+    if q.ndim != 2 or q.shape[1] != 4:
+        raise ValueError(f"expected [N,4] qwxyz quaternions, got {q.shape}")
+    return qxyzw_to_rotmat(q[:, [1, 2, 3, 0]])
 
 
 def rotation_angle_deg(R):
@@ -395,18 +406,34 @@ def reconstruction_metric_metadata(blob, auto_metricize_imu=True):
     }
 
 
-def load_recon(path, auto_metricize_imu=True):
+def load_recon(path, auto_metricize_imu=True, trajectory_source="keyframes"):
     blob = torch.load(path, map_location="cpu")
-    poses = blob["poses"].detach().cpu().float().numpy()
-    if "tstamps" in blob:
-        tstamps = blob["tstamps"].detach().cpu().numpy()
+    if trajectory_source == "dense":
+        if "dense_tstamps" not in blob or "dense_poses" not in blob:
+            raise ValueError(
+                f"{path} has no dense trajectory. Re-run demo.py after dense export support was added."
+            )
+        poses = blob["dense_poses"].detach().cpu().float().numpy()
+        tstamps = blob["dense_tstamps"].detach().cpu().numpy()
+        pose_representation = blob.get("dense_pose_format", "")
+        if pose_representation != "camera_c2w_wxyz":
+            raise ValueError(
+                f"unsupported dense pose representation in {path}: {pose_representation!r}"
+            )
     else:
-        tstamps = np.arange(len(poses), dtype=np.float64)
+        poses = blob["poses"].detach().cpu().float().numpy()
+        if "tstamps" in blob:
+            tstamps = blob["tstamps"].detach().cpu().numpy()
+        else:
+            tstamps = np.arange(len(poses), dtype=np.float64)
+        pose_representation = "droid_w2c_xyzw"
 
     valid = np.isfinite(poses).all(axis=1)
     poses = poses[valid]
     tstamps = tstamps[valid]
     metadata = reconstruction_metric_metadata(blob, auto_metricize_imu)
+    metadata["trajectory_source"] = trajectory_source
+    metadata["pose_representation"] = pose_representation
     if metadata["metric_scale_available"] and auto_metricize_imu:
         # ``poses`` stores world-to-camera translations.  A global length-unit
         # conversion therefore acts directly on t_cw; rotations are unchanged.
@@ -548,8 +575,16 @@ def sim3_align(source, target):
     return aligned, scale
 
 
-def estimate_camera_poses(poses, mode):
+def estimate_camera_poses(poses, mode, pose_representation="droid_w2c_xyzw"):
     """Recover camera centers and world-frame camera rotations from DROID poses."""
+
+    if pose_representation == "camera_c2w_wxyz":
+        centers = np.asarray(poses[:, :3], dtype=np.float64)
+        rotations = qwxyz_to_rotmat(poses[:, 3:7])
+        return centers, rotations, "camera_c2w_wxyz"
+    if pose_representation != "droid_w2c_xyzw":
+        raise ValueError(f"unsupported pose representation: {pose_representation!r}")
+
     pose_t = np.asarray(poses[:, :3], dtype=np.float64)
     R_cw = qxyzw_to_rotmat(poses[:, 3:7])
 
@@ -665,7 +700,11 @@ def ate_metrics(
         out.update(reconstruction_metadata)
         return out
 
-    source, source_rot, pose_mode = estimate_camera_poses(poses[recon_idx], mode)
+    source, source_rot, pose_mode = estimate_camera_poses(
+        poses[recon_idx],
+        mode,
+        reconstruction_metadata.get("pose_representation", "droid_w2c_xyzw"),
+    )
     target = gt_pos[gt_idx]
     target_rot = None if gt_rot is None else gt_rot[gt_idx]
 
@@ -833,6 +872,7 @@ def evaluate_run(label, recon_path, debug_path, args, frames, gt_ts, gt_pos, gt_
     tstamps, poses, reconstruction_metadata = load_recon(
         recon_path,
         auto_metricize_imu=args.auto_metricize_imu_recon,
+        trajectory_source=args.trajectory_source,
     )
     return evaluate_loaded_run(
         label,
@@ -869,7 +909,11 @@ def evaluate_loaded_run(
         "debug": debug_path,
         "raw_n_poses": int(len(poses)) if raw_n_poses is None else int(raw_n_poses),
     }
-    trajectory_positions, trajectory_rotations, _ = estimate_camera_poses(poses, args.pose_mode)
+    trajectory_positions, trajectory_rotations, _ = estimate_camera_poses(
+        poses,
+        args.pose_mode,
+        reconstruction_metadata.get("pose_representation", "droid_w2c_xyzw"),
+    )
     row.update(
         trajectory_metrics(
             tstamps,
@@ -1091,6 +1135,15 @@ def main():
             "input-frame IDs"
         ),
     )
+    parser.add_argument(
+        "--trajectory-source",
+        choices=["keyframes", "dense"],
+        default="keyframes",
+        help=(
+            "keyframes reads the DepthVideo state; dense reads every input-frame "
+            "pose returned by Droid.terminate()."
+        ),
+    )
     parser.add_argument("--output-csv", required=True)
     parser.add_argument("--output-md", default="")
     parser.add_argument("--run", action="append", type=parse_run, required=True)
@@ -1114,6 +1167,7 @@ def main():
                 *load_recon(
                     recon,
                     auto_metricize_imu=args.auto_metricize_imu_recon,
+                    trajectory_source=args.trajectory_source,
                 ),
             )
             for label, recon, debug in args.run

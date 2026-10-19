@@ -110,14 +110,25 @@ def _select_temporal_mask(imu_valid, dst, batch, num_frames, device):
 
 
 def _select_temporal_confidence(imu_confidence, dst, batch, num_frames, device, dtype):
+    """Select scalar or component IMU confidence for temporal factors.
+
+    The returned layout is always ``[B, E, C]`` where ``C`` is one for legacy
+    checkpoints or three in the fixed order ``[rotation, velocity, position]``.
+    Keeping the component axis lets the full inertial system weight each
+    residual block without changing the surrounding Schur solve.
+    """
+
     if imu_confidence is None:
-        return torch.ones((batch, dst.numel()), device=device, dtype=dtype)
+        return torch.ones((batch, dst.numel(), 1), device=device, dtype=dtype)
 
     confidence = imu_confidence.to(device=device, dtype=dtype)
     if confidence.ndim == 1:
-        return confidence[dst][None].expand(batch, -1)
+        return confidence[dst][None, :, None].expand(batch, -1, -1)
 
     if confidence.ndim == 2:
+        # Unbatched component confidence stored by the runtime cache: [N, 3].
+        if confidence.shape[-1] == 3 and confidence.shape[0] >= num_frames:
+            return confidence[dst][None].expand(batch, -1, -1)
         if confidence.shape[0] == 1 and batch > 1:
             confidence = confidence.expand(batch, -1)
         if confidence.shape[0] != batch or confidence.shape[1] < num_frames:
@@ -125,10 +136,25 @@ def _select_temporal_confidence(imu_confidence, dst, batch, num_frames, device, 
                 "imu_confidence must have shape [N] or [B, N] and match BA poses, "
                 f"got {tuple(imu_confidence.shape)} for frames={num_frames}"
             )
+        return confidence[:, dst, None]
+
+    if confidence.ndim == 3:
+        if confidence.shape[0] == 1 and batch > 1:
+            confidence = confidence.expand(batch, -1, -1)
+        if (
+            confidence.shape[0] != batch
+            or confidence.shape[1] < num_frames
+            or confidence.shape[-1] not in (1, 3)
+        ):
+            raise ValueError(
+                "imu_confidence must have shape [B, N, 1|3] and match BA poses, "
+                f"got {tuple(imu_confidence.shape)} for frames={num_frames}"
+            )
         return confidence[:, dst]
 
     raise ValueError(
-        f"imu_confidence must be [N] or [B, N], got {tuple(imu_confidence.shape)}"
+        "imu_confidence must be [N], [B, N], [N, 3], or [B, N, 1|3], "
+        f"got {tuple(imu_confidence.shape)}"
     )
 
 
@@ -399,25 +425,9 @@ def _build_rotation_imu_system(
             f"got {tuple(global_weight.shape)}"
         )
 
-    if imu_confidence is None:
-        confidence = pose_data.new_ones((B, dst.numel()))
-    else:
-        confidence = imu_confidence.to(device=pose_data.device, dtype=pose_data.dtype)
-        if confidence.ndim == 1:
-            confidence = confidence[dst][None].expand(B, -1)
-        elif confidence.ndim == 2:
-            if confidence.shape[0] == 1 and B > 1:
-                confidence = confidence.expand(B, -1)
-            if confidence.shape[0] != B or confidence.shape[1] < num_frames:
-                raise ValueError(
-                    "imu_confidence must have shape [N] or [B, N] and match BA poses, "
-                    f"got {tuple(imu_confidence.shape)} for poses={tuple(pose_data.shape)}"
-                )
-            confidence = confidence[:, dst]
-        else:
-            raise ValueError(
-                f"imu_confidence must be [N] or [B, N], got {tuple(imu_confidence.shape)}"
-            )
+    confidence = _select_temporal_confidence(
+        imu_confidence, dst, B, num_frames, pose_data.device, pose_data.dtype
+    )[:, :, 0]
 
     adaptive_gate = _select_temporal_gate(
         imu_adaptive_gate, dst, B, num_frames, pose_data.device, pose_data.dtype
@@ -655,10 +665,19 @@ def _build_full_imu_system(
     confidence = _select_temporal_confidence(
         imu_confidence, dst, B, num_frames, pose_data.device, pose_data.dtype
     )
+    if confidence.shape[-1] == 1:
+        confidence = confidence.expand(-1, -1, 3)
+    elif confidence.shape[-1] != 3:
+        raise ValueError(
+            "full IMU confidence must have one legacy or three component channels, "
+            f"got {tuple(confidence.shape)}"
+        )
     adaptive_gate = _select_temporal_gate(
         imu_adaptive_gate, dst, B, num_frames, pose_data.device, pose_data.dtype
     )
-    edge_weight = global_weight * confidence * adaptive_gate * edge_mask.to(dtype=pose_data.dtype)
+    # Confidence is applied per residual block below.  The scalar edge term
+    # carries only global factor strength, deterministic gating, and validity.
+    edge_weight = global_weight * adaptive_gate * edge_mask.to(dtype=pose_data.dtype)
 
     residual_dim = 15 if imu_optimize_bias else 9
     Ji = pose_data.new_zeros((B, edge_count, residual_dim, state_dim))
@@ -774,7 +793,25 @@ def _build_full_imu_system(
     else:
         residual_info_scale = pose_data.new_ones((B, edge_count, residual_dim))
 
-    scale = base_scale.view(1, 1, residual_dim) * residual_info_scale
+    # Channel order is [rotation, velocity, position], while the factor rows
+    # are [position, velocity, rotation, accel-bias, gyro-bias].  Multiplying
+    # residual and Jacobian by sqrt(confidence) yields the standard weighted
+    # least-squares / Mahalanobis normal equations without ad-hoc H scaling.
+    rot_confidence = confidence[:, :, 0:1]
+    vel_confidence = confidence[:, :, 1:2]
+    pos_confidence = confidence[:, :, 2:3]
+    bias_confidence = confidence.mean(dim=-1, keepdim=True)
+    confidence_scale = torch.cat(
+        [
+            pos_confidence.expand(-1, -1, 3),
+            vel_confidence.expand(-1, -1, 3),
+            rot_confidence.expand(-1, -1, 3),
+            bias_confidence.expand(-1, -1, 6 if imu_optimize_bias else 0),
+        ],
+        dim=-1,
+    ).clamp(0.0, 1.0).sqrt()
+
+    scale = base_scale.view(1, 1, residual_dim) * residual_info_scale * confidence_scale
     residual = residual * scale
     Ji = Ji * scale.unsqueeze(-1)
     Jj = Jj * scale.unsqueeze(-1)

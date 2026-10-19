@@ -1,8 +1,10 @@
 import csv
+import fnmatch
 import glob
 import os
 import os.path as osp
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -142,6 +144,12 @@ class EuRoC(data.Dataset):
         imu_prior_name="imu_prior.csv",
         imu_require=False,
         imu_train_frame_strides=None,
+        imu_train_gyro_noise_density=None,
+        imu_train_accel_noise_density=None,
+        euroc_camera_frame_stride=1,
+        euroc_keyframe_manifest_root=None,
+        euroc_sequence_include=None,
+        euroc_sequence_exclude=None,
         placeholder_depth=1.0,
         **kwargs,
     ):
@@ -156,6 +164,38 @@ class EuRoC(data.Dataset):
             raise ValueError(
                 "imu_train_frame_strides must contain one or more positive integers"
             )
+        self.imu_train_gyro_noise_density = self._validate_noise_density(
+            imu_train_gyro_noise_density,
+            "imu_train_gyro_noise_density",
+        )
+        self.imu_train_accel_noise_density = self._validate_noise_density(
+            imu_train_accel_noise_density,
+            "imu_train_accel_noise_density",
+        )
+        self.euroc_camera_frame_stride = int(euroc_camera_frame_stride)
+        if self.euroc_camera_frame_stride <= 0:
+            raise ValueError("euroc_camera_frame_stride must be a positive integer")
+        self.euroc_keyframe_manifest_root = (
+            None
+            if euroc_keyframe_manifest_root in (None, "")
+            else osp.abspath(osp.expanduser(str(euroc_keyframe_manifest_root)))
+        )
+        if (
+            self.euroc_keyframe_manifest_root is not None
+            and not osp.isdir(self.euroc_keyframe_manifest_root)
+        ):
+            raise FileNotFoundError(
+                "euroc_keyframe_manifest_root is not a directory: "
+                f"{self.euroc_keyframe_manifest_root}"
+            )
+        self.euroc_sequence_include = self._normalize_sequence_patterns(
+            euroc_sequence_include,
+            "euroc_sequence_include",
+        )
+        self.euroc_sequence_exclude = self._normalize_sequence_patterns(
+            euroc_sequence_exclude,
+            "euroc_sequence_exclude",
+        )
         self.placeholder_depth = float(placeholder_depth)
         self.aug = RGBDAugmentor(crop_size=crop_size) if do_aug else None
 
@@ -172,11 +212,88 @@ class EuRoC(data.Dataset):
                 "[IMU DATA] EuRoC temporal strides="
                 f"{self.imu_train_frame_strides}"
             )
+        if self.euroc_camera_frame_stride != 1:
+            print(
+                "[EuRoC DATA] camera-frame decimation="
+                f"{self.euroc_camera_frame_stride} "
+                "(all IMU samples are retained for preintegration)"
+            )
+        if self.euroc_keyframe_manifest_root is not None:
+            print(
+                "[EuRoC DATA] using frozen DROID MotionFilter manifests from "
+                f"{self.euroc_keyframe_manifest_root}"
+            )
+        if self.use_imu:
+            gyro_source = (
+                f"override={self.imu_train_gyro_noise_density:.6g}"
+                if self.imu_train_gyro_noise_density is not None
+                else "imu0/sensor.yaml"
+            )
+            accel_source = (
+                f"override={self.imu_train_accel_noise_density:.6g}"
+                if self.imu_train_accel_noise_density is not None
+                else "imu0/sensor.yaml"
+            )
+            print(
+                "[IMU DATA] EuRoC covariance density source "
+                f"gyro={gyro_source}, accel={accel_source}"
+            )
+
+    @staticmethod
+    def _validate_noise_density(value, name):
+        """Validate an optional covariance override without changing EuRoC defaults."""
+
+        if value is None:
+            return None
+        value = float(value)
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative")
+        return value
+
+    @staticmethod
+    def _normalize_sequence_patterns(patterns, name):
+        if patterns is None:
+            return ()
+        normalized = tuple(str(pattern).strip() for pattern in patterns if str(pattern).strip())
+        if not normalized:
+            raise ValueError(f"{name} must contain at least one non-empty pattern")
+        return normalized
+
+    @staticmethod
+    def _matches_sequence_pattern(sequence_root, pattern):
+        sequence_root = osp.abspath(sequence_root)
+        # Standard raw EuRoC paths end in <sequence>/mav0. Matching both the
+        # sequence name and full path keeps a split manifest portable.
+        sequence_name = osp.basename(osp.dirname(sequence_root))
+        return (
+            fnmatch.fnmatchcase(sequence_name, pattern)
+            or fnmatch.fnmatchcase(sequence_root, pattern)
+        )
 
     def _build_scenes(self):
         sequence_roots = _discover_euroc_sequences(self.root)
+        if self.euroc_sequence_include:
+            sequence_roots = [
+                root for root in sequence_roots
+                if any(
+                    self._matches_sequence_pattern(root, pattern)
+                    for pattern in self.euroc_sequence_include
+                )
+            ]
+        if self.euroc_sequence_exclude:
+            sequence_roots = [
+                root for root in sequence_roots
+                if not any(
+                    self._matches_sequence_pattern(root, pattern)
+                    for pattern in self.euroc_sequence_exclude
+                )
+            ]
         if not sequence_roots:
-            raise FileNotFoundError(f"EuRoC sequence not found under {self.root}")
+            raise FileNotFoundError(
+                "EuRoC sequence not found after applying split filters under "
+                f"{self.root}; include={self.euroc_sequence_include or 'all'}, "
+                f"exclude={self.euroc_sequence_exclude or 'none'}"
+            )
 
         scenes = []
         for sequence_root in sequence_roots:
@@ -188,7 +305,11 @@ class EuRoC(data.Dataset):
             raise ValueError(f"no EuRoC scene has at least {self.n_frames} cam0 frames")
 
         total_frames = sum(len(scene["images"]) for scene in scenes)
-        print(f"Building EuRoC dataset: scenes={len(scenes)}, frames={total_frames}")
+        scene_names = [osp.basename(osp.dirname(scene["id"])) for scene in scenes]
+        print(
+            "Building EuRoC dataset: "
+            f"scenes={len(scenes)}, frames={total_frames}, selected={scene_names}"
+        )
         return scenes
 
     def _load_scene(self, mav0_root):
@@ -209,6 +330,13 @@ class EuRoC(data.Dataset):
             row for row in cam_rows
             if gt_ts[0] <= row["timestamp_ns"] <= gt_ts[-1]
         ]
+        # The selected rows define the camera rate presented to DROID.  Keep
+        # ``frame_index`` unchanged so an IMU interval still composes every
+        # original 20 Hz camera-to-camera preintegration prior between the
+        # retained 10 Hz frames.
+        valid_rows = valid_rows[::self.euroc_camera_frame_stride]
+        if self.euroc_keyframe_manifest_root is not None:
+            valid_rows = self._select_motion_filter_rows(mav0_root, valid_rows)
         if len(valid_rows) < self.n_frames:
             raise ValueError(f"not enough cam0 frames with GT pose in {mav0_root}")
 
@@ -264,6 +392,71 @@ class EuRoC(data.Dataset):
             "imu_info_reference": RGBDDataset._estimate_imu_info_reference(imu_priors),
         }
 
+    def _select_motion_filter_rows(self, mav0_root, candidate_rows):
+        """Apply an immutable visual MotionFilter selection to candidate rows.
+
+        The exporter records original raw camera indices. This reader first
+        reproduces the exporter candidate stream through
+        ``euroc_camera_frame_stride`` and refuses a mismatch rather than
+        silently changing the camera/IMU timing distribution.
+        """
+
+        sequence_name = osp.basename(osp.dirname(osp.abspath(mav0_root)))
+        manifest_path = osp.join(
+            self.euroc_keyframe_manifest_root,
+            f"{sequence_name}.csv",
+        )
+        if not osp.isfile(manifest_path):
+            raise FileNotFoundError(
+                "missing frozen MotionFilter manifest for EuRoC sequence "
+                f"{sequence_name}: {manifest_path}"
+            )
+
+        with open(manifest_path, "r", newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        if not rows or "frame_index" not in rows[0]:
+            raise ValueError(
+                f"{manifest_path} must be a non-empty CSV with frame_index column"
+            )
+
+        try:
+            selected_indices = [int(row["frame_index"]) for row in rows]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{manifest_path} contains a non-integer frame_index"
+            ) from exc
+        if any(
+            current <= previous
+            for previous, current in zip(selected_indices, selected_indices[1:])
+        ):
+            raise ValueError(
+                f"{manifest_path} frame_index values must be strictly increasing"
+            )
+
+        candidates_by_index = {
+            int(row["frame_index"]): row for row in candidate_rows
+        }
+        missing = [
+            frame_index
+            for frame_index in selected_indices
+            if frame_index not in candidates_by_index
+        ]
+        if missing:
+            sample = ", ".join(str(value) for value in missing[:5])
+            raise ValueError(
+                "MotionFilter manifest does not match this EuRoC candidate "
+                "stream. Check euroc_camera_frame_stride and the source "
+                f"sequence; missing frame indices: {sample}"
+            )
+
+        selected = [candidates_by_index[frame_index] for frame_index in selected_indices]
+        print(
+            "[EuRoC DATA] MotionFilter selection "
+            f"sequence={sequence_name}, candidates={len(candidate_rows)}, "
+            f"selected={len(selected)}"
+        )
+        return selected
+
     def _load_or_build_imu_priors(
         self,
         mav0_root,
@@ -300,6 +493,20 @@ class EuRoC(data.Dataset):
             cam_sensor_yaml=Path(cam_yaml),
             imu_sensor_yaml=Path(imu_yaml),
         )
+        # Official EuRoC noise values from imu0/sensor.yaml are the default.
+        # Training commands can intentionally substitute a target phone noise
+        # model, but the override must affect the covariance/info fields rather
+        # than being silently swallowed by this reader.
+        if self.imu_train_gyro_noise_density is not None:
+            calibration = replace(
+                calibration,
+                gyro_noise_density=self.imu_train_gyro_noise_density,
+            )
+        if self.imu_train_accel_noise_density is not None:
+            calibration = replace(
+                calibration,
+                accel_noise_density=self.imu_train_accel_noise_density,
+            )
         imu = load_imu(imu_csv, calibration=calibration)
         imu_timestamps = [int(sample["timestamp_ns"]) for sample in imu]
 

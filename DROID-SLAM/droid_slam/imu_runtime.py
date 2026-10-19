@@ -1,6 +1,56 @@
 import math
 
 
+def configure_confidence_only_imu_weighting(args, source="runtime"):
+    """Use learned IMU confidence as the sole adaptive factor attenuation.
+
+    ``imu_ba_prior_weight`` historically mixed two separate concerns: the
+    visual-vs-IMU global scale and per-interval IMU reliability.  This mode
+    fixes the former at one.  The preintegration covariance supplies the
+    physical relative information and the temporal GRU confidence is the only
+    learned multiplier that may reduce an individual IMU factor.
+    """
+
+    if not getattr(args, "imu_confidence_only_weighting", False):
+        return False
+
+    if getattr(args, "use_learned_imu_ba_weight", False):
+        raise ValueError(
+            "--imu_confidence_only_weighting cannot be combined with "
+            "--use_learned_imu_ba_weight"
+        )
+    if getattr(args, "imu_tuned_confidence_schedule", None) is not None:
+        raise ValueError(
+            "--imu_confidence_only_weighting cannot be combined with "
+            "--imu_tuned_confidence_schedule"
+        )
+
+    old_weight = float(getattr(args, "imu_ba_prior_weight", 0.0))
+    args.imu_ba_prior_weight = 1.0
+
+    # A learned confidence must be the only quality gate in this mode.  These
+    # legacy mechanisms multiply the same factor a second time and obscure
+    # what the confidence head learned.
+    had_adaptive_gate = bool(getattr(args, "use_adaptive_imu_gate", False))
+    args.use_adaptive_imu_gate = False
+    if hasattr(args, "imu_confidence_floor"):
+        args.imu_confidence_floor = 0.0
+    if hasattr(args, "imu_conf_floor"):
+        args.imu_conf_floor = 0.0
+
+    print(
+        "[IMU] confidence-only weighting "
+        f"source={source}, global_weight=1, previous_cli={old_weight:.6g}, "
+        "adaptive_gate=disabled, confidence_floor=disabled"
+    )
+    if had_adaptive_gate:
+        print(
+            "[IMU] disabled legacy adaptive IMU gate because learned "
+            "confidence is the sole adaptive attenuation"
+        )
+    return True
+
+
 def configure_imu_noise_model(args, source="runtime"):
     """Select covariance-relative weighting without an arbitrary info clip.
 

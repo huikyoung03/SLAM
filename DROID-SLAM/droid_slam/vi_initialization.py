@@ -1,16 +1,13 @@
-"""Visual-inertial alignment and fixed-bias refinement helpers.
+"""Visual-inertial alignment and bias-refinement helpers.
 
-The runtime DBA state stays deliberately small: pose, velocity and dense
-inverse depth are optimized per keyframe.  This module estimates the global
-metric quantities that should not be duplicated at every keyframe:
+This module obtains visual-to-metric scale, gravity, global accelerometer/gyro
+bias and initial keyframe velocities from visual poses plus temporal IMU
+constraints. It uses torch operations so its conventions match DROID runtime.
 
-* visual-to-metric scale,
-* gravity expressed in the visual world frame,
-* one accelerometer bias and one gyroscope bias.
-
-The initializer is intentionally outside the CUDA DBA loop.  It runs after a
-short visual-only warm-up, metricizes the current visual state, then lets the
-existing 9D pose/velocity CUDA path consume the resulting fixed parameters.
+The alignment result serves both runtime designs: the 9DoF path retains the
+estimated bias as a fixed parameter, while the two-stage path uses it as the
+centre for per-keyframe bias corrections in full 15DoF DBA. The initializer is
+therefore outside CUDA DBA but shared by both paths.
 """
 
 from __future__ import annotations
@@ -193,6 +190,45 @@ def capture_imu_state_diagnostics(video) -> Dict[str, object]:
     gravity_norm = (
         float(np.linalg.norm(gravity_metric)) if gravity_metric is not None else None
     )
+    local_accel_bias_median = None
+    local_gyro_bias_median = None
+    total_accel_bias_median = None
+    total_gyro_bias_median = None
+    local_accel_bias_p95_norm = None
+    local_gyro_bias_p95_norm = None
+    if (
+        count > 0
+        and hasattr(video, "bias_acc")
+        and hasattr(video, "bias_gyro")
+        and getattr(video, "imu_global_bias_acc", None) is not None
+        and getattr(video, "imu_global_bias_gyro", None) is not None
+    ):
+        local_accel = video.bias_acc[:count].detach()
+        local_gyro = video.bias_gyro[:count].detach()
+        finite = torch.isfinite(local_accel).all(dim=-1) & torch.isfinite(local_gyro).all(dim=-1)
+        if int(finite.sum().item()) > 0:
+            local_accel = local_accel[finite]
+            local_gyro = local_gyro[finite]
+            global_accel = video.imu_global_bias_acc.detach().to(
+                device=local_accel.device, dtype=local_accel.dtype
+            )
+            global_gyro = video.imu_global_bias_gyro.detach().to(
+                device=local_gyro.device, dtype=local_gyro.dtype
+            )
+            local_accel_bias_median = local_accel.median(dim=0).values.cpu().tolist()
+            local_gyro_bias_median = local_gyro.median(dim=0).values.cpu().tolist()
+            total_accel_bias_median = (
+                global_accel + local_accel.median(dim=0).values
+            ).cpu().tolist()
+            total_gyro_bias_median = (
+                global_gyro + local_gyro.median(dim=0).values
+            ).cpu().tolist()
+            local_accel_bias_p95_norm = float(
+                torch.quantile(local_accel.norm(dim=-1), 0.95).cpu().item()
+            )
+            local_gyro_bias_p95_norm = float(
+                torch.quantile(local_gyro.norm(dim=-1), 0.95).cpu().item()
+            )
     return {
         "selected_keyframes": count,
         "alignment_ready": int(_alignment_ready(video)),
@@ -209,6 +245,12 @@ def capture_imu_state_diagnostics(video) -> Dict[str, object]:
         "global_gyro_bias": _vector_or_none(
             getattr(video, "imu_global_bias_gyro", None)
         ),
+        "local_accel_bias_median": local_accel_bias_median,
+        "local_gyro_bias_median": local_gyro_bias_median,
+        "total_accel_bias_median": total_accel_bias_median,
+        "total_gyro_bias_median": total_gyro_bias_median,
+        "local_accel_bias_p95_norm": local_accel_bias_p95_norm,
+        "local_gyro_bias_p95_norm": local_gyro_bias_p95_norm,
         "velocity_metric_mean_norm": velocity_mean_norm,
         "velocity_metric_max_norm": velocity_max_norm,
         "valid_imu_edges": valid_edges,
@@ -1113,6 +1155,8 @@ def _full_bias_residual_and_jacobian(
     gravity: torch.Tensor,
     compose_order: str,
     inverse_imu: bool,
+    local_accel_bias: Optional[torch.Tensor] = None,
+    local_gyro_bias: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return residuals and a shared-bias Jacobian for selected IMU edges.
 
@@ -1120,7 +1164,10 @@ def _full_bias_residual_and_jacobian(
     ``r - J db``. It is therefore the negative residual derivative. This is
     the same convention used by the pose/velocity blocks in ``FactorGraph``
     and makes the six-variable shared-bias step directly compatible with the
-    local IMU DBA objective.
+    local IMU DBA objective. ``local_accel_bias`` and ``local_gyro_bias``
+    optionally supply the per-keyframe 15DoF corrections at the source end of
+    each edge. They leave the returned Jacobian unchanged: it is always with
+    respect to the *shared* global bias block.
     """
 
     poses = video.poses
@@ -1139,18 +1186,36 @@ def _full_bias_residual_and_jacobian(
     v_i = video.velocities[src]
     v_j = video.velocities[dst]
 
+    def total_bias(shared: torch.Tensor, local: Optional[torch.Tensor], name: str):
+        shared = shared.to(device=poses.device, dtype=poses.dtype).reshape(-1)
+        if shared.numel() < 3:
+            raise ValueError(f"{name} shared bias must contain three values")
+        value = shared[:3].view(1, 3).expand(src.numel(), -1)
+        if local is None:
+            return value
+        local = local.to(device=poses.device, dtype=poses.dtype)
+        if local.shape != value.shape:
+            raise ValueError(
+                f"{name} local bias must have shape {tuple(value.shape)}, "
+                f"got {tuple(local.shape)}"
+            )
+        return value + local
+
+    accel_total = total_bias(accel_bias, local_accel_bias, "accelerometer")
+    gyro_total = total_bias(gyro_bias, local_gyro_bias, "gyroscope")
+
     rotvec = video.imu_delta[dst, 1:4] + torch.matmul(
-        jacobian[:, 0], gyro_bias.view(1, 3, 1)
+        jacobian[:, 0], gyro_total.unsqueeze(-1)
     ).squeeze(-1)
     dv_imu = (
         video.imu_delta[dst, 4:7]
-        + torch.matmul(jacobian[:, 1], accel_bias.view(1, 3, 1)).squeeze(-1)
-        + torch.matmul(jacobian[:, 2], gyro_bias.view(1, 3, 1)).squeeze(-1)
+        + torch.matmul(jacobian[:, 1], accel_total.unsqueeze(-1)).squeeze(-1)
+        + torch.matmul(jacobian[:, 2], gyro_total.unsqueeze(-1)).squeeze(-1)
     )
     dp_imu = (
         video.imu_delta[dst, 7:10]
-        + torch.matmul(jacobian[:, 3], accel_bias.view(1, 3, 1)).squeeze(-1)
-        + torch.matmul(jacobian[:, 4], gyro_bias.view(1, 3, 1)).squeeze(-1)
+        + torch.matmul(jacobian[:, 3], accel_total.unsqueeze(-1)).squeeze(-1)
+        + torch.matmul(jacobian[:, 4], gyro_total.unsqueeze(-1)).squeeze(-1)
     )
     q_pred = predict_imu_rotation(
         q_i,
@@ -1202,6 +1267,8 @@ def _full_bias_residuals(
     gravity: torch.Tensor,
     compose_order: str,
     inverse_imu: bool,
+    local_accel_bias: Optional[torch.Tensor] = None,
+    local_gyro_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Return `[r_p, r_v, r_R]` for callers that only need residuals."""
 
@@ -1214,6 +1281,8 @@ def _full_bias_residuals(
         gravity,
         compose_order,
         inverse_imu,
+        local_accel_bias,
+        local_gyro_bias,
     )
     return residual
 
@@ -1600,7 +1669,414 @@ def refine_window_biases(
     }
 
 
-def record_window_bias_refinement(video, result: Dict[str, float], stage: str) -> None:
+@torch.no_grad()
+def refine_global_bias_15dof(
+    video,
+    compose_order: str = "dq_prev",
+    inverse_imu: bool = True,
+    max_dt: float = 0.5,
+    max_residual_deg: float = 45.0,
+    pos_weight: float = 0.05,
+    vel_weight: float = 0.05,
+    damping: float = 1e-4,
+    step_scale: float = 0.5,
+    max_accel_step: float = 0.15,
+    max_gyro_step: float = 0.015,
+    max_accel_norm: float = 2.0,
+    max_gyro_norm: float = 0.2,
+    global_weight: float = 1.0,
+    imu_confidence: Optional[torch.Tensor] = None,
+    use_imu_info_weighting: bool = False,
+    imu_info_reference: Optional[torch.Tensor] = None,
+    imu_info_weight_clip: float = 4.0,
+    imu_info_weight_eps: float = 1e-12,
+    robust_delta: float = 3.0,
+    min_edges: int = 20,
+    min_duration: float = 2.0,
+    min_rotation_deg: float = 5.0,
+    max_condition: float = 1e8,
+    min_relative_improvement: float = 1e-4,
+    accel_random_walk: float = -1.0,
+    gyro_random_walk: float = -1.0,
+    accel_prior_std: float = 0.5,
+    gyro_prior_std: float = 0.05,
+    relinearize_accel_threshold: float = 0.05,
+    relinearize_gyro_threshold: float = 0.005,
+) -> Dict[str, object]:
+    """Run one offline 6D global-bias block after a global 15DoF DBA pass.
+
+    The normal local full-state solver owns the per-keyframe state
+    ``[T_i, v_i, ba_i, bg_i]``.  This routine holds that state fixed for one
+    robust Gauss-Newton update of a *shared* bias centre and uses all valid
+    temporal factors in the completed sequence.  It is intentionally a
+    block-coordinate update rather than an undocumented second CUDA state
+    layout: a short full 15DoF backend pass must follow an accepted update.
+
+    Local bias corrections are included in each preintegration residual, so
+    the solved variable has a clear meaning: it changes the physical total
+    bias ``b_global + b_i``.  A subsequent recentering step can later choose a
+    numerically convenient global/local split without changing that total.
+    """
+
+    if not _alignment_ready(video):
+        return {"updated": 0.0, "reason": "not_aligned"}
+    if global_weight <= 0.0 or not np.isfinite(global_weight):
+        return {"updated": 0.0, "reason": "zero_global_weight"}
+    if not hasattr(video, "bias_acc") or not hasattr(video, "bias_gyro"):
+        return {"updated": 0.0, "reason": "missing_local_bias_state"}
+
+    count = int(video.counter.value)
+    src, dst = _valid_temporal_edges(video, 0, count, max_dt)
+    if dst.numel() < max(1, int(min_edges)):
+        return {
+            "updated": 0.0,
+            "reason": "insufficient_edges",
+            "edges": float(dst.numel()),
+        }
+
+    device = video.poses.device
+    dtype = video.poses.dtype
+    accel_bias = video.imu_global_bias_acc.detach().to(
+        device=device, dtype=dtype
+    ).clone()
+    gyro_bias = video.imu_global_bias_gyro.detach().to(
+        device=device, dtype=dtype
+    ).clone()
+    gravity = video.imu_gravity.detach().to(device=device, dtype=dtype)
+    local_accel = video.bias_acc[src].detach().to(device=device, dtype=dtype)
+    local_gyro = video.bias_gyro[src].detach().to(device=device, dtype=dtype)
+
+    duration = float(video.imu_delta[dst, 0].sum().detach().cpu().item())
+    if duration < float(min_duration):
+        return {
+            "updated": 0.0,
+            "reason": "insufficient_duration",
+            "edges": float(dst.numel()),
+            "duration_sec": duration,
+        }
+    rotation_excitation_deg = float(
+        video.imu_delta[dst, 1:4].norm(dim=-1).sum().detach().cpu().item()
+        * (180.0 / np.pi)
+    )
+    if rotation_excitation_deg < float(min_rotation_deg):
+        return {
+            "updated": 0.0,
+            "reason": "insufficient_rotation",
+            "edges": float(dst.numel()),
+            "duration_sec": duration,
+            "rotation_excitation_deg": rotation_excitation_deg,
+        }
+
+    residual, jacobian = _full_bias_residual_and_jacobian(
+        video,
+        src,
+        dst,
+        accel_bias,
+        gyro_bias,
+        gravity,
+        compose_order,
+        inverse_imu,
+        local_accel,
+        local_gyro,
+    )
+    base_scale = residual.new_tensor(
+        [pos_weight] * 3 + [vel_weight] * 3 + [1.0] * 3
+    ).clamp_min(0.0).sqrt()
+    information_scale = _shared_bias_information_scale(
+        video,
+        dst,
+        imu_info_reference,
+        use_imu_info_weighting,
+        imu_info_weight_clip,
+        imu_info_weight_eps,
+    )
+    residual_scale = base_scale.view(1, 9) * information_scale
+    confidence = _shared_bias_confidence(
+        imu_confidence, dst, count, device, dtype
+    )
+    row_weight = video.imu_weight[dst].detach().to(device=device, dtype=dtype)
+    row_scale = (row_weight / 0.001).clamp(0.0, 1.0)
+    edge_weight = float(global_weight) * confidence * row_scale
+    rotation_residual_deg = residual[:, 6:9].norm(dim=-1) * (180.0 / np.pi)
+    valid = (
+        torch.isfinite(residual).all(dim=-1)
+        & torch.isfinite(jacobian).all(dim=(-1, -2))
+        & torch.isfinite(residual_scale).all(dim=-1)
+        & torch.isfinite(local_accel).all(dim=-1)
+        & torch.isfinite(local_gyro).all(dim=-1)
+        & torch.isfinite(edge_weight)
+        & (edge_weight > 0.0)
+    )
+    if max_residual_deg > 0.0:
+        valid &= rotation_residual_deg <= float(max_residual_deg)
+    if int(valid.sum().item()) < max(1, int(min_edges)):
+        return {
+            "updated": 0.0,
+            "reason": "insufficient_weighted_edges",
+            "edges": float(valid.sum().detach().cpu().item()),
+        }
+
+    src = src[valid]
+    dst = dst[valid]
+    residual = residual[valid]
+    jacobian = jacobian[valid]
+    residual_scale = residual_scale[valid]
+    confidence = confidence[valid]
+    edge_weight = edge_weight[valid]
+    local_accel = local_accel[valid]
+    local_gyro = local_gyro[valid]
+
+    normalized_residual = residual * residual_scale
+    residual_norm = normalized_residual.norm(dim=-1)
+    _, irls = _huber_cost_and_irls(residual_norm, robust_delta)
+    sqrt_weight = (edge_weight * irls).clamp_min(0.0).sqrt()
+    weighted_residual = normalized_residual * sqrt_weight[:, None]
+    weighted_jacobian = (
+        jacobian * residual_scale[:, :, None] * sqrt_weight[:, None, None]
+    )
+    hessian_data = torch.einsum(
+        "eri,erj->ij", weighted_jacobian, weighted_jacobian
+    )
+    gradient = torch.einsum("eri,er->i", weighted_jacobian, weighted_residual)
+    hessian_sym = 0.5 * (hessian_data + hessian_data.T)
+    try:
+        eigenvalues = torch.linalg.eigvalsh(hessian_sym)
+    except RuntimeError:
+        return {"updated": 0.0, "reason": "eigendecomposition_failed"}
+    largest = (
+        float(eigenvalues[-1].detach().cpu().item())
+        if eigenvalues.numel()
+        else 0.0
+    )
+    rank_threshold = max(largest * 1e-6, 1e-12)
+    rank = int((eigenvalues > rank_threshold).sum().detach().cpu().item())
+    smallest = (
+        float(eigenvalues[0].detach().cpu().item())
+        if eigenvalues.numel()
+        else 0.0
+    )
+    condition = (
+        largest / max(smallest, rank_threshold)
+        if largest > 0.0
+        else float("inf")
+    )
+    if rank < 6 or not np.isfinite(condition) or condition > float(max_condition):
+        return {
+            "updated": 0.0,
+            "reason": "poor_observability",
+            "edges": float(dst.numel()),
+            "rank": float(rank),
+            "condition": condition,
+            "rotation_excitation_deg": rotation_excitation_deg,
+        }
+
+    prior_std = _shared_bias_prior_std(
+        video,
+        dst,
+        duration,
+        accel_random_walk,
+        gyro_random_walk,
+        accel_prior_std,
+        gyro_prior_std,
+    )
+    prior_precision = torch.zeros(6, device=device, dtype=dtype)
+    usable_prior = torch.isfinite(prior_std) & (prior_std > 0.0)
+    prior_precision[usable_prior] = 1.0 / prior_std[usable_prior].square()
+    hessian = hessian_sym + torch.diag(prior_precision)
+    hessian += float(damping) * torch.eye(6, device=device, dtype=dtype)
+    try:
+        # This is the same `r - J db` convention as the DBA factor, hence
+        # the positive J^T r right-hand side.
+        step = torch.linalg.solve(hessian, gradient) * float(step_scale)
+    except RuntimeError:
+        return {"updated": 0.0, "reason": "singular"}
+    if not torch.isfinite(step).all():
+        return {"updated": 0.0, "reason": "nonfinite_step"}
+
+    accel_step = step[:3]
+    gyro_step = step[3:]
+    accel_step_norm = accel_step.norm().clamp_min(1e-12)
+    gyro_step_norm = gyro_step.norm().clamp_min(1e-12)
+    if max_accel_step > 0.0:
+        accel_step = accel_step * min(
+            1.0, float(max_accel_step) / float(accel_step_norm.item())
+        )
+    if max_gyro_step > 0.0:
+        gyro_step = gyro_step * min(
+            1.0, float(max_gyro_step) / float(gyro_step_norm.item())
+        )
+
+    candidate_accel = accel_bias + accel_step
+    candidate_gyro = gyro_bias + gyro_step
+    if max_accel_norm > 0.0 and float(candidate_accel.norm().item()) > float(max_accel_norm):
+        candidate_accel *= float(max_accel_norm) / float(candidate_accel.norm().item())
+    if max_gyro_norm > 0.0 and float(candidate_gyro.norm().item()) > float(max_gyro_norm):
+        candidate_gyro *= float(max_gyro_norm) / float(candidate_gyro.norm().item())
+
+    def objective(accel, gyro, prior_step=None):
+        candidate_residual, _ = _full_bias_residual_and_jacobian(
+            video,
+            src,
+            dst,
+            accel,
+            gyro,
+            gravity,
+            compose_order,
+            inverse_imu,
+            local_accel,
+            local_gyro,
+        )
+        norm = (candidate_residual * residual_scale).norm(dim=-1)
+        cost, _ = _huber_cost_and_irls(norm, robust_delta)
+        total = torch.sum(edge_weight * cost)
+        if prior_step is not None:
+            total = total + 0.5 * torch.sum(prior_precision * prior_step.square())
+        return total
+
+    before_t = objective(accel_bias, gyro_bias)
+    candidate_step = torch.cat(
+        [candidate_accel - accel_bias, candidate_gyro - gyro_bias], dim=0
+    )
+    after_t = objective(candidate_accel, candidate_gyro, candidate_step)
+    before = float(before_t.detach().cpu().item())
+    after = float(after_t.detach().cpu().item())
+    relative_improvement = (before - after) / max(abs(before), 1e-12)
+    if not np.isfinite(after) or after >= before:
+        return {
+            "updated": 0.0,
+            "reason": "no_improvement",
+            "edges": float(dst.numel()),
+            "cost_before": before,
+            "cost_after": after,
+            "relative_improvement": relative_improvement,
+        }
+    if (
+        float(min_relative_improvement) > 0.0
+        and relative_improvement < float(min_relative_improvement)
+    ):
+        return {
+            "updated": 0.0,
+            "reason": "insufficient_relative_improvement",
+            "edges": float(dst.numel()),
+            "cost_before": before,
+            "cost_after": after,
+            "relative_improvement": relative_improvement,
+        }
+
+    accel_step = candidate_accel - accel_bias
+    gyro_step = candidate_gyro - gyro_bias
+    video.imu_global_bias_acc[:] = candidate_accel
+    video.imu_global_bias_gyro[:] = candidate_gyro
+    video.dirty[:count] = True
+    requires_reintegration = bool(
+        (relinearize_accel_threshold > 0.0
+         and float(accel_step.norm().detach().cpu().item()) > relinearize_accel_threshold)
+        or (relinearize_gyro_threshold > 0.0
+            and float(gyro_step.norm().detach().cpu().item()) > relinearize_gyro_threshold)
+    )
+    video.imu_bias_relinearization_required = bool(
+        getattr(video, "imu_bias_relinearization_required", False)
+        or requires_reintegration
+    )
+    return {
+        "updated": 1.0,
+        "global_15dof_block": 1.0,
+        "edges": float(dst.numel()),
+        "duration_sec": duration,
+        "rotation_excitation_deg": rotation_excitation_deg,
+        "condition": condition,
+        "rank": float(rank),
+        "confidence_mean": float(confidence.mean().detach().cpu().item()),
+        "prior_accel_std": float(prior_std[:3].mean().detach().cpu().item()),
+        "prior_gyro_std": float(prior_std[3:].mean().detach().cpu().item()),
+        "cost_before": before,
+        "cost_after": after,
+        "relative_improvement": relative_improvement,
+        "accel_step_norm": float(accel_step.norm().detach().cpu().item()),
+        "gyro_step_norm": float(gyro_step.norm().detach().cpu().item()),
+        "accel_bias_norm": float(candidate_accel.norm().detach().cpu().item()),
+        "gyro_bias_norm": float(candidate_gyro.norm().detach().cpu().item()),
+        "relinearization_required": float(requires_reintegration),
+    }
+
+
+@torch.no_grad()
+def recenter_full_imu_biases(
+    video,
+    max_dt: float = 0.5,
+    max_accel_norm: float = 2.0,
+    max_gyro_norm: float = 0.2,
+) -> Dict[str, object]:
+    """Move the robust local-bias centre into the global bias parameter.
+
+    This is a gauge normalization, not another physical correction. For every
+    keyframe it preserves ``b_global + b_i`` exactly while making local bias
+    deviations zero-centred. That gives the offline re-preintegration tool a
+    meaningful nominal global bias without changing the just-optimized pose,
+    velocity, or inertial residuals.
+    """
+
+    if not _alignment_ready(video):
+        return {"updated": 0.0, "reason": "not_aligned"}
+    if not hasattr(video, "bias_acc") or not hasattr(video, "bias_gyro"):
+        return {"updated": 0.0, "reason": "missing_local_bias_state"}
+
+    count = int(video.counter.value)
+    src, dst = _valid_temporal_edges(video, 0, count, max_dt)
+    if dst.numel() == 0:
+        return {"updated": 0.0, "reason": "insufficient_edges"}
+    indices = torch.unique(torch.cat([src, dst], dim=0))
+    local_accel = video.bias_acc[indices].detach()
+    local_gyro = video.bias_gyro[indices].detach()
+    finite = torch.isfinite(local_accel).all(dim=-1) & torch.isfinite(local_gyro).all(dim=-1)
+    if int(finite.sum().item()) < 2:
+        return {"updated": 0.0, "reason": "insufficient_finite_biases"}
+
+    local_accel = local_accel[finite]
+    local_gyro = local_gyro[finite]
+    accel_shift = local_accel.median(dim=0).values
+    gyro_shift = local_gyro.median(dim=0).values
+    current_accel = video.imu_global_bias_acc.detach().clone()
+    current_gyro = video.imu_global_bias_gyro.detach().clone()
+    candidate_accel = current_accel + accel_shift
+    candidate_gyro = current_gyro + gyro_shift
+    if (
+        (max_accel_norm > 0.0 and float(candidate_accel.norm().item()) > max_accel_norm)
+        or (max_gyro_norm > 0.0 and float(candidate_gyro.norm().item()) > max_gyro_norm)
+    ):
+        return {
+            "updated": 0.0,
+            "reason": "centre_out_of_bounds",
+            "candidate_accel_bias_norm": float(candidate_accel.norm().detach().cpu().item()),
+            "candidate_gyro_bias_norm": float(candidate_gyro.norm().detach().cpu().item()),
+        }
+
+    total_accel_before = current_accel.view(1, 3) + video.bias_acc[:count].detach()
+    total_gyro_before = current_gyro.view(1, 3) + video.bias_gyro[:count].detach()
+    video.imu_global_bias_acc[:] = candidate_accel
+    video.imu_global_bias_gyro[:] = candidate_gyro
+    video.bias_acc[:count] -= accel_shift
+    video.bias_gyro[:count] -= gyro_shift
+    total_accel_after = candidate_accel.view(1, 3) + video.bias_acc[:count]
+    total_gyro_after = candidate_gyro.view(1, 3) + video.bias_gyro[:count]
+    preservation_error = max(
+        float((total_accel_after - total_accel_before).abs().max().detach().cpu().item()),
+        float((total_gyro_after - total_gyro_before).abs().max().detach().cpu().item()),
+    )
+    video.dirty[:count] = True
+    return {
+        "updated": 1.0,
+        "recentered": 1.0,
+        "edges": float(dst.numel()),
+        "accel_center_shift_norm": float(accel_shift.norm().detach().cpu().item()),
+        "gyro_center_shift_norm": float(gyro_shift.norm().detach().cpu().item()),
+        "accel_bias_norm": float(candidate_accel.norm().detach().cpu().item()),
+        "gyro_bias_norm": float(candidate_gyro.norm().detach().cpu().item()),
+        "total_bias_preservation_max_abs": preservation_error,
+    }
+
+
+def record_window_bias_refinement(video, result: Dict[str, object], stage: str) -> None:
     """Persist scalar shared-bias updates for reconstruction-side analysis."""
 
     history = getattr(video, "imu_bias_refinement_history", None)

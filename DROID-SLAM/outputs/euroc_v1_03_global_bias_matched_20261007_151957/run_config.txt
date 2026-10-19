@@ -1,0 +1,1 @@
+OUT_DIR=outputs/euroc_v1_03_global_bias_matched_20261007_151957

@@ -39,7 +39,11 @@ class DroidFrontend:
             imu_regularizer=self.imu_regularizer,
             apply_imu_residual=getattr(args, "use_imu_residual", False),
             use_learned_imu_confidence=getattr(args, "use_learned_imu_confidence", False),
+            use_component_imu_confidence=getattr(args, "use_component_imu_confidence", False),
+            use_dvi_imu_confidence=getattr(args, "use_dvi_imu_confidence", False),
+            use_dvi_imu_quality_fusion=getattr(args, "use_dvi_imu_quality_fusion", False),
             imu_confidence_floor=getattr(args, "imu_confidence_floor", 0.0),
+            imu_tuned_confidence_schedule=getattr(args, "imu_tuned_confidence_schedule", None),
             use_imu_ba_prior=getattr(args, "use_imu_ba_prior", False),
             imu_ba_prior_weight=getattr(args, "imu_ba_prior_weight", 0.0),
             imu_ba_prior_max_deg=getattr(args, "imu_ba_prior_max_deg", 45.0),
@@ -117,6 +121,14 @@ class DroidFrontend:
         self.max_age = 20
         self.iters1 = 3
         self.iters2 = 2
+        self.use_two_stage_imu_ba = bool(
+            getattr(args, "use_two_stage_imu_ba", False)
+        )
+        if self.use_two_stage_imu_ba:
+            print(
+                "[IMU] local two-stage DBA enabled: "
+                "visual pose-only -> joint pose/velocity/bias 15DoF"
+            )
 
         self.keyframe_removal_index = 3
 
@@ -143,6 +155,16 @@ class DroidFrontend:
         self.vi_init_bootstrap_frames = max(
             0, int(getattr(args, "vi_init_bootstrap_frames", 60))
         )
+        # This is an ablation-only switch. It isolates the visual benefit of
+        # retaining early keyframes from the IMU factor/VI-initialization path.
+        self.visual_bootstrap_control = bool(
+            getattr(args, "visual_bootstrap_control", False)
+        )
+        if self.visual_bootstrap_control:
+            print(
+                "[VISUAL-CONTROL] retaining startup keyframes for "
+                f"{self.vi_init_bootstrap_frames} frames"
+            )
         self._reported_vi_init_keyframe_retention = False
         self.vi_init_retry_interval = max(
             1, int(getattr(args, "vi_init_retry_interval", 5))
@@ -170,6 +192,16 @@ class DroidFrontend:
         )
         self._last_bias_refinement_frame = 0
 
+    def _run_local_dba_stage(self, stage, iterations):
+        """Run one local stage, keeping stage one strictly visual."""
+
+        if iterations <= 0:
+            return
+        if self.use_two_stage_imu_ba:
+            self.graph.set_imu_ba_stage(stage)
+        for _ in range(iterations):
+            self.graph.update(None, None, use_inactive=True)
+
     def _has_vi_alignment(self):
         ready = getattr(self.video, "imu_alignment_ready", None)
         return bool(ready.value) if hasattr(ready, "value") else False
@@ -177,6 +209,11 @@ class DroidFrontend:
     def _retain_startup_keyframes_for_vi(self):
         """Keep a bounded visual window intact until VI alignment is observable."""
 
+        if self.visual_bootstrap_control:
+            return (
+                self.vi_init_bootstrap_frames > 0
+                and int(self.video.counter.value) < self.vi_init_bootstrap_frames
+            )
         return bool(
             self.use_vi_initialization
             and self.vi_init_bootstrap
@@ -459,8 +496,9 @@ class DroidFrontend:
             self.video.disps[self.t1 - 1],
         )
 
-        for itr in range(self.iters1):
-            self.graph.update(None, None, use_inactive=True)
+        # Do not let velocity absorb an unmodelled IMU bias before the joint
+        # 15DoF stage can estimate the bias itself.
+        self._run_local_dba_stage("pose_only", self.iters1)
 
         # Capture the visual/IMU state before a redundancy decision can remove
         # one of its short temporal edges.
@@ -493,13 +531,20 @@ class DroidFrontend:
         self._maybe_initialize_visual_inertial()
         bias_updated = self._maybe_refine_window_biases()
 
-        # A newly accepted shared-bias step must be followed by at least one
-        # regular 9DoF CUDA DBA pass so T, v and dense depth react to the new
-        # preintegration correction in the same local update.
-        post_bias_iterations = self.iters2 if not removed_keyframe else (1 if bias_updated else 0)
-        if post_bias_iterations > 0:
-            for itr in range(post_bias_iterations):
-                self.graph.update(None, None, use_inactive=True)
+        if self.use_two_stage_imu_ba:
+            # Stage two is the existing per-keyframe full state path, not a
+            # low-rate/shared-bias correction. It starts only after VI
+            # initialization has supplied gravity, velocity, and bias seeds.
+            post_bias_iterations = self.iters2 if self._has_vi_alignment() else 0
+            self._run_local_dba_stage("full_15dof", post_bias_iterations)
+        else:
+            # A newly accepted shared-bias step must be followed by at least
+            # one regular 9DoF CUDA DBA pass so T, v and dense depth react to
+            # the new preintegration correction in the same local update.
+            post_bias_iterations = self.iters2 if not removed_keyframe else (1 if bias_updated else 0)
+            if post_bias_iterations > 0:
+                for _ in range(post_bias_iterations):
+                    self.graph.update(None, None, use_inactive=True)
 
 
         # set pose for next itration
@@ -516,6 +561,9 @@ class DroidFrontend:
 
         self.t0 = 0
         self.t1 = self.video.counter.value
+
+        if self.use_two_stage_imu_ba:
+            self.graph.set_imu_ba_stage("pose_only")
 
         self.graph.add_neighborhood_factors(self.t0, self.t1, r=3)
 

@@ -146,7 +146,6 @@ dist
 *.vscode/
 *.pth
 tests
-checkpoints
 datasets
 runs
 cache
@@ -154,5 +153,8 @@ cache
 *.o
 data
 figures/*.pdf
+
+!checkpoints/*.pth
+!checkpoints/**/*.pth
 
 

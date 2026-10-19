@@ -1,0 +1,4 @@
+label,checkpoint
+learned_001000,/home/ubuntu/DROID-SLAM/checkpoints/full15dof_confidence_only_3000_001000.pth
+learned_002000,/home/ubuntu/DROID-SLAM/checkpoints/full15dof_confidence_only_3000_002000.pth
+learned_003000,/home/ubuntu/DROID-SLAM/checkpoints/full15dof_confidence_only_3000_final_003000.pth

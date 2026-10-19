@@ -864,7 +864,9 @@ class MotionFilter:
             )
             if self.vi_init_bootstrap:
                 self._vi_init_bootstrap_selected = 1
-            return
+            # Regular DROID callers ignore this result. The offline manifest
+            # exporter uses it to record the exact visual selection decision.
+            return True
 
         # index correlation volume
         coords0 = pops.coords_grid(ht, wd, device=self.device)[None, None]
@@ -931,3 +933,8 @@ class MotionFilter:
 
         else:
             self.count += 1
+
+        # A frontend may subsequently marginalize a keyframe, so return the
+        # selection decision itself rather than reconstructing it from video
+        # state after frontend work.
+        return bool(should_append)

@@ -1,0 +1,6 @@
+label,checkpoint
+learned_001000,/home/ubuntu/DROID-SLAM/checkpoints/dvi_mh03_10fps_stage3_10000_001000.pth
+learned_002000,/home/ubuntu/DROID-SLAM/checkpoints/dvi_mh03_10fps_stage3_10000_002000.pth
+learned_003000,/home/ubuntu/DROID-SLAM/checkpoints/dvi_mh03_10fps_stage3_10000_003000.pth
+learned_004000,/home/ubuntu/DROID-SLAM/checkpoints/dvi_mh03_10fps_stage3_10000_004000.pth
+learned_005000,/home/ubuntu/DROID-SLAM/checkpoints/dvi_mh03_10fps_stage3_10000_005000.pth

@@ -10,12 +10,16 @@ from droid_backend import DroidBackend
 from trajectory_filler import PoseTrajectoryFiller
 from vi_initialization import (
     apply_visual_inertial_alignment,
+    recenter_full_imu_biases,
+    record_window_bias_refinement,
     record_imu_state_diagnostics,
+    refine_global_bias_15dof,
     try_visual_inertial_initialization,
 )
 from imu_runtime import (
     apply_learned_imu_ba_weight,
     apply_learned_imu_residual_weights,
+    configure_confidence_only_imu_weighting,
     configure_imu_noise_model,
 )
 
@@ -99,7 +103,33 @@ class Droid:
 
         # 실행 옵션 저장
         self.args = args
+        if getattr(self.args, "use_component_imu_confidence", False):
+            loaded_keys = getattr(self.net, "_loaded_state_keys", set())
+            has_component_head = any(
+                key.startswith("update.imu_component_confidence.")
+                or key.startswith("update.imu_quality_fusion.")
+                for key in loaded_keys
+            )
+            if not has_component_head:
+                self.net.initialize_component_imu_confidence_from_scalar()
+                print(
+                    "[IMU] initialized component confidence from scalar checkpoint; "
+                    "quality fusion is neutral until fine-tuned"
+                )
+        if getattr(self.args, "use_dvi_imu_quality_fusion", False):
+            loaded_keys = getattr(self.net, "_loaded_state_keys", set())
+            has_dvi_quality_head = any(
+                key.startswith("update.dvi_imu_quality_fusion.")
+                for key in loaded_keys
+            )
+            if not has_dvi_quality_head:
+                self.net.initialize_dvi_imu_quality_fusion()
+                print(
+                    "[IMU] initialized scalar DVI IMU-quality fusion from "
+                    "an older checkpoint; quality contribution is neutral"
+                )
         configure_imu_noise_model(self.args, source="droid")
+        configure_confidence_only_imu_weighting(self.args, source="droid")
         apply_learned_imu_ba_weight(self.args, self.net, source="droid")
         apply_learned_imu_residual_weights(self.args, self.net, source="droid")
 
@@ -315,7 +345,7 @@ class Droid:
             #   이전 selected frame과 correlation 계산
             #   update network로 approximate flow delta 계산
             #   delta가 threshold보다 크면 self.video.append(...)
-            self.filterx.track(
+            was_selected = self.filterx.track(
                 tstamp,
                 image,
                 depth,
@@ -332,6 +362,10 @@ class Droid:
             # MotionFilter가 새 frame을 추가했다면
             # frontend가 factor graph를 갱신하고 pose/disparity를 최적화한다.
             self.frontend()
+
+            # Existing callers ignore this return value. The offline manifest
+            # exporter consumes the pre-frontend MotionFilter decision.
+            return bool(was_selected)
 
     def _has_vi_alignment(self):
         ready = getattr(self.video, "imu_alignment_ready", None)
@@ -419,6 +453,223 @@ class Droid:
         )
         return True
 
+    @torch.no_grad()
+    def _run_final_global_bias_refinement(self):
+        """Refine the common bias centre after the first global 15DoF pass.
+
+        The main CUDA DBA already optimizes every keyframe's local 15DoF
+        state. This explicit six-variable block is an offline finalization
+        step, followed by a short ordinary full-state backend pass. Keeping it
+        here makes the online frontend schedule unchanged and records a clear
+        before/after boundary in the reconstruction diagnostics.
+        """
+
+        if not getattr(self.args, "use_global_bias_15dof_refinement", False):
+            return False
+
+        # Global and local bias states have a gauge freedom: moving the same
+        # offset between them leaves every physical total bias unchanged.
+        # Normalize that gauge before the shared six-variable solve instead of
+        # injecting a new local-bias prior only in this final backend pass.
+        precenter = recenter_full_imu_biases(
+            self.video,
+            max_dt=getattr(self.args, "imu_full_max_dt", 0.5),
+            max_accel_norm=getattr(
+                self.args, "imu_global_bias_refine_max_accel_norm", 2.0
+            ),
+            max_gyro_norm=getattr(
+                self.args, "imu_global_bias_refine_max_gyro_norm", 0.2
+            ),
+        )
+        record_window_bias_refinement(self.video, precenter, "global_15dof_precenter")
+        if precenter.get("updated", 0.0) > 0.0:
+            print(
+                "[VI-BIAS-GLOBAL] precentered local 15DoF biases "
+                f"|dba|={precenter.get('accel_center_shift_norm', 0.0):.6g}, "
+                f"|dbg|={precenter.get('gyro_center_shift_norm', 0.0):.6g}, "
+                f"total_preservation={precenter.get('total_bias_preservation_max_abs', 0.0):.3g}"
+            )
+
+        record_imu_state_diagnostics(self.video, "pre_global_bias_15dof")
+        learned_confidence = None
+        confidence_stats = {
+            "learned_confidence_enabled": 0.0,
+            "learned_confidence_cached_rows": 0.0,
+            "learned_confidence_cached_mean": 1.0,
+        }
+        if getattr(self.args, "use_learned_imu_confidence", False):
+            count = int(self.video.counter.value)
+            cache = getattr(self.video, "imu_learned_confidence", None)
+            coverage = getattr(self.video, "imu_learned_confidence_valid", None)
+            if cache is not None and cache.shape[0] >= count:
+                learned_confidence = cache[:count].detach().clone()
+                if coverage is not None and coverage.numel() >= count:
+                    coverage = coverage[:count].detach().to(dtype=torch.bool)
+                    learned_confidence = torch.where(
+                        coverage[:, None] if learned_confidence.ndim == 2 else coverage,
+                        learned_confidence,
+                        torch.ones_like(learned_confidence),
+                    )
+                    cached_rows = int(coverage.sum().detach().cpu().item())
+                    cached_mean = (
+                        float(learned_confidence[coverage].mean().detach().cpu().item())
+                        if cached_rows > 0
+                        else 1.0
+                    )
+                else:
+                    cached_rows = count
+                    cached_mean = float(learned_confidence.mean().detach().cpu().item())
+                confidence_stats = {
+                    "learned_confidence_enabled": 1.0,
+                    "learned_confidence_cached_rows": float(cached_rows),
+                    "learned_confidence_cached_mean": cached_mean,
+                }
+                print(
+                    "[IMU-CONFIDENCE] global shared-bias uses cached direct "
+                    f"temporal confidence: rows={cached_rows}/{count}, "
+                    f"mean={cached_mean:.4f}"
+                )
+            else:
+                print(
+                    "[IMU-CONFIDENCE WARNING] no complete cached temporal confidence; "
+                    "using neutral global shared-bias weights"
+                )
+
+        # `refine_global_bias_15dof()` predates component confidence and has
+        # a scalar per-factor likelihood.  Full local DBA uses all three
+        # channels; global bias-only refinement receives their neutral mean.
+        if learned_confidence is not None and learned_confidence.ndim == 2:
+            learned_confidence = learned_confidence.mean(dim=-1)
+
+        result = refine_global_bias_15dof(
+            self.video,
+            compose_order=getattr(self.args, "imu_full_compose_order", "dq_prev"),
+            inverse_imu=getattr(self.args, "imu_full_inverse", True),
+            max_dt=getattr(self.args, "imu_full_max_dt", 0.5),
+            max_residual_deg=getattr(self.args, "imu_ba_prior_max_deg", 45.0),
+            pos_weight=getattr(self.args, "imu_full_pos_weight", 0.05),
+            vel_weight=getattr(self.args, "imu_full_vel_weight", 0.05),
+            damping=getattr(self.args, "imu_global_bias_refine_damping", 1e-4),
+            step_scale=getattr(self.args, "imu_global_bias_refine_step_scale", 0.5),
+            max_accel_step=getattr(
+                self.args, "imu_global_bias_refine_max_accel_step", 0.15
+            ),
+            max_gyro_step=getattr(
+                self.args, "imu_global_bias_refine_max_gyro_step", 0.015
+            ),
+            max_accel_norm=getattr(
+                self.args, "imu_global_bias_refine_max_accel_norm", 2.0
+            ),
+            max_gyro_norm=getattr(
+                self.args, "imu_global_bias_refine_max_gyro_norm", 0.2
+            ),
+            # This block conditions on the completed pose/velocity trajectory.
+            # Its likelihood scale must therefore not inherit the small
+            # visual-versus-IMU DBA trade-off weight; covariance, row quality,
+            # and robustification provide the relevant relative weighting here.
+            global_weight=getattr(
+                self.args, "imu_global_bias_refine_weight", 1.0
+            ),
+            # The cache contains only direct temporal visual edge predictions.
+            # Rows without such an edge are explicitly neutral rather than
+            # inheriting confidence from an unrelated graph factor.
+            imu_confidence=learned_confidence,
+            use_imu_info_weighting=getattr(
+                self.args, "use_imu_info_weighting", False
+            ),
+            imu_info_reference=getattr(self.args, "imu_info_reference", None),
+            imu_info_weight_clip=getattr(self.args, "imu_info_weight_clip", 4.0),
+            imu_info_weight_eps=getattr(self.args, "imu_info_weight_eps", 1e-12),
+            robust_delta=getattr(self.args, "imu_global_bias_refine_robust_delta", 3.0),
+            min_edges=getattr(self.args, "imu_global_bias_refine_min_edges", 20),
+            min_duration=getattr(
+                self.args, "imu_global_bias_refine_min_duration", 2.0
+            ),
+            min_rotation_deg=getattr(
+                self.args, "imu_global_bias_refine_min_rotation_deg", 5.0
+            ),
+            max_condition=getattr(
+                self.args, "imu_global_bias_refine_max_condition", 1e8
+            ),
+            min_relative_improvement=getattr(
+                self.args,
+                "imu_global_bias_refine_min_relative_improvement",
+                1e-4,
+            ),
+            accel_random_walk=getattr(
+                self.args, "imu_global_bias_refine_accel_random_walk", -1.0
+            ),
+            gyro_random_walk=getattr(
+                self.args, "imu_global_bias_refine_gyro_random_walk", -1.0
+            ),
+            accel_prior_std=getattr(
+                self.args, "imu_global_bias_refine_accel_prior_std", 0.5
+            ),
+            gyro_prior_std=getattr(
+                self.args, "imu_global_bias_refine_gyro_prior_std", 0.05
+            ),
+            relinearize_accel_threshold=getattr(
+                self.args, "imu_global_bias_relinearize_accel", 0.05
+            ),
+            relinearize_gyro_threshold=getattr(
+                self.args, "imu_global_bias_relinearize_gyro", 0.005
+            ),
+        )
+        result.update(confidence_stats)
+        record_window_bias_refinement(self.video, result, "global_15dof_block")
+        if result.get("updated", 0.0) <= 0.0:
+            print(
+                "[VI-BIAS-GLOBAL] skipped: "
+                f"{result.get('reason', 'unknown')}, "
+                f"edges={int(result.get('edges', 0.0))}"
+            )
+            record_imu_state_diagnostics(self.video, "post_global_bias_15dof_rejected")
+            return False
+
+        print(
+            "[VI-BIAS-GLOBAL] accepted "
+            f"cost={result.get('cost_before', 0.0):.6g}->{result.get('cost_after', 0.0):.6g}, "
+            f"|dba|={result.get('accel_step_norm', 0.0):.6g}, "
+            f"|dbg|={result.get('gyro_step_norm', 0.0):.6g}, "
+            f"cond={result.get('condition', float('nan')):.3g}"
+        )
+        torch.cuda.empty_cache()
+        post_steps = max(
+            1, int(getattr(self.args, "imu_global_bias_refine_post_steps", 2))
+        )
+        print(
+            "[IMU] rerunning global 15DoF DBA after shared-bias update "
+            f"(steps={post_steps})"
+        )
+        self.backend(post_steps)
+        record_imu_state_diagnostics(self.video, "post_global_bias_15dof_backend")
+
+        recenter = recenter_full_imu_biases(
+            self.video,
+            max_dt=getattr(self.args, "imu_full_max_dt", 0.5),
+            max_accel_norm=getattr(
+                self.args, "imu_global_bias_refine_max_accel_norm", 2.0
+            ),
+            max_gyro_norm=getattr(
+                self.args, "imu_global_bias_refine_max_gyro_norm", 0.2
+            ),
+        )
+        record_window_bias_refinement(self.video, recenter, "global_15dof_recenter")
+        if recenter.get("updated", 0.0) > 0.0:
+            print(
+                "[VI-BIAS-GLOBAL] recentered local 15DoF biases "
+                f"|dba|={recenter.get('accel_center_shift_norm', 0.0):.6g}, "
+                f"|dbg|={recenter.get('gyro_center_shift_norm', 0.0):.6g}, "
+                f"total_preservation={recenter.get('total_bias_preservation_max_abs', 0.0):.3g}"
+            )
+        else:
+            print(
+                "[VI-BIAS-GLOBAL] recenter skipped: "
+                f"{recenter.get('reason', 'unknown')}"
+            )
+        record_imu_state_diagnostics(self.video, "post_global_bias_15dof")
+        return True
+
     def terminate(self, stream=None):
         """
         terminate the visualization process, return poses [t, q]
@@ -467,35 +718,78 @@ class Droid:
 
         print("#" * 32)
 
-        # backend optimization 수행
-        # steps=7
-        #
-        # 첫 번째 backend pass로 전체 trajectory를 한 번 정리한다.
-        self.backend(7)
-        record_imu_state_diagnostics(self.video, "post_backend_visual")
+        if getattr(self.args, "use_two_stage_imu_ba", False):
+            # Local updates already ran visual pose-only followed by full
+            # state DBA. The global-bias path must start from exactly the
+            # same state objective as its no-global-bias control.
+            if getattr(self.args, "imu_two_stage_skip_global_backend", False):
+                # This is an ablation aid, not a normal VI-SLAM termination
+                # mode. It saves the state produced by local pose-only ->
+                # local full-15DoF updates so a later run can isolate what
+                # the final global graph changes.
+                print(
+                    "[IMU-DIAGNOSTIC] skipping final global 15DoF backend; "
+                    "saving local two-stage state"
+                )
+                record_imu_state_diagnostics(self.video, "post_backend_skipped")
+            else:
+                global_steps = max(
+                    1, int(getattr(self.args, "imu_two_stage_global_steps", 12))
+                )
+                print("[IMU] running one global joint 15DoF backend refinement")
+                self.backend(global_steps)
+                record_imu_state_diagnostics(self.video, "post_backend_final")
+                refined = self._run_final_global_bias_refinement()
 
-        # A difficult sequence can lack enough early parallax for online VI
-        # initialization even though the first visual global pass makes it
-        # observable.  This optional fallback keeps the next backend pass a
-        # real 9DoF visual-inertial refinement rather than silently visual-only.
-        self._maybe_backend_visual_inertial_initialization()
-        record_imu_state_diagnostics(self.video, "post_backend_vi_init")
+                # A no-global-bias run can use this to match the short post-update
+                # backend pass of a shared-bias experiment without changing any
+                # bias state. It is intentionally explicit for ablation reports.
+                if not refined:
+                    matched_steps = max(
+                        0,
+                        int(
+                            getattr(self.args, "imu_two_stage_matched_post_steps", 0)
+                        ),
+                    )
+                    if matched_steps > 0:
+                        print(
+                            "[IMU] running matched no-bias extra global 15DoF DBA "
+                            f"(steps={matched_steps})"
+                        )
+                        self.backend(matched_steps)
+                        record_imu_state_diagnostics(
+                            self.video, "post_backend_matched_control"
+                        )
+        else:
+            # backend optimization 수행
+            # steps=7
+            #
+            # 첫 번째 backend pass로 전체 trajectory를 한 번 정리한다.
+            self.backend(7)
+            record_imu_state_diagnostics(self.video, "post_backend_visual")
 
-        ############################################################
-        # 3. backend refinement 2차
-        ############################################################
+            # A difficult sequence can lack enough early parallax for online VI
+            # initialization even though the first visual global pass makes it
+            # observable.  This optional fallback keeps the next backend pass a
+            # real 9DoF visual-inertial refinement rather than silently visual-only.
+            self._maybe_backend_visual_inertial_initialization()
+            record_imu_state_diagnostics(self.video, "post_backend_vi_init")
 
-        # 다시 CUDA cache 정리
-        torch.cuda.empty_cache()
+            ############################################################
+            # 3. backend refinement 2차
+            ############################################################
 
-        print("#" * 32)
+            # 다시 CUDA cache 정리
+            torch.cuda.empty_cache()
 
-        # 두 번째 backend pass
-        # steps=12
-        #
-        # 더 많은 iteration으로 추가 refinement를 수행한다.
-        self.backend(12)
-        record_imu_state_diagnostics(self.video, "post_backend_final")
+            print("#" * 32)
+
+            # 두 번째 backend pass
+            # steps=12
+            #
+            # 더 많은 iteration으로 추가 refinement를 수행한다.
+            self.backend(12)
+            record_imu_state_diagnostics(self.video, "post_backend_final")
 
         ############################################################
         # 4. trajectory filling

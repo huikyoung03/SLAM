@@ -1,0 +1,21 @@
+{
+  "format": "droid-early-stop-v1",
+  "records": [
+    {
+      "action": "continue",
+      "checkpoint": "checkpoints/full15dof_confidence_only_dvi_quality_mh03_mh04_8000_earlystop_002000.pth",
+      "coverage": 274.0,
+      "metric": 0.19055884968457976,
+      "metric_name": "se3_ate_rmse_m",
+      "reason": "first_validation"
+    },
+    {
+      "action": "continue",
+      "checkpoint": "checkpoints/full15dof_confidence_only_dvi_quality_mh03_mh04_8000_earlystop_004000.pth",
+      "coverage": 274.0,
+      "metric": 0.19103888743214567,
+      "metric_name": "se3_ate_rmse_m",
+      "reason": "metric_not_worse_than_best"
+    }
+  ]
+}

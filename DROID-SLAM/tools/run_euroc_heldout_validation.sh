@@ -57,6 +57,7 @@ RUN_PLY="${RUN_PLY:-0}"
 USE_LEGACY_ADAPTIVE_GATE="${USE_LEGACY_ADAPTIVE_GATE:-0}"
 USE_NOISE_MODEL="${USE_NOISE_MODEL:-1}"
 USE_LEARNED_IMU_RESIDUAL_WEIGHTS="${USE_LEARNED_IMU_RESIDUAL_WEIGHTS:-1}"
+USE_DVI_IMU_CONFIDENCE="${USE_DVI_IMU_CONFIDENCE:-0}"
 RUN_SHARED_BIAS="${RUN_SHARED_BIAS:-1}"
 BIAS_REFINE_INTERVAL="${BIAS_REFINE_INTERVAL:-20}"
 BIAS_REFINE_WINDOW="${BIAS_REFINE_WINDOW:-30}"
@@ -291,6 +292,17 @@ IMU_ARGS=(
   --vi_init_snapshot_max_candidates "$VI_INIT_SNAPSHOT_MAX_CANDIDATES"
   --imu_ba_debug
 )
+
+# The scalar DVI projection is a different checkpoint head from the legacy
+# IMU-confidence head. Keep it opt-in so existing scalar/component reports
+# remain bit-for-bit reproducible, while a DVI calibration run is evaluated
+# through the same head used in training.
+if [[ "$USE_DVI_IMU_CONFIDENCE" == "1" ]]; then
+  IMU_ARGS+=(--use_dvi_imu_confidence)
+elif [[ "$USE_DVI_IMU_CONFIDENCE" != "0" ]]; then
+  echo "USE_DVI_IMU_CONFIDENCE must be 0 or 1, got: $USE_DVI_IMU_CONFIDENCE" >&2
+  exit 2
+fi
 
 if [[ "$USE_LEGACY_ADAPTIVE_GATE" == "1" ]]; then
   if [[ "$USE_NOISE_MODEL" == "1" ]]; then

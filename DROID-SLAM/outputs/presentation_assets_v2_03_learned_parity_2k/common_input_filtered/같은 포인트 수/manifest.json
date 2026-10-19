@@ -1,0 +1,19 @@
+{
+  "purpose": "Equal point-count PLY comparison; source coordinates unchanged.",
+  "target_point_count": 2414289,
+  "seed": 20261012,
+  "inputs": [
+    {
+      "source": "/home/ubuntu/DROID-SLAM/outputs/presentation_assets_v2_03_learned_parity_2k/common_input_filtered/original_common_frames_filtered_t005_c2.ply",
+      "source_point_count": 3399396,
+      "output": "outputs/presentation_assets_v2_03_learned_parity_2k/common_input_filtered/equal_point_count_2414289/original_common_frames_filtered_t005_c2_equal_2414289.ply",
+      "method": "uniform random sample (seed=20261012)"
+    },
+    {
+      "source": "/home/ubuntu/DROID-SLAM/outputs/presentation_assets_v2_03_learned_parity_2k/common_input_filtered/learned_parity_2k_common_frames_filtered_t005_c2.ply",
+      "source_point_count": 2414289,
+      "output": "outputs/presentation_assets_v2_03_learned_parity_2k/common_input_filtered/equal_point_count_2414289/learned_parity_2k_common_frames_filtered_t005_c2_equal_2414289.ply",
+      "method": "hardlink (already at target count)"
+    }
+  ]
+}

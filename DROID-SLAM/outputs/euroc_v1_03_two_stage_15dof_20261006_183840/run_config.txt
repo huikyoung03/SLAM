@@ -1,0 +1,15 @@
+date=2026-10-06T19:28:41+09:00
+root=/home/ubuntu/DROID-SLAM
+data_root=/home/ubuntu/SLAM/uploads/euroc_v1_03_droid_cam0
+image_dir=/home/ubuntu/SLAM/uploads/euroc_v1_03_droid_cam0/data
+calib=/home/ubuntu/SLAM/uploads/euroc_v1_03_droid_cam0/calib.txt
+imu_prior_original=/home/ubuntu/SLAM/uploads/euroc_v1_03_droid_cam0/imu_prior_fd_jacobian.csv
+imu_prior_reintegrated=/home/ubuntu/SLAM/uploads/euroc_v1_03_droid_cam0/imu_prior_fd_jacobian.csv
+frames_csv=/home/ubuntu/SLAM/uploads/euroc_v1_03_droid_cam0/frames.csv
+camera_sensor_yaml=/home/ubuntu/SLAM/uploads/euroc_v1_03_droid_cam0/cam0_sensor.yaml
+imu_sensor_yaml=/home/ubuntu/SLAM/uploads/euroc_v1_03_droid_cam0/imu0_sensor.yaml
+gt_csv=/home/ubuntu/SLAM/uploads/euroc_v1_03_mav0/state_groundtruth_estimate0/data.csv
+max_frames=450
+stride=2
+buffer=1024
+weights=/home/ubuntu/DROID-SLAM/droid.pth

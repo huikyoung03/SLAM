@@ -13,6 +13,7 @@ import os
 import glob 
 import time
 import argparse
+import csv
 import hashlib
 import math
 from pathlib import Path
@@ -368,6 +369,48 @@ def validate_imu_calibration_contract(args, imu_priors, runtime_calibration):
             raise ValueError(message)
 
     return fingerprint
+
+
+def validate_imu_bias_jacobian_contract(args, imu_priors):
+    """Require real bias derivatives before opening a full VI state optimizer.
+
+    A rotation-only prior can fall back to ``-dt I`` for legacy CSV files, but
+    a 9/15DoF factor corrects rotation, velocity, and position using all five
+    preintegration Jacobians. Silently replacing those terms with zeros lets a
+    bias state optimize against a different measurement model.
+    """
+
+    if not getattr(args, "use_full_imu_ba", False) or not imu_priors:
+        return
+
+    valid_rows = [
+        row for row in imu_priors.values()
+        if int(row.get("imu_valid", 0)) != 0 and float(row.get("dt", 0.0)) > 0.0
+    ]
+    if not valid_rows:
+        raise ValueError("full IMU BA requires at least one valid IMU prior row")
+
+    missing = sum(
+        not bool(row.get("bias_jacobian_present", 0)) for row in valid_rows
+    )
+    if missing:
+        raise ValueError(
+            "full IMU BA requires imu_prior.csv with J_R_bg/J_v_ba/J_v_bg/"
+            "J_p_ba/J_p_bg for every valid interval. The supplied prior uses "
+            f"legacy fallback Jacobians on {missing}/{len(valid_rows)} rows. "
+            "Regenerate it with tools/imu_preintegrate.py before running 9DoF "
+            "or 15DoF visual-inertial DBA."
+        )
+
+    methods = {
+        str(row.get("bias_jacobian_method", "")).strip()
+        for row in valid_rows
+    }
+    if methods != {"central_difference"}:
+        print(
+            "[IMU WARNING] full IMU BA received non-central-difference bias "
+            f"Jacobians: {sorted(methods)}"
+        )
 
 
 def resolve_imu_camera_translation(args, imu_priors, runtime_calibration=None):
@@ -754,6 +797,37 @@ def image_stream(imagedir, calib, stride, max_frames=None, frame_records=None):
         yield t, image[None], intrinsics
 
 
+def write_motion_filter_manifest(path, selected_rows):
+    """Persist the input frames accepted by MotionFilter in one run.
+
+    ``frame_index`` is the original 20 Hz EuRoC camera-row index, not the
+    decimated-stream ordinal. The ordered training reader can consequently
+    compose all raw IMU samples between adjacent selected rows.
+    """
+
+    output = Path(path).expanduser().resolve()
+    if output.exists():
+        raise FileExistsError(
+            "refusing to overwrite an existing MotionFilter manifest: "
+            f"{output}"
+        )
+    if not selected_rows:
+        raise ValueError("MotionFilter selected no frames; manifest was not written")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=("frame_index", "timestamp_ns"),
+        )
+        writer.writeheader()
+        writer.writerows(selected_rows)
+    print(
+        "[MOTION-FILTER MANIFEST] "
+        f"selected_frames={len(selected_rows)}, output={output}"
+    )
+
+
 def _sha256_file(path):
     """Return a content digest for a small run-input file, if it exists."""
 
@@ -870,7 +944,7 @@ def _reconstruction_input_provenance(args):
     }
 
 
-def save_reconstruction(droid, save_path):
+def save_reconstruction(droid, save_path, dense_tstamps=None, dense_poses=None):
     """
     DROID-SLAM 결과를 .pth 파일로 저장하는 함수.
 
@@ -889,6 +963,12 @@ def save_reconstruction(droid, save_path):
 
         intrinsics:
             frame별 camera intrinsics
+
+        dense_tstamps, dense_poses:
+            ``Droid.terminate()``가 PoseTrajectoryFiller로 완성한 모든
+            입력 frame의 trajectory. ``video``에는 MotionFilter가 남긴
+            keyframe만 있으므로, DVI-style 전체 입력 시간축 평가는 이
+            dense trajectory를 사용해야 한다.
 
     입력:
         droid:
@@ -916,6 +996,25 @@ def save_reconstruction(droid, save_path):
     ############################################################
 
     t = video.counter.value
+
+    if (dense_tstamps is None) != (dense_poses is None):
+        raise ValueError(
+            "dense_tstamps and dense_poses must either both be supplied or both be None"
+        )
+    if dense_tstamps is not None:
+        dense_tstamps = np.asarray(dense_tstamps, dtype=np.int64).reshape(-1)
+        dense_poses = np.asarray(dense_poses, dtype=np.float32)
+        if dense_poses.ndim != 2 or dense_poses.shape[1] != 7:
+            raise ValueError(
+                "dense_poses must have shape [N, 7] as returned by Droid.terminate()"
+            )
+        if len(dense_tstamps) != len(dense_poses):
+            raise ValueError(
+                "dense trajectory timestamp/pose length mismatch: "
+                f"{len(dense_tstamps)} != {len(dense_poses)}"
+            )
+        if not np.isfinite(dense_poses).all():
+            raise ValueError("dense trajectory contains non-finite pose values")
 
     ############################################################
     # 3. 저장할 데이터 구성
@@ -977,6 +1076,12 @@ def save_reconstruction(droid, save_path):
         "imu_weight": video.imu_weight[:t].cpu(),
         "imu_used_steps": video.imu_used_steps[:t].cpu(),
         "imu_info": video.imu_info[:t].cpu(),
+        # Auditable GRU-to-IMU runtime handoff. ``valid`` means the value came
+        # from a direct visual temporal edge; invalid rows are neutral 1.0.
+        "imu_learned_confidence": video.imu_learned_confidence[:t].cpu(),
+        "imu_learned_confidence_valid": (
+            video.imu_learned_confidence_valid[:t].cpu()
+        ),
         "imu_bias_random_walk": video.imu_bias_random_walk[:t].cpu(),
         "imu_bias_jacobian": video.imu_bias_jacobian[:t].cpu(),
         # DROID can renormalize monocular pose/depth scale after the VI
@@ -1022,8 +1127,20 @@ def save_reconstruction(droid, save_path):
         "input_provenance": input_provenance,
 
         # intrinsics
-        "intrinsics": video.intrinsics[:t].cpu()
+        "intrinsics": video.intrinsics[:t].cpu(),
     }
+
+    if dense_tstamps is not None:
+        # ``terminate()`` returns camera-to-world poses with quaternion order
+        # [qw, qx, qy, qz]. Keep that representation explicit rather than
+        # pretending it has DepthVideo's world-to-camera qxyzw convention.
+        save_data.update(
+            {
+                "dense_tstamps": torch.from_numpy(dense_tstamps.copy()),
+                "dense_poses": torch.from_numpy(dense_poses.copy()),
+                "dense_pose_format": "camera_c2w_wxyz",
+            }
+        )
 
     ############################################################
     # 4. torch save
@@ -1091,6 +1208,23 @@ if __name__ == '__main__':
         type=float,
         default=2.4,
         help="how much motion before considering new keyframe"
+    )
+    parser.add_argument(
+        "--motion_filter_manifest_out",
+        type=str,
+        default=None,
+        help=(
+            "optional CSV destination for exact input frame IDs accepted by "
+            "MotionFilter; intended for frozen ordered-training manifests"
+        ),
+    )
+    parser.add_argument(
+        "--motion_filter_manifest_only",
+        action="store_true",
+        help=(
+            "export MotionFilter selections and exit before frontend/backend "
+            "refinement; requires --motion_filter_manifest_out and --disable_vis"
+        ),
     )
 
     # SLAM 초기화에 필요한 warmup frame 수
@@ -1259,6 +1393,14 @@ if __name__ == '__main__':
         help="replace --imu_ba_prior_weight with the checkpoint-learned global IMU BA weight",
     )
     parser.add_argument(
+        "--imu_confidence_only_weighting",
+        action="store_true",
+        help=(
+            "fix the runtime global IMU factor weight to 1.0 and use learned "
+            "temporal IMU confidence as the only adaptive attenuation"
+        ),
+    )
+    parser.add_argument(
         "--learned_imu_ba_weight_scale",
         type=float,
         default=1.0,
@@ -1271,6 +1413,37 @@ if __name__ == '__main__':
     )
     parser.add_argument("--imu_ba_prior_max_deg", type=float, default=10.0, help="legacy angular residual hard limit in degrees; zero disables it")
     parser.add_argument("--use_full_imu_ba", action="store_true", help="extend runtime CUDA DBA state to pose+velocity+accel-bias+gyro-bias")
+    parser.add_argument(
+        "--use_two_stage_imu_ba",
+        action="store_true",
+        help=(
+            "local visual pose-only DBA followed by normal joint 15DoF IMU DBA; "
+            "run one final global 15DoF backend refinement"
+        ),
+    )
+    parser.add_argument(
+        "--imu_two_stage_global_steps",
+        type=int,
+        default=12,
+        help="iterations in the primary final global 15DoF backend pass",
+    )
+    parser.add_argument(
+        "--imu_two_stage_matched_post_steps",
+        type=int,
+        default=0,
+        help=(
+            "extra final 15DoF backend iterations for a no-global-bias "
+            "matched-iteration control"
+        ),
+    )
+    parser.add_argument(
+        "--imu_two_stage_skip_global_backend",
+        action="store_true",
+        help=(
+            "diagnostic-only: stop after local two-stage DBA and skip the "
+            "final global 15DoF backend refinement"
+        ),
+    )
     parser.add_argument(
         "--use_pose_velocity_imu_ba",
         action="store_true",
@@ -1333,6 +1506,14 @@ if __name__ == '__main__':
     parser.add_argument("--vi_init_bootstrap", dest="vi_init_bootstrap", action="store_true", default=True, help="retain a bounded startup keyframe set for VI alignment")
     parser.add_argument("--no_vi_init_bootstrap", dest="vi_init_bootstrap", action="store_false", help="use normal MotionFilter during VI initialization")
     parser.add_argument("--vi_init_bootstrap_frames", type=int, default=60, help="maximum startup keyframes retained solely for VI alignment")
+    parser.add_argument(
+        "--visual_bootstrap_control",
+        action="store_true",
+        help=(
+            "visual-only ablation: retain the same startup frontend keyframes "
+            "as VI initialization, but do not initialize or optimize IMU state"
+        ),
+    )
     parser.add_argument(
         "--vi_init_snapshot_history_size",
         type=int,
@@ -1447,6 +1628,57 @@ if __name__ == '__main__':
     parser.add_argument("--imu_joint_bias_relinearize_accel", type=float, default=0.05, help="warn when a coupled accel-bias step exceeds this first-order relinearization threshold")
     parser.add_argument("--imu_joint_bias_relinearize_gyro", type=float, default=0.005, help="warn when a coupled gyro-bias step exceeds this first-order relinearization threshold")
     parser.add_argument(
+        "--use_global_bias_15dof_refinement",
+        action="store_true",
+        help=(
+            "offline two-stage mode: after the global 15DoF DBA, refine one "
+            "shared accel/gyro bias block across the full sequence and rerun "
+            "a short 15DoF backend pass"
+        ),
+    )
+    parser.add_argument(
+        "--imu_global_bias_refine_post_steps",
+        type=int,
+        default=2,
+        help="global 15DoF DBA iterations after an accepted shared global-bias update",
+    )
+    parser.add_argument(
+        "--imu_global_bias_local_prior_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "deprecated compatibility option; set --imu_local_bias_prior_weight "
+            "explicitly when a local-bias regularizer is desired"
+        ),
+    )
+    parser.add_argument(
+        "--imu_global_bias_refine_weight",
+        type=float,
+        default=1.0,
+        help=(
+            "IMU likelihood scale for the post-global 6D bias solve; this is "
+            "independent of visual-versus-IMU DBA balance because T/v are fixed"
+        ),
+    )
+    parser.add_argument("--imu_global_bias_refine_damping", type=float, default=1e-4, help="damping for the post-global shared 6D bias block")
+    parser.add_argument("--imu_global_bias_refine_step_scale", type=float, default=0.5, help="damped update multiplier for the post-global shared 6D bias block")
+    parser.add_argument("--imu_global_bias_refine_max_accel_step", type=float, default=0.15, help="maximum post-global accelerometer-bias update in m/s^2")
+    parser.add_argument("--imu_global_bias_refine_max_gyro_step", type=float, default=0.015, help="maximum post-global gyroscope-bias update in rad/s")
+    parser.add_argument("--imu_global_bias_refine_max_accel_norm", type=float, default=2.0, help="maximum global accelerometer-bias norm in m/s^2")
+    parser.add_argument("--imu_global_bias_refine_max_gyro_norm", type=float, default=0.2, help="maximum global gyroscope-bias norm in rad/s")
+    parser.add_argument("--imu_global_bias_refine_robust_delta", type=float, default=3.0, help="Huber threshold for the post-global shared-bias objective")
+    parser.add_argument("--imu_global_bias_refine_min_edges", type=int, default=20, help="minimum full-sequence IMU factors for a post-global shared-bias update")
+    parser.add_argument("--imu_global_bias_refine_min_duration", type=float, default=2.0, help="minimum IMU duration in seconds for a post-global shared-bias update")
+    parser.add_argument("--imu_global_bias_refine_min_rotation_deg", type=float, default=5.0, help="minimum accumulated IMU rotation for a post-global shared-bias update")
+    parser.add_argument("--imu_global_bias_refine_max_condition", type=float, default=1e8, help="maximum data-Hessian condition number for the post-global shared-bias block")
+    parser.add_argument("--imu_global_bias_refine_min_relative_improvement", type=float, default=1e-4, help="minimum relative IMU-objective reduction required for a post-global shared-bias update")
+    parser.add_argument("--imu_global_bias_refine_accel_random_walk", type=float, default=-1.0, help="override accelerometer bias random walk for the post-global shared-bias trust region")
+    parser.add_argument("--imu_global_bias_refine_gyro_random_walk", type=float, default=-1.0, help="override gyroscope bias random walk for the post-global shared-bias trust region")
+    parser.add_argument("--imu_global_bias_refine_accel_prior_std", type=float, default=0.5, help="accelerometer-bias trust-region std for the post-global shared block in m/s^2")
+    parser.add_argument("--imu_global_bias_refine_gyro_prior_std", type=float, default=0.05, help="gyroscope-bias trust-region std for the post-global shared block in rad/s")
+    parser.add_argument("--imu_global_bias_relinearize_accel", type=float, default=0.05, help="mark re-preintegration as recommended above this post-global accel-bias step")
+    parser.add_argument("--imu_global_bias_relinearize_gyro", type=float, default=0.005, help="mark re-preintegration as recommended above this post-global gyro-bias step")
+    parser.add_argument(
         "--imu_ba_outer_relinearize",
         action="store_true",
         help=(
@@ -1481,6 +1713,41 @@ if __name__ == '__main__':
         "--use_learned_imu_confidence",
         action="store_true",
         help="scale IMU residual/prior strength with the GRU IMU confidence head",
+    )
+    parser.add_argument(
+        "--use_component_imu_confidence",
+        action="store_true",
+        help=(
+            "use separate GRU confidence for IMU rotation, velocity, and position "
+            "residuals with preintegration-quality fusion"
+        ),
+    )
+    parser.add_argument(
+        "--use_dvi_imu_confidence",
+        action="store_true",
+        help=(
+            "use the DVI-style scalar IMU confidence head: 1x1 GRU projection "
+            "followed by spatial average pooling"
+        ),
+    )
+    parser.add_argument(
+        "--use_dvi_imu_quality_fusion",
+        action="store_true",
+        help=(
+            "add direct preintegrated-IMU quality features to the DVI scalar "
+            "confidence logit"
+        ),
+    )
+    parser.add_argument(
+        "--imu_tuned_confidence_schedule",
+        type=float,
+        nargs="+",
+        default=None,
+        metavar="W",
+        help=(
+            "manual scalar IMU confidence per outer 15DoF DBA update; "
+            "used only for the fixed/tuned DVI ablation control"
+        ),
     )
     parser.add_argument(
         "--imu_confidence_floor",
@@ -1526,6 +1793,77 @@ if __name__ == '__main__':
             "--use_imu_pose_prior. Apply R_CI during preintegration; pose prior "
             "now follows --imu_full_compose_order/--imu_full_inverse exactly."
         )
+
+    if args.use_two_stage_imu_ba:
+        incompatible = []
+        for option, active in (
+            ("--use_pose_velocity_imu_ba", args.use_pose_velocity_imu_ba),
+            ("--use_low_rate_bias_refinement", args.use_low_rate_bias_refinement),
+            ("--use_shared_bias_local_ba", args.use_shared_bias_local_ba),
+            ("--use_window_bias_refinement", args.use_window_bias_refinement),
+            ("--use_joint_shared_bias_ba", args.use_joint_shared_bias_ba),
+            ("--imu_ba_outer_relinearize", args.imu_ba_outer_relinearize),
+            ("--imu_bias_refine_backend", args.imu_bias_refine_backend),
+            ("--vi_init_backend_fallback", args.vi_init_backend_fallback),
+        ):
+            if active:
+                incompatible.append(option)
+        if incompatible:
+            raise ValueError(
+                "--use_two_stage_imu_ba cannot be combined with "
+                + ", ".join(incompatible)
+            )
+
+        args.use_full_imu_ba = True
+        args.imu_full_frontend = True
+        args.use_imu_ba_prior = True
+        args.use_vi_initialization = True
+        print(
+            "[IMU] two-stage mode: local pose-only -> full 15DoF; "
+            "one global full-state backend pass."
+        )
+
+    if args.use_global_bias_15dof_refinement:
+        if not args.use_two_stage_imu_ba:
+            raise ValueError(
+                "--use_global_bias_15dof_refinement requires "
+                "--use_two_stage_imu_ba so the completed trajectory has "
+                "per-keyframe 15DoF bias state."
+            )
+        if args.imu_global_bias_refine_post_steps < 1:
+            raise ValueError(
+                "--imu_global_bias_refine_post_steps must be at least one; "
+                "an accepted global-bias step needs a following 15DoF DBA pass."
+            )
+        if args.imu_global_bias_local_prior_weight < 0.0:
+            raise ValueError(
+                "--imu_global_bias_local_prior_weight must be non-negative."
+            )
+        if args.imu_two_stage_global_steps < 1:
+            raise ValueError("--imu_two_stage_global_steps must be at least one.")
+        if args.imu_two_stage_matched_post_steps < 0:
+            raise ValueError("--imu_two_stage_matched_post_steps must be non-negative.")
+        if args.imu_two_stage_skip_global_backend:
+            raise ValueError(
+                "--use_global_bias_15dof_refinement requires the final global "
+                "15DoF backend pass; remove --imu_two_stage_skip_global_backend"
+            )
+        if args.imu_global_bias_refine_weight <= 0.0:
+            raise ValueError(
+                "--imu_global_bias_refine_weight must be positive."
+            )
+        print(
+            "[IMU] final global shared-bias refinement enabled: "
+            f"post_steps={args.imu_global_bias_refine_post_steps}, "
+            "precenter=total_bias_preserving, "
+            f"bias_likelihood_weight={args.imu_global_bias_refine_weight}"
+        )
+        if args.imu_global_bias_local_prior_weight > 0.0:
+            print(
+                "[IMU WARNING] --imu_global_bias_local_prior_weight is no longer "
+                "injected only at termination; use --imu_local_bias_prior_weight "
+                "for an explicit, consistently applied regularizer."
+            )
 
     if args.use_pose_velocity_imu_ba:
         args.use_full_imu_ba = True
@@ -1590,12 +1928,51 @@ if __name__ == '__main__':
             f"window={args.imu_bias_refine_window}, backend={backend_stage}"
         )
 
-    if args.use_vi_initialization and not args.use_pose_velocity_imu_ba:
-        raise ValueError("--use_vi_initialization requires --use_pose_velocity_imu_ba")
+    if args.use_vi_initialization and not (
+        args.use_pose_velocity_imu_ba or args.use_two_stage_imu_ba
+    ):
+        raise ValueError(
+            "--use_vi_initialization requires --use_pose_velocity_imu_ba "
+            "or --use_two_stage_imu_ba"
+        )
+    if args.visual_bootstrap_control:
+        incompatible = []
+        for option, active in (
+            ("--use_vi_initialization", args.use_vi_initialization),
+            ("--use_full_imu_ba", args.use_full_imu_ba),
+            ("--use_imu_ba_prior", args.use_imu_ba_prior),
+            ("--use_pose_velocity_imu_ba", args.use_pose_velocity_imu_ba),
+            ("--use_two_stage_imu_ba", args.use_two_stage_imu_ba),
+        ):
+            if active:
+                incompatible.append(option)
+        if incompatible:
+            raise ValueError(
+                "--visual_bootstrap_control is visual-only and cannot be combined with "
+                + ", ".join(incompatible)
+            )
+        print(
+            "[VISUAL-CONTROL] retaining startup keyframes without VI "
+            "initialization or IMU factors"
+        )
     if args.use_vi_initialization and args.asynchronous:
         raise ValueError(
             "--use_vi_initialization currently requires synchronous Droid; "
             "the async frontend/backend coordinate handoff is not yet VI-aligned."
+        )
+    if args.motion_filter_manifest_out is not None and args.asynchronous:
+        raise ValueError(
+            "--motion_filter_manifest_out requires synchronous Droid because "
+            "the asynchronous tracker does not expose a synchronous selection result"
+        )
+    if args.motion_filter_manifest_only and args.motion_filter_manifest_out is None:
+        raise ValueError(
+            "--motion_filter_manifest_only requires --motion_filter_manifest_out"
+        )
+    if args.motion_filter_manifest_only and not args.disable_vis:
+        raise ValueError(
+            "--motion_filter_manifest_only requires --disable_vis so no visualizer "
+            "process is left running after the early exit"
         )
 
     if args.use_full_imu_ba:
@@ -1629,6 +2006,7 @@ if __name__ == '__main__':
 
     imu_priors = load_imu_priors(args.imu_prior)
     args.imu_priors = imu_priors
+    validate_imu_bias_jacobian_contract(args, imu_priors)
     (
         args.imu_frame_manifest_path,
         args.frame_records,
@@ -1656,7 +2034,7 @@ if __name__ == '__main__':
         f"applied={int(args.imu_translation_extrinsic_applied)}"
     )
     if (
-        args.use_pose_velocity_imu_ba
+        (args.use_pose_velocity_imu_ba or args.use_two_stage_imu_ba)
         and not args.imu_translation_extrinsic_applied
     ):
         print(
@@ -1727,13 +2105,68 @@ if __name__ == '__main__':
     if args.use_learned_imu_confidence and not (args.use_imu_residual or args.use_imu_ba_prior):
         print("[IMU WARNING] --use_learned_imu_confidence has no effect without an IMU residual/prior term.")
 
+    if args.use_component_imu_confidence and not args.use_learned_imu_confidence:
+        raise ValueError('--use_component_imu_confidence requires --use_learned_imu_confidence')
+    if args.use_component_imu_confidence and not args.use_full_imu_ba:
+        raise ValueError('--use_component_imu_confidence requires --use_full_imu_ba')
+    if args.use_dvi_imu_confidence and not args.use_learned_imu_confidence:
+        raise ValueError('--use_dvi_imu_confidence requires --use_learned_imu_confidence')
+    if args.use_dvi_imu_confidence and args.use_component_imu_confidence:
+        raise ValueError('choose only one of --use_dvi_imu_confidence and --use_component_imu_confidence')
+    if args.use_dvi_imu_confidence and not args.use_full_imu_ba:
+        raise ValueError('--use_dvi_imu_confidence requires --use_full_imu_ba')
+    if args.use_dvi_imu_quality_fusion and not args.use_dvi_imu_confidence:
+        raise ValueError(
+            '--use_dvi_imu_quality_fusion requires --use_dvi_imu_confidence'
+        )
+    if args.imu_confidence_only_weighting:
+        if not args.use_full_imu_ba:
+            raise ValueError(
+                '--imu_confidence_only_weighting requires --use_full_imu_ba'
+            )
+        if not args.use_imu_ba_prior:
+            raise ValueError(
+                '--imu_confidence_only_weighting requires --use_imu_ba_prior'
+            )
+        if not args.use_learned_imu_confidence:
+            raise ValueError(
+                '--imu_confidence_only_weighting requires '
+                '--use_learned_imu_confidence'
+            )
+        if not (args.use_dvi_imu_confidence or args.use_component_imu_confidence):
+            raise ValueError(
+                '--imu_confidence_only_weighting requires DVI or component '
+                'IMU confidence'
+            )
+        if args.use_learned_imu_ba_weight:
+            raise ValueError(
+                '--imu_confidence_only_weighting cannot be combined with '
+                '--use_learned_imu_ba_weight'
+            )
+    if args.imu_tuned_confidence_schedule is not None:
+        if args.use_learned_imu_confidence:
+            raise ValueError('--imu_tuned_confidence_schedule cannot be combined with learned confidence')
+        if args.use_component_imu_confidence or args.use_dvi_imu_confidence:
+            raise ValueError('--imu_tuned_confidence_schedule is a scalar fixed/tuned control')
+        if not args.use_full_imu_ba:
+            raise ValueError('--imu_tuned_confidence_schedule requires --use_full_imu_ba')
+        if any(value < 0.0 or value > 1.0 for value in args.imu_tuned_confidence_schedule):
+            raise ValueError('--imu_tuned_confidence_schedule values must be in [0, 1]')
+
     ############################################################
     # 9. 이미지 스트림 처리
     ############################################################
 
-    # timestamp 목록.
-    # 현재 코드에서는 append만 하지 않고 선언만 되어 있음.
+    # The exact input-frame IDs supplied to the tracker. They are later paired
+    # with the dense poses returned by ``terminate()``.
     tstamps = []
+    selected_motion_filter_rows = []
+    frame_timestamp_by_index = {}
+    if args.frame_records is not None:
+        frame_timestamp_by_index = {
+            int(record["frame_index"]): int(record["timestamp_ns"])
+            for record in args.frame_records
+        }
 
     # image_stream에서 frame을 하나씩 받아 DROID에 넣음
     for (t, image, intrinsics) in tqdm(
@@ -1752,6 +2185,8 @@ if __name__ == '__main__':
 
         if t < args.t0:
             continue
+
+        tstamps.append(int(t))
 
         ########################################################
         # 9-2. 입력 이미지 표시
@@ -1811,12 +2246,37 @@ if __name__ == '__main__':
                 f"imu_count={imu_prior.get('imu_count', 0)}"
             )
 
-        droid.track(
-            t,
-            image,
-            intrinsics=intrinsics,
-            imu_prior=imu_prior,
-        )
+        if args.motion_filter_manifest_only:
+            # MotionFilter's decision depends only on its own hidden/context
+            # state, the current visual image, and the previous selected
+            # frame. Frontend/backend updates do not feed back into it. Skip
+            # them here so a training manifest does not pay for an unrelated
+            # full-sequence reconstruction.
+            was_selected = droid.filterx.track(
+                t,
+                image,
+                intrinsics=intrinsics,
+                imu_prior=imu_prior,
+            )
+        else:
+            was_selected = droid.track(
+                t,
+                image,
+                intrinsics=intrinsics,
+                imu_prior=imu_prior,
+            )
+        if args.motion_filter_manifest_out is not None and was_selected:
+            if int(t) not in frame_timestamp_by_index:
+                raise RuntimeError(
+                    "MotionFilter manifest requires --imu_frame_manifest so "
+                    "each selected original frame index has a verified timestamp"
+                )
+            selected_motion_filter_rows.append(
+                {
+                    "frame_index": int(t),
+                    "timestamp_ns": frame_timestamp_by_index[int(t)],
+                }
+            )
 
     ############################################################
     # 10. DROID 종료 및 trajectory 생성
@@ -1825,21 +2285,39 @@ if __name__ == '__main__':
     if droid is None:
         raise RuntimeError("No images were processed. Check --imagedir and image files.")
 
+    if args.motion_filter_manifest_out is not None:
+        write_motion_filter_manifest(
+            args.motion_filter_manifest_out,
+            selected_motion_filter_rows,
+        )
+
+    if args.motion_filter_manifest_only:
+        print("[MOTION-FILTER MANIFEST] frontend/backend refinement skipped")
+        raise SystemExit(0)
+
     # terminate()는 backend refinement를 마무리하고,
     # keyframe이 아닌 skipped frame의 pose까지 채운 trajectory를 반환한다.
     #
     # image_stream을 다시 넘기는 이유:
     #   PoseTrajectoryFiller가 원본 stream의 전체 frame에 대한 pose를 채울 때
     #   다시 이미지 stream을 참고할 수 있기 때문.
-    traj_est = droid.terminate(
-        image_stream(
+    dense_stream = (
+        (t, image, intrinsics)
+        for t, image, intrinsics in image_stream(
             args.imagedir,
             args.calib,
             args.stride,
             args.max_frames,
             frame_records=args.frame_records,
         )
+        if t >= args.t0
     )
+    traj_est = droid.terminate(dense_stream)
+    if len(traj_est) != len(tstamps):
+        raise RuntimeError(
+            "dense trajectory length does not match the tracked input timeline: "
+            f"poses={len(traj_est)}, frame_ids={len(tstamps)}"
+        )
 
     if args.use_vi_initialization:
         aligned = bool(droid.video.imu_alignment_ready.value)
@@ -1866,5 +2344,7 @@ if __name__ == '__main__':
     if args.reconstruction_path is not None:
         save_reconstruction(
             droid,
-            args.reconstruction_path
+            args.reconstruction_path,
+            dense_tstamps=tstamps,
+            dense_poses=traj_est,
         )

@@ -876,11 +876,117 @@ def interpolate_imu_sample(
     }
 
 
+def _bias_perturbed_imu_window(
+    imu_window: List[Dict[str, Any]],
+    accel_bias: Vector3 = (0.0, 0.0, 0.0),
+    gyro_bias: Vector3 = (0.0, 0.0, 0.0),
+) -> List[Dict[str, Any]]:
+    """Return samples corrected by a small hypothetical IMU bias.
+
+    The stored Jacobians are derivatives with respect to the bias that is
+    *subtracted* from a raw measurement.  Keeping this helper next to the
+    integrator makes that convention explicit and lets the finite-difference
+    check use exactly the same midpoint integration as the nominal delta.
+    """
+
+    ax_bias, ay_bias, az_bias = accel_bias
+    gx_bias, gy_bias, gz_bias = gyro_bias
+    corrected = []
+    for sample in imu_window:
+        row = dict(sample)
+        row["gx"] = float(row["gx"]) - gx_bias
+        row["gy"] = float(row["gy"]) - gy_bias
+        row["gz"] = float(row["gz"]) - gz_bias
+        row["ax"] = float(row["ax"]) - ax_bias
+        row["ay"] = float(row["ay"]) - ay_bias
+        row["az"] = float(row["az"]) - az_bias
+        corrected.append(row)
+    return corrected
+
+
+def _finite_difference_bias_jacobians(
+    imu_window: List[Dict[str, Any]],
+    start_ns: int,
+    end_ns: int,
+    window_status: str,
+) -> Optional[Dict[str, Matrix3]]:
+    """Differentiate this integrator's stored delta representation directly.
+
+    ``J_R_bg`` is consumed downstream as ``rotvec + J_R_bg @ dbg`` rather
+    than as a separate SO(3) tangent perturbation.  Analytic Jacobians written
+    in a different tangent convention are therefore subtly wrong once several
+    raw-frame deltas are composed.  Central differences here are inexpensive
+    (at most twelve extra short integrations per image interval) and produce
+    Jacobians for the exact ``dr/dv/dp`` representation persisted in CSV.
+    """
+
+    epsilon = 1e-5
+    jacobians = {
+        prefix: [[0.0, 0.0, 0.0] for _ in range(3)]
+        for prefix in IMU_BIAS_JACOBIAN_ORDER
+    }
+
+    def integrate_with_bias(
+        accel_bias: Vector3,
+        gyro_bias: Vector3,
+    ) -> Dict[str, Any]:
+        return integrate_imu_window(
+            _bias_perturbed_imu_window(
+                imu_window,
+                accel_bias=accel_bias,
+                gyro_bias=gyro_bias,
+            ),
+            start_ns,
+            end_ns,
+            window_status=window_status,
+            _compute_bias_jacobians=False,
+        )
+
+    for axis in range(3):
+        accel_plus = [0.0, 0.0, 0.0]
+        accel_minus = [0.0, 0.0, 0.0]
+        accel_plus[axis] = epsilon
+        accel_minus[axis] = -epsilon
+        plus = integrate_with_bias(tuple(accel_plus), (0.0, 0.0, 0.0))
+        minus = integrate_with_bias(tuple(accel_minus), (0.0, 0.0, 0.0))
+        if bool(plus.get("has_nan")) or bool(minus.get("has_nan")):
+            return None
+        for component, suffix in enumerate(("x", "y", "z")):
+            jacobians["J_v_ba"][component][axis] = (
+                float(plus[f"dv_{suffix}"]) - float(minus[f"dv_{suffix}"])
+            ) / (2.0 * epsilon)
+            jacobians["J_p_ba"][component][axis] = (
+                float(plus[f"dp_{suffix}"]) - float(minus[f"dp_{suffix}"])
+            ) / (2.0 * epsilon)
+
+        gyro_plus = [0.0, 0.0, 0.0]
+        gyro_minus = [0.0, 0.0, 0.0]
+        gyro_plus[axis] = epsilon
+        gyro_minus[axis] = -epsilon
+        plus = integrate_with_bias((0.0, 0.0, 0.0), tuple(gyro_plus))
+        minus = integrate_with_bias((0.0, 0.0, 0.0), tuple(gyro_minus))
+        if bool(plus.get("has_nan")) or bool(minus.get("has_nan")):
+            return None
+        for component, suffix in enumerate(("x", "y", "z")):
+            jacobians["J_R_bg"][component][axis] = (
+                float(plus[f"dr_{suffix}"]) - float(minus[f"dr_{suffix}"])
+            ) / (2.0 * epsilon)
+            jacobians["J_v_bg"][component][axis] = (
+                float(plus[f"dv_{suffix}"]) - float(minus[f"dv_{suffix}"])
+            ) / (2.0 * epsilon)
+            jacobians["J_p_bg"][component][axis] = (
+                float(plus[f"dp_{suffix}"]) - float(minus[f"dp_{suffix}"])
+            ) / (2.0 * epsilon)
+
+    return jacobians
+
+
 def integrate_imu_window(
     imu_window: List[Dict[str, Any]],
     start_ns: Optional[int],
     end_ns: int,
     window_status: str = "ok",
+    _compute_bias_jacobians: bool = True,
 ) -> Dict[str, Any]:
     """
     하나의 프레임 구간에 해당하는 IMU window를 사전적분한다.
@@ -941,6 +1047,7 @@ def integrate_imu_window(
         }
         for prefix, matrix in default_bias_jacobians(dt).items():
             out.update(matrix_columns(prefix, matrix))
+        out["bias_jacobian_method"] = "fallback"
         return out
 
     # 누적 delta rotation. 프레임 시작 시점에서 현재 step까지의 상대 회전이다.
@@ -1006,8 +1113,11 @@ def integrate_imu_window(
         accel_body = (ax, ay, az)
         acc_x, acc_y, acc_z = mat3_vec(R_mid, accel_body)
 
-        # First-order bias Jacobian propagation. These matrices let the BA side
-        # correct the preintegrated deltas as:
+        # First-order fallback bias Jacobian propagation. The public call below
+        # replaces these with central-difference derivatives of the stored
+        # rotvec/dv/dp representation. Keeping this fallback here preserves a
+        # defined result if numerical differentiation encounters invalid data.
+        # The matrices let the BA side correct the preintegrated deltas as:
         #   dR ~= dR_hat Exp(J_R_bg dbg)
         #   dv ~= dv_hat + J_v_ba dba + J_v_bg dbg
         #   dp ~= dp_hat + J_p_ba dba + J_p_bg dbg
@@ -1115,6 +1225,22 @@ def integrate_imu_window(
         "J_p_bg": J_p_bg,
     }.items():
         out.update(matrix_columns(prefix, matrix))
+
+    if _compute_bias_jacobians:
+        numerical_jacobians = _finite_difference_bias_jacobians(
+            imu_window,
+            int(start_ns),
+            int(end_ns),
+            window_status,
+        )
+        if numerical_jacobians is not None:
+            for prefix, matrix in numerical_jacobians.items():
+                out.update(matrix_columns(prefix, matrix))
+            out["bias_jacobian_method"] = "central_difference"
+        else:
+            out["bias_jacobian_method"] = "first_order_fallback"
+    else:
+        out["bias_jacobian_method"] = "first_order_internal"
     return out
 
 
@@ -1305,6 +1431,9 @@ def build_imu_prior(
             # 이 컬럼은 나중에 여러 적분 구현을 비교할 때 어떤 방식으로 생성된 CSV인지
             # 추적하기 위한 메타데이터다.
             "integration_method": "boundary_interp_midpoint_so3",
+            "bias_jacobian_method": str(
+                integ.get("bias_jacobian_method", "unknown")
+            ),
         }
         for prefix in IMU_BIAS_JACOBIAN_ORDER:
             matrix = tuple(

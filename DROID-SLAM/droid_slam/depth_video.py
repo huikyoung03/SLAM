@@ -71,6 +71,16 @@ class DepthVideo:
         self.imu_weight = torch.zeros(buffer, device=device, dtype=torch.float).share_memory_()
         self.imu_used_steps = torch.zeros(buffer, device=device, dtype=torch.float).share_memory_()
         self.imu_info = torch.zeros(buffer, 3, device=device, dtype=torch.float).share_memory_()
+        # Learned confidence belongs to the temporal IMU interval ending at a
+        # keyframe. Channel order is [rotation, velocity, position]. A value
+        # of one is deliberately neutral; the companion mask distinguishes
+        # that fallback from a direct GRU prediction.
+        self.imu_learned_confidence = torch.ones(
+            buffer, 3, device=device, dtype=torch.float
+        ).share_memory_()
+        self.imu_learned_confidence_valid = torch.zeros(
+            buffer, device=device, dtype=torch.bool
+        ).share_memory_()
         # Per-row sensor bias random-walk densities in physical IMU units:
         # [accelerometer (m/s^2/sqrt(s)), gyroscope (rad/s/sqrt(s))].
         # They are calibration metadata, not keyframe optimization states.
@@ -122,6 +132,10 @@ class DepthVideo:
         self.imu_weight = self.imu_weight.to(device=device)
         self.imu_used_steps = self.imu_used_steps.to(device=device)
         self.imu_info = self.imu_info.to(device=device)
+        self.imu_learned_confidence = self.imu_learned_confidence.to(device=device)
+        self.imu_learned_confidence_valid = self.imu_learned_confidence_valid.to(
+            device=device
+        )
         self.imu_bias_random_walk = self.imu_bias_random_walk.to(device=device)
         self.imu_bias_jacobian = self.imu_bias_jacobian.to(device=device)
         self.disps = self.disps.to(device=device)
@@ -156,6 +170,8 @@ class DepthVideo:
         del self.imu_weight
         del self.imu_used_steps
         del self.imu_info
+        del self.imu_learned_confidence
+        del self.imu_learned_confidence_valid
         del self.imu_bias_random_walk
         del self.imu_bias_jacobian
         del self.disps
@@ -187,6 +203,75 @@ class DepthVideo:
         """Return ``t_CI`` in the same length unit as current pose centers."""
 
         return self.imu_camera_translation * self.imu_unit_scale[0]
+
+    @torch.no_grad()
+    def update_imu_learned_confidence(self, confidence, coverage=None, count=None):
+        """Persist direct temporal GRU confidence without overwriting fallbacks.
+
+        ``confidence[j]`` weights the preintegrated interval ``(j-1, j)``.
+        Graph updates often contain only a local subset of direct temporal
+        visual edges, so only entries marked by ``coverage`` replace the
+        existing cache. Missing edges remain neutral rather than being treated
+        as learned low confidence.
+        """
+
+        if confidence is None:
+            return 0
+
+        values = torch.as_tensor(
+            confidence,
+            device=self.imu_learned_confidence.device,
+            dtype=self.imu_learned_confidence.dtype,
+        ).detach()
+        if values.ndim == 0:
+            return 0
+        if values.ndim == 3:
+            values = values[0]
+        elif values.ndim == 2 and values.shape[0] == 1:
+            values = values[0]
+        if values.ndim == 1:
+            values = values[:, None]
+        if values.ndim != 2:
+            return 0
+        cache_components = (
+            int(self.imu_learned_confidence.shape[-1])
+            if self.imu_learned_confidence.ndim == 2
+            else 1
+        )
+        if values.shape[-1] == 1 and cache_components == 3:
+            values = values.expand(-1, 3)
+        if cache_components == 1:
+            values = values[:, :1]
+        if values.shape[-1] != cache_components:
+            return 0
+
+        if count is None:
+            count = int(self.counter.value)
+        count = max(0, min(int(count), self.imu_learned_confidence.shape[0]))
+        usable = min(count, values.shape[0])
+        if usable <= 0:
+            return 0
+
+        if coverage is None:
+            valid = torch.ones(usable, dtype=torch.bool, device=values.device)
+        else:
+            coverage = torch.as_tensor(
+                coverage, device=values.device, dtype=torch.bool
+            ).reshape(-1)
+            valid = torch.zeros(usable, dtype=torch.bool, device=values.device)
+            valid[: min(usable, coverage.numel())] = coverage[:usable]
+
+        valid &= torch.isfinite(values[:usable]).all(dim=-1)
+        indices = torch.nonzero(valid, as_tuple=False).reshape(-1)
+        if indices.numel() == 0:
+            return 0
+
+        cached_values = values[indices].clamp(0.0, 1.0)
+        if self.imu_learned_confidence.ndim == 1:
+            cached_values = cached_values[:, 0]
+        self.imu_learned_confidence[indices] = cached_values
+        self.imu_learned_confidence_valid[indices] = True
+        return int(indices.numel())
 
     @staticmethod
     def __imu_value(imu_prior, key, default=0.0):
@@ -294,6 +379,12 @@ class DepthVideo:
             self.velocities[index] = self.velocities[index - 1]
             self.bias_acc[index] = self.bias_acc[index - 1]
             self.bias_gyro[index] = self.bias_gyro[index - 1]
+
+        if isinstance(index, int):
+            # A buffer slot can be reused after keyframe removal. Do not carry
+            # a confidence prediction from an unrelated temporal interval.
+            self.imu_learned_confidence[index] = 1.0
+            self.imu_learned_confidence_valid[index] = False
 
         if item[3] is not None:
             self.disps[index] = item[3]

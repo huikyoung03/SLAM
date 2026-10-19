@@ -1,0 +1,10 @@
+selection_metric=common-frame metric SE(3) ATE RMSE
+coverage_guard=raw_n_poses >= 0.950 * 256
+best_candidate_label=learned_002000
+best_candidate_checkpoint=/home/ubuntu/DROID-SLAM/checkpoints/dvi_mh03_10fps_parity_ramp_8000_002000.pth
+best_candidate_common_se3_ate_rmse_m=0.178761726
+best_candidate_common_rpe_1s_trans_rmse_m=0.078122034
+best_candidate_common_rpe_5s_trans_rmse_m=0.224253159
+best_candidate_full_raw_n_poses=256
+decision=checkpoint fixed before V1_03/V2_03 final evaluation
+note=The V1_03/V2_03 reporting sequences must not be used for this selection.

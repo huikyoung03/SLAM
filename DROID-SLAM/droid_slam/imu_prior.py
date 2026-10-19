@@ -259,6 +259,121 @@ def _bias_jacobian_dict(row):
     }
 
 
+def _mat3_vec(A, v):
+    return [sum(A[i][j] * v[j] for j in range(3)) for i in range(3)]
+
+
+def _row_rotvec(row):
+    """Return a row's rotation in the same log-coordinate form BA consumes."""
+
+    has_rotvec = all(row.get(f"dr_{axis}") not in (None, "") for axis in "xyz")
+    if has_rotvec:
+        return _row_vec3(row, "dr")
+    return _quat_to_rotvec_xyzw(_row_delta_quat_xyzw(row))
+
+
+def _compose_imu_measurements(rows, accel_bias=(0.0, 0.0, 0.0), gyro_bias=(0.0, 0.0, 0.0)):
+    """Compose row deltas after applying their first-order bias correction.
+
+    The CSV stores ``J_R_bg`` as the derivative of *rotation-vector
+    coordinates*, because the DBA side applies it through
+    ``rotvec + J_R_bg @ dbg``.  Applying each row correction first and then
+    composing on SO(3) makes the representation explicit.  The caller can
+    differentiate this function numerically without mixing left/right tangent
+    conventions.
+    """
+
+    q_total = [0.0, 0.0, 0.0, 1.0]
+    dv_total = [0.0, 0.0, 0.0]
+    dp_total = [0.0, 0.0, 0.0]
+    dt_total = 0.0
+
+    for row in rows:
+        jac = _bias_jacobian_dict(row)
+        rotvec = _add3(_row_rotvec(row), _mat3_vec(jac["J_R_bg"], gyro_bias))
+        dv = _add3(
+            _add3(_row_vec3(row, "dv"), _mat3_vec(jac["J_v_ba"], accel_bias)),
+            _mat3_vec(jac["J_v_bg"], gyro_bias),
+        )
+        dp = _add3(
+            _add3(_row_vec3(row, "dp"), _mat3_vec(jac["J_p_ba"], accel_bias)),
+            _mat3_vec(jac["J_p_bg"], gyro_bias),
+        )
+        dt = max(_safe_float(row.get("dt"), 0.0), 0.0)
+
+        q_before = q_total
+        dp_total = _add3(
+            dp_total,
+            _add3(_scale3(dv_total, dt), _quat_rotate_xyzw(q_before, dp)),
+        )
+        dv_total = _add3(dv_total, _quat_rotate_xyzw(q_before, dv))
+        q_total = _quat_multiply_xyzw(q_before, _rotvec_to_quat_xyzw(*rotvec))
+        dt_total += dt
+
+    return {
+        "q": q_total,
+        "rotvec": _quat_to_rotvec_xyzw(q_total),
+        "dv": dv_total,
+        "dp": dp_total,
+        "dt": dt_total,
+    }
+
+
+def _compose_bias_jacobians(rows):
+    """Return Jacobians of the exact composed CSV delta representation.
+
+    The former closed-form composition used a left-tangent rotation Jacobian
+    in one equation and a right-tangent Jacobian in another.  That mismatch is
+    nearly invisible for one 50 ms camera interval but grows as MotionFilter
+    skips frames.  Differentiating `_compose_imu_measurements()` instead keeps
+    its output exactly consistent with the downstream ``rotvec + J @ bias``
+    correction.
+    """
+
+    epsilon = 1e-5
+    jacobians = {
+        "J_R_bg": _zero_mat3(),
+        "J_v_ba": _zero_mat3(),
+        "J_v_bg": _zero_mat3(),
+        "J_p_ba": _zero_mat3(),
+        "J_p_bg": _zero_mat3(),
+    }
+
+    for axis in range(3):
+        accel_plus = [0.0, 0.0, 0.0]
+        accel_minus = [0.0, 0.0, 0.0]
+        accel_plus[axis] = epsilon
+        accel_minus[axis] = -epsilon
+        plus = _compose_imu_measurements(rows, accel_bias=accel_plus)
+        minus = _compose_imu_measurements(rows, accel_bias=accel_minus)
+        for component in range(3):
+            jacobians["J_v_ba"][component][axis] = (
+                plus["dv"][component] - minus["dv"][component]
+            ) / (2.0 * epsilon)
+            jacobians["J_p_ba"][component][axis] = (
+                plus["dp"][component] - minus["dp"][component]
+            ) / (2.0 * epsilon)
+
+        gyro_plus = [0.0, 0.0, 0.0]
+        gyro_minus = [0.0, 0.0, 0.0]
+        gyro_plus[axis] = epsilon
+        gyro_minus[axis] = -epsilon
+        plus = _compose_imu_measurements(rows, gyro_bias=gyro_plus)
+        minus = _compose_imu_measurements(rows, gyro_bias=gyro_minus)
+        for component in range(3):
+            jacobians["J_R_bg"][component][axis] = (
+                plus["rotvec"][component] - minus["rotvec"][component]
+            ) / (2.0 * epsilon)
+            jacobians["J_v_bg"][component][axis] = (
+                plus["dv"][component] - minus["dv"][component]
+            ) / (2.0 * epsilon)
+            jacobians["J_p_bg"][component][axis] = (
+                plus["dp"][component] - minus["dp"][component]
+            ) / (2.0 * epsilon)
+
+    return jacobians
+
+
 def _variance_from_info(row, var_key, info_key):
     var = _safe_float(row.get(var_key), 0.0)
     if var > 0.0:
@@ -298,10 +413,12 @@ def compose_imu_prior_rows(rows, prev_frame_index=None, frame_index=None):
     if len(rows) == 0:
         return None
 
-    q_total = [0.0, 0.0, 0.0, 1.0]
-    dv_total = [0.0, 0.0, 0.0]
-    dp_total = [0.0, 0.0, 0.0]
-    dt_total = 0.0
+    nominal = _compose_imu_measurements(rows)
+    q_total = nominal["q"]
+    dv_total = nominal["dv"]
+    dp_total = nominal["dp"]
+    dt_total = nominal["dt"]
+    bias_jacobians = _compose_bias_jacobians(rows)
 
     imu_count = 0
     imu_used_steps = 0
@@ -315,54 +432,8 @@ def compose_imu_prior_rows(rows, prev_frame_index=None, frame_index=None):
     gyro_variance_rate_count = 0
     accel_variance_rate_sum = 0.0
     accel_variance_rate_count = 0
-    J_R_bg_total = _zero_mat3()
-    J_v_ba_total = _zero_mat3()
-    J_v_bg_total = _zero_mat3()
-    J_p_ba_total = _zero_mat3()
-    J_p_bg_total = _zero_mat3()
-
     for row in rows:
-        q_before = q_total
-        R_before = _quat_to_rotmat_xyzw(q_before)
         dt = _safe_float(row.get("dt"), 0.0)
-        dv = _row_vec3(row, "dv")
-        dp = _row_vec3(row, "dp")
-        jac = _bias_jacobian_dict(row)
-
-        R_dp_skew = _mat3_multiply(R_before, _skew3(dp))
-        R_dv_skew = _mat3_multiply(R_before, _skew3(dv))
-
-        J_p_ba_total = _mat3_add(
-            _mat3_add(J_p_ba_total, _mat3_scale(J_v_ba_total, dt)),
-            _mat3_multiply(R_before, jac["J_p_ba"]),
-        )
-        J_p_bg_total = _mat3_add(
-            _mat3_add(
-                _mat3_add(J_p_bg_total, _mat3_scale(J_v_bg_total, dt)),
-                _mat3_multiply(R_before, jac["J_p_bg"]),
-            ),
-            _mat3_scale(_mat3_multiply(R_dp_skew, J_R_bg_total), -1.0),
-        )
-        J_v_ba_total = _mat3_add(
-            J_v_ba_total,
-            _mat3_multiply(R_before, jac["J_v_ba"]),
-        )
-        J_v_bg_total = _mat3_add(
-            _mat3_add(J_v_bg_total, _mat3_multiply(R_before, jac["J_v_bg"])),
-            _mat3_scale(_mat3_multiply(R_dv_skew, J_R_bg_total), -1.0),
-        )
-        J_R_bg_total = _mat3_add(
-            J_R_bg_total,
-            _mat3_multiply(R_before, jac["J_R_bg"]),
-        )
-
-        dp_total = _add3(
-            dp_total,
-            _add3(_scale3(dv_total, dt), _quat_rotate_xyzw(q_before, dp)),
-        )
-        dv_total = _add3(dv_total, _quat_rotate_xyzw(q_before, dv))
-        q_total = _quat_multiply_xyzw(q_total, _row_delta_quat_xyzw(row))
-        dt_total += dt
 
         imu_count += _safe_int(row.get("imu_count"), 0)
         imu_used_steps += _safe_int(row.get("imu_used_steps", row.get("imu_count")), 0)
@@ -437,11 +508,11 @@ def compose_imu_prior_rows(rows, prev_frame_index=None, frame_index=None):
         "pos_info": 1.0 / pos_var if pos_var > 1e-18 else 0.0,
     })
     for prefix, matrix in {
-        "J_R_bg": J_R_bg_total,
-        "J_v_ba": J_v_ba_total,
-        "J_v_bg": J_v_bg_total,
-        "J_p_ba": J_p_ba_total,
-        "J_p_bg": J_p_bg_total,
+        "J_R_bg": bias_jacobians["J_R_bg"],
+        "J_v_ba": bias_jacobians["J_v_ba"],
+        "J_v_bg": bias_jacobians["J_v_bg"],
+        "J_p_ba": bias_jacobians["J_p_ba"],
+        "J_p_bg": bias_jacobians["J_p_bg"],
     }.items():
         out.update(_matrix_columns(prefix, matrix))
 
@@ -574,6 +645,17 @@ def load_imu_prior_csv(path, report=False):
                         )
                     )
                 ),
+                "bias_jacobian_present": int(
+                    all(
+                        row.get(f"{prefix}_{i}{j}") not in (None, "")
+                        for prefix in IMU_BIAS_JACOBIAN_ORDER
+                        for i in range(3)
+                        for j in range(3)
+                    )
+                ),
+                "bias_jacobian_method": str(
+                    row.get("bias_jacobian_method", "")
+                ).strip(),
                 "gyro_bias_x": get_float("gyro_bias_x", 0.0),
                 "gyro_bias_y": get_float("gyro_bias_y", 0.0),
                 "gyro_bias_z": get_float("gyro_bias_z", 0.0),
