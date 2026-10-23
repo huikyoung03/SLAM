@@ -1702,15 +1702,18 @@ def refine_global_bias_15dof(
     gyro_prior_std: float = 0.05,
     relinearize_accel_threshold: float = 0.05,
     relinearize_gyro_threshold: float = 0.005,
+    window: int = 0,
 ) -> Dict[str, object]:
-    """Run one offline 6D global-bias block after a global 15DoF DBA pass.
+    """Run one shared 6D global-bias block for a full 15DoF state.
 
     The normal local full-state solver owns the per-keyframe state
     ``[T_i, v_i, ba_i, bg_i]``.  This routine holds that state fixed for one
-    robust Gauss-Newton update of a *shared* bias centre and uses all valid
-    temporal factors in the completed sequence.  It is intentionally a
-    block-coordinate update rather than an undocumented second CUDA state
-    layout: a short full 15DoF backend pass must follow an accepted update.
+    robust Gauss-Newton update of a *shared* bias centre. ``window=0`` uses
+    all valid temporal factors in the completed sequence (the termination
+    path); a positive ``window`` restricts the solve to recent keyframes for
+    the online frontend path. It is intentionally a block-coordinate update
+    rather than an undocumented second CUDA state layout: a short full 15DoF
+    DBA pass must follow an accepted update.
 
     Local bias corrections are included in each preintegration residual, so
     the solved variable has a clear meaning: it changes the physical total
@@ -1726,12 +1729,19 @@ def refine_global_bias_15dof(
         return {"updated": 0.0, "reason": "missing_local_bias_state"}
 
     count = int(video.counter.value)
-    src, dst = _valid_temporal_edges(video, 0, count, max_dt)
+    start = (
+        max(0, count - max(2, int(window)))
+        if int(window) > 0
+        else 0
+    )
+    src, dst = _valid_temporal_edges(video, start, count, max_dt)
     if dst.numel() < max(1, int(min_edges)):
         return {
             "updated": 0.0,
             "reason": "insufficient_edges",
             "edges": float(dst.numel()),
+            "window_t0": float(start),
+            "window_t1": float(count),
         }
 
     device = video.poses.device
@@ -1753,6 +1763,8 @@ def refine_global_bias_15dof(
             "reason": "insufficient_duration",
             "edges": float(dst.numel()),
             "duration_sec": duration,
+            "window_t0": float(start),
+            "window_t1": float(count),
         }
     rotation_excitation_deg = float(
         video.imu_delta[dst, 1:4].norm(dim=-1).sum().detach().cpu().item()
@@ -1765,6 +1777,8 @@ def refine_global_bias_15dof(
             "edges": float(dst.numel()),
             "duration_sec": duration,
             "rotation_excitation_deg": rotation_excitation_deg,
+            "window_t0": float(start),
+            "window_t1": float(count),
         }
 
     residual, jacobian = _full_bias_residual_and_jacobian(
@@ -1814,6 +1828,8 @@ def refine_global_bias_15dof(
             "updated": 0.0,
             "reason": "insufficient_weighted_edges",
             "edges": float(valid.sum().detach().cpu().item()),
+            "window_t0": float(start),
+            "window_t1": float(count),
         }
 
     src = src[valid]
@@ -1868,6 +1884,8 @@ def refine_global_bias_15dof(
             "rank": float(rank),
             "condition": condition,
             "rotation_excitation_deg": rotation_excitation_deg,
+            "window_t0": float(start),
+            "window_t1": float(count),
         }
 
     prior_std = _shared_bias_prior_std(
@@ -1949,6 +1967,8 @@ def refine_global_bias_15dof(
             "cost_before": before,
             "cost_after": after,
             "relative_improvement": relative_improvement,
+            "window_t0": float(start),
+            "window_t1": float(count),
         }
     if (
         float(min_relative_improvement) > 0.0
@@ -1961,6 +1981,8 @@ def refine_global_bias_15dof(
             "cost_before": before,
             "cost_after": after,
             "relative_improvement": relative_improvement,
+            "window_t0": float(start),
+            "window_t1": float(count),
         }
 
     accel_step = candidate_accel - accel_bias
@@ -1982,6 +2004,8 @@ def refine_global_bias_15dof(
         "updated": 1.0,
         "global_15dof_block": 1.0,
         "edges": float(dst.numel()),
+        "window_t0": float(start),
+        "window_t1": float(count),
         "duration_sec": duration,
         "rotation_excitation_deg": rotation_excitation_deg,
         "condition": condition,

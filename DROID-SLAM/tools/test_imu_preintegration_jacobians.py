@@ -60,6 +60,8 @@ def add_metadata(row, index):
         "imu_valid": 1,
         "imu_weight": 1.0,
         "imu_reason": "ok",
+        "prev_timestamp_ns": (index - 1) * 50_000_000,
+        "timestamp_ns": index * 50_000_000,
         "rot_var": 1.0,
         "vel_var": 1.0,
         "pos_var": 1.0,
@@ -87,6 +89,8 @@ def test_composed_jacobians_match_direct_preintegration():
 
     composed = compose_imu_prior_rows(rows, prev_frame_index=0, frame_index=10)
     assert composed is not None
+    assert int(composed["prev_timestamp_ns"]) == int(rows[0]["prev_timestamp_ns"])
+    assert int(composed["timestamp_ns"]) == int(rows[-1]["timestamp_ns"])
 
     for prefix in ("dr", "dv", "dp"):
         error = max(

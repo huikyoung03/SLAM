@@ -18,12 +18,15 @@ from geom.imu_factor import (
     quat_to_rotmat,
     quat_to_rotvec,
     rotvec_to_quat,
+    full_imu_factor_linearization,
+    bias_random_walk_relative_sqrt_information,
     select_imu_bias_jacobian,
     skew_symmetric,
     so3_left_jacobian,
     so3_left_jacobian_inv,
     edge_imu_quality_features,
     temporal_imu_confidence_from_edges,
+    temporal_imu_precision_from_edges,
     temporal_imu_quality_features,
 )
 
@@ -105,6 +108,7 @@ class FactorGraph:
         imu_regularizer=None,
         apply_imu_residual=None,
         use_learned_imu_confidence=False,
+        use_learned_imu_precision=False,
         use_component_imu_confidence=False,
         use_dvi_imu_confidence=False,
         use_dvi_imu_quality_fusion=False,
@@ -118,6 +122,8 @@ class FactorGraph:
         imu_full_pos_weight=0.05,
         imu_full_vel_weight=0.05,
         imu_full_bias_weight=0.001,
+        use_imu_bias_random_walk=False,
+        use_imu_full_covariance_weighting=False,
         imu_motion_prior_weight=0.0,
         imu_local_bias_prior_weight=0.0,
         imu_gravity=None,
@@ -145,6 +151,7 @@ class FactorGraph:
         imu_gyro_bias=None,
         imu_acc_bias=None,
         use_joint_shared_bias_ba=False,
+        use_joint_shared_bias_15dof=False,
         imu_joint_bias_interval=10,
         imu_joint_bias_window=30,
         imu_joint_bias_damping=1e-4,
@@ -231,7 +238,16 @@ class FactorGraph:
             if apply_imu_residual is None
             else bool(apply_imu_residual)
         )
-        self.use_learned_imu_confidence = bool(use_learned_imu_confidence)
+        # This legacy-named route is distinct from old scalar confidence. Its
+        # three R/v/p outputs are covariance-relative reliabilities: one
+        # retains the physical IMU factor and values below one attenuate it.
+        self.use_learned_imu_precision = bool(use_learned_imu_precision)
+        self.use_learned_imu_confidence = bool(
+            use_learned_imu_confidence and not self.use_learned_imu_precision
+        )
+        self.use_learned_imu_prediction = bool(
+            self.use_learned_imu_confidence or self.use_learned_imu_precision
+        )
         self.use_component_imu_confidence = bool(
             use_component_imu_confidence and self.use_learned_imu_confidence
         )
@@ -265,6 +281,18 @@ class FactorGraph:
         self.imu_full_pos_weight = float(imu_full_pos_weight)
         self.imu_full_vel_weight = float(imu_full_vel_weight)
         self.imu_full_bias_weight = float(imu_full_bias_weight)
+        # Legacy checkpoints used one manually selected coefficient for both
+        # bias-transition blocks.  The optional calibrated mode replaces that
+        # coefficient per temporal edge with sensor random-walk information.
+        self.use_imu_bias_random_walk = bool(use_imu_bias_random_walk)
+        # In the compatibility path, p/v/R retain the historical hand-tuned
+        # cross-block weights (0.05, 0.05, 1.0).  This calibrated path instead
+        # puts all three preintegration blocks in one covariance reference
+        # frame.  It must be opt-in: older priors only supply relative row
+        # quality and cannot support a physically meaningful cross-block ratio.
+        self.use_imu_full_covariance_weighting = bool(
+            use_imu_full_covariance_weighting
+        )
         self.imu_motion_prior_weight = float(imu_motion_prior_weight)
         self.imu_local_bias_prior_weight = float(imu_local_bias_prior_weight)
         self.imu_gravity = imu_gravity
@@ -297,11 +325,12 @@ class FactorGraph:
         self._configured_imu_optimize_bias = self.imu_optimize_bias
         self.imu_gyro_bias = imu_gyro_bias
         self.imu_acc_bias = imu_acc_bias
-        # Keep one shared accelerometer/gyroscope bias inside each local
-        # 9DoF window. The 6D block is analytically eliminated into the
-        # existing CUDA state-prior system, so no per-keyframe 15DoF state is
-        # allocated.
+        # Keep one shared accelerometer/gyroscope bias inside a DBA normal
+        # system. The legacy mode is local 9DoF; the 15DoF mode is reserved
+        # for the final full-sequence backend and couples the same shared 6D
+        # block to the existing per-keyframe [T, v, ba, bg] state.
         self.use_joint_shared_bias_ba = bool(use_joint_shared_bias_ba)
+        self.use_joint_shared_bias_15dof = bool(use_joint_shared_bias_15dof)
         self.imu_joint_bias_interval = max(1, int(imu_joint_bias_interval))
         self.imu_joint_bias_window = max(2, int(imu_joint_bias_window))
         self.imu_joint_bias_damping = max(0.0, float(imu_joint_bias_damping))
@@ -524,21 +553,32 @@ class FactorGraph:
             int(self.video.counter.value),
             int(torch.maximum(ii.max(), jj.max()).item()) + 1,
         )
-        quality_fallback = self._temporal_dvi_quality_confidence(num_frames)
-        frame_confidence, coverage = temporal_imu_confidence_from_edges(
-            edge_confidence.to(device=self.device, dtype=torch.float),
-            ii,
-            jj,
-            num_frames=num_frames,
-            fallback=quality_fallback if quality_fallback is not None else 1.0,
-            return_coverage=True,
-        )
+        if self.use_learned_imu_precision:
+            quality_fallback = self._temporal_imu_quality_precision(num_frames)
+            frame_confidence, coverage = temporal_imu_precision_from_edges(
+                edge_confidence.to(device=self.device, dtype=torch.float),
+                ii,
+                jj,
+                num_frames=num_frames,
+                fallback=quality_fallback if quality_fallback is not None else 1.0,
+                return_coverage=True,
+            )
+        else:
+            quality_fallback = self._temporal_imu_quality_confidence(num_frames)
+            frame_confidence, coverage = temporal_imu_confidence_from_edges(
+                edge_confidence.to(device=self.device, dtype=torch.float),
+                ii,
+                jj,
+                num_frames=num_frames,
+                fallback=quality_fallback if quality_fallback is not None else 1.0,
+                return_coverage=True,
+            )
 
-        if self.imu_confidence_floor > 0.0:
-            floor = float(self.imu_confidence_floor)
-            frame_confidence = floor + (1.0 - floor) * frame_confidence
+            if self.imu_confidence_floor > 0.0:
+                floor = float(self.imu_confidence_floor)
+                frame_confidence = floor + (1.0 - floor) * frame_confidence
 
-        frame_confidence = frame_confidence.clamp(0.0, 1.0)
+            frame_confidence = frame_confidence.clamp(0.0, 1.0)
         if return_coverage:
             return frame_confidence, coverage
         return frame_confidence
@@ -546,7 +586,11 @@ class FactorGraph:
     def _persist_imu_confidence(self, frame_confidence, coverage):
         """Cache only direct temporal predictions for terminal VI refinement."""
 
-        if frame_confidence is None or coverage is None:
+        if (
+            self.use_learned_imu_precision
+            or frame_confidence is None
+            or coverage is None
+        ):
             return 0
 
         if not hasattr(self.video, "update_imu_learned_confidence"):
@@ -572,7 +616,8 @@ class FactorGraph:
         # quality features.  That creates a train/runtime input mismatch and
         # turns the learned scalar quality contribution into an all-zero logit.
         if not (
-            self.use_component_imu_confidence
+            self.use_learned_imu_precision
+            or self.use_component_imu_confidence
             or self.use_dvi_imu_quality_fusion
         ):
             return None
@@ -590,19 +635,30 @@ class FactorGraph:
             num_frames=count,
         )
 
-    def _temporal_dvi_quality_confidence(self, count):
+    def _temporal_imu_quality_confidence(self, count):
         """Predict fallback confidence for temporal rows lacking visual edges.
 
-        A direct GRU edge remains the preferred prediction.  When it is not
-        present, using 1.0 would silently restore a full-strength IMU factor
-        and bypass the learned quality model.  The scalar DVI quality MLP is
-        available for every preintegrated interval, so it supplies that
-        fallback without borrowing an unrelated visual/proximity edge.
+        The direct visual-GRU branch remains preferable when a temporal edge
+        exists.  For an uncovered but valid interval, the raw preintegration
+        quality MLP supplies either one scalar (DVI mode) or three
+        [rotation, velocity, position] confidences (component mode).  This
+        prevents a missing visual edge from silently becoming fixed c=1.
         """
 
-        if not self.use_dvi_imu_quality_fusion or count <= 0:
+        if (
+            count <= 0
+            or not (
+                self.use_component_imu_confidence
+                or self.use_dvi_imu_quality_fusion
+            )
+        ):
             return None
-        predictor = getattr(self.update_op, "dvi_imu_quality_confidence", None)
+        predictor_name = (
+            "component_imu_quality_confidence"
+            if self.use_component_imu_confidence
+            else "dvi_imu_quality_confidence"
+        )
+        predictor = getattr(self.update_op, predictor_name, None)
         if predictor is None:
             return None
         quality = temporal_imu_quality_features(
@@ -621,13 +677,50 @@ class FactorGraph:
             confidence.ndim != 3
             or confidence.shape[0] != 1
             or confidence.shape[1] < count
-            or confidence.shape[-1] != 1
+            or confidence.shape[-1]
+            != (3 if self.use_component_imu_confidence else 1)
         ):
             raise ValueError(
-                "DVI quality fallback must be [1, N, 1], got "
+                "IMU quality fallback must be [1, N, 1|3], got "
                 f"{tuple(confidence.shape)} for N={count}"
             )
         return confidence[:, :count]
+
+    def _temporal_imu_quality_precision(self, count):
+        """Positive R/v/p fallback weights for direct-precision mode.
+
+        A direct temporal visual edge remains preferred.  This fallback only
+        covers valid IMU intervals that have no active visual edge, and uses
+        exactly the same seven preintegration features as the GRU fusion path.
+        """
+
+        if count <= 0 or not self.use_learned_imu_precision:
+            return None
+        predictor = getattr(self.update_op, "imu_precision_quality_weights", None)
+        if predictor is None:
+            return None
+        quality = temporal_imu_quality_features(
+            self.video.imu_delta[:count],
+            self.video.imu_info[:count],
+            num_frames=count,
+        )
+        if quality is None:
+            return None
+        precision = predictor(quality)
+        if (
+            precision is None
+            or precision.ndim != 3
+            or precision.shape[0] != 1
+            or precision.shape[1] < count
+            or precision.shape[-1] != 3
+        ):
+            raise ValueError(
+                "IMU precision quality fallback must be [1, N, 3], got "
+                f"{None if precision is None else tuple(precision.shape)} for N={count}"
+            )
+        # Keep the BA-side invariant even if a stale or externally loaded
+        # checkpoint predates the bounded attenuation parameterization.
+        return precision[:, :count].clamp(1e-12, 1.0)
 
     def _apply_imu_residual(self, stage):
         if self.imu_regularizer is None or not self.apply_imu_residual:
@@ -660,7 +753,7 @@ class FactorGraph:
             value = self.imu_tuned_confidence_schedule[schedule_ix]
             return np.full(3, value, dtype=np.float64)
 
-        if not self.use_learned_imu_confidence or self.last_imu_confidence is None:
+        if not self.use_learned_imu_prediction or self.last_imu_confidence is None:
             return np.ones(3, dtype=np.float64)
 
         try:
@@ -690,6 +783,8 @@ class FactorGraph:
         if values.size < 3 or not np.all(np.isfinite(values[:3])):
             return np.ones(3, dtype=np.float64)
 
+        if self.use_learned_imu_precision:
+            return np.clip(values[:3], 1e-12, 1.0)
         return np.clip(values[:3], 0.0, 1.0)
 
     def _confidence_for_pose_index(self, pose_ix):
@@ -700,6 +795,8 @@ class FactorGraph:
     def _imu_confidence_mode(self):
         if self.imu_tuned_confidence_schedule is not None:
             return "tuned"
+        if self.use_learned_imu_precision:
+            return "learned_precision"
         if self.use_learned_imu_confidence:
             return "learned"
         return "fixed"
@@ -1193,6 +1290,65 @@ class FactorGraph:
             float(pos_scale.detach().cpu().item()),
         )
 
+    def _imu_full_covariance_term_scale(self, curr_ix, info_ref, device, dtype):
+        """Return p/v/R row scales in one rotation-information reference.
+
+        ``imu_info`` contains the diagonal information for [R, v, p] after
+        the translation rows have been converted into the current DROID unit.
+        The historical implementation divided each kind by *its own* median
+        and then multiplied p/v by arbitrary 0.05 weights.  That removes the
+        covariance relation between position, velocity, and rotation.
+
+        Here every row is instead normalized by the calibrated rotation
+        information reference.  The result remains dimensionless relative to
+        DROID's visual normal equations (so this is not a new global lambda),
+        but preserves the measured p/v/R covariance ratios.  The source
+        preintegrator currently provides a diagonal approximation, hence the
+        name deliberately says "term" rather than claiming a dense covariance
+        whitening.
+        """
+        if (
+            info_ref is None
+            or getattr(self.video, "imu_info", None) is None
+            or curr_ix < 0
+            or curr_ix >= int(self.video.imu_info.shape[0])
+            or info_ref.numel() < 3
+        ):
+            return None, None
+
+        info = self.video.imu_info[curr_ix].detach().to(device=device, dtype=dtype)
+        info = info.reshape(-1)[:3]
+        if info.numel() < 3:
+            return None, None
+
+        rotation_ref = info_ref.reshape(-1)[0]
+        valid = (
+            torch.isfinite(info).all()
+            & torch.isfinite(rotation_ref)
+            & (info > self.imu_info_weight_eps).all()
+            & (rotation_ref > self.imu_info_weight_eps)
+        )
+        if not bool(valid.detach().cpu().item()):
+            return None, None
+
+        # imu_info is [R, v, p], while the factor residual is [p, v, R].
+        row_scale = (info / rotation_ref).clamp_min(0.0).sqrt()
+        rot_scale, vel_scale, pos_scale = row_scale[0], row_scale[1], row_scale[2]
+        term_scale = torch.cat(
+            [
+                pos_scale.expand(3),
+                vel_scale.expand(3),
+                rot_scale.expand(3),
+                torch.ones(6, device=device, dtype=dtype),
+            ],
+            dim=0,
+        )
+        return term_scale, (
+            float(rot_scale.detach().cpu().item()),
+            float(vel_scale.detach().cpu().item()),
+            float(pos_scale.detach().cpu().item()),
+        )
+
     def refine_shared_bias_block(
         self,
         *,
@@ -1454,12 +1610,20 @@ class FactorGraph:
                 velocities[pose_ix] = v
 
     def _joint_shared_bias_due(self):
-        """Return whether the next local BA may update the carried bias."""
+        """Return whether the next DBA may update the carried shared bias."""
 
-        if not self.use_joint_shared_bias_ba:
+        if not self._joint_shared_bias_enabled():
             return False
         frame = int(self.video.counter.value)
         return frame - self._last_joint_bias_attempt_frame >= self.imu_joint_bias_interval
+
+    def _joint_shared_bias_enabled(self):
+        """Whether either explicitly supported shared-bias formulation is active."""
+
+        return bool(
+            getattr(self, "use_joint_shared_bias_ba", False)
+            or getattr(self, "use_joint_shared_bias_15dof", False)
+        )
 
     def _outer_imu_ba_relinearization_due(self):
         """Return whether the fixed-bias control should use outer BA steps.
@@ -1479,16 +1643,17 @@ class FactorGraph:
 
     @staticmethod
     def _schur_eliminate_shared_bias(Hxb, Hbb, gb):
-        """Marginalize one six-variable bias block from a local 9D system.
+        """Marginalize one six-variable bias block from a DBA state system.
 
-        ``Hxb[i]`` is the 9-by-6 normal-equation cross block for local state
-        ``i`` and the shared bias.  With DROID's ``H dx = v`` convention,
-        eliminating ``db`` adds the returned negative Hessian and gradient
-        corrections to the ordinary pose/velocity system.
+        ``Hxb[i]`` is the ``state_dim``-by-6 normal-equation cross block for
+        state ``i`` and the shared bias. ``state_dim`` is 9 for the legacy
+        pose/velocity path and 15 for the two-stage full-state path. With
+        DROID's ``H dx = v`` convention, eliminating ``db`` adds the returned
+        negative Hessian and gradient corrections to the CUDA state system.
         """
 
-        if Hxb.ndim != 3 or Hxb.shape[-2:] != (9, 6):
-            raise ValueError("Hxb must have shape [window, 9, 6]")
+        if Hxb.ndim != 3 or Hxb.shape[-1] != 6 or Hxb.shape[-2] not in (9, 15):
+            raise ValueError("Hxb must have shape [window, 9|15, 6]")
         if Hbb.shape != (6, 6) or gb.shape != (6,):
             raise ValueError("shared bias normal block must be 6D")
 
@@ -1498,7 +1663,7 @@ class FactorGraph:
         hbb_inv_hbx = torch.linalg.solve(
             Hbb,
             Hxb.permute(2, 0, 1).reshape(6, -1),
-        ).reshape(6, Hxb.shape[0], 9)
+        ).reshape(6, Hxb.shape[0], Hxb.shape[1])
         hessian_correction = -torch.einsum(
             "aik,kbj->abij", Hxb, hbb_inv_hbx
         )
@@ -1577,21 +1742,38 @@ class FactorGraph:
         H_jj = []
         v_prior = torch.zeros((P, state_dim), device=device, dtype=dtype)
         eye3 = torch.eye(3, device=device, dtype=dtype)
-        # The shared-bias mode keeps the CUDA state at 9D.  We accumulate the
-        # 9D-to-6D cross terms here, then eliminate the one window-level bias
-        # block before passing the resulting dense state blocks to CUDA.
+        # Both supported shared-bias variants are Schur-reduced into the
+        # existing CUDA state system. The legacy variant owns 9D [T, v] local
+        # states; the final-global variant owns the normal 15D [T, v, ba, bg]
+        # states and therefore cannot be replaced by the old 9D path.
         if enable_joint_bias is None:
             enable_joint_bias = self._joint_shared_bias_due()
-        joint_bias_enabled = bool(
+        legacy_joint_bias = bool(
             self.use_joint_shared_bias_ba
-            and enable_joint_bias
             and not optimize_bias
             and state_dim == 9
         )
+        full_joint_bias = bool(
+            self.use_joint_shared_bias_15dof
+            and optimize_bias
+            and state_dim == 15
+        )
+        joint_bias_enabled = bool(
+            enable_joint_bias and (legacy_joint_bias or full_joint_bias)
+        )
         if joint_bias_enabled and mark_joint_attempt:
             self._last_joint_bias_attempt_frame = int(self.video.counter.value)
-        joint_start_ix = max(t0, max_pose_ix - self.imu_joint_bias_window)
-        joint_Hxb = torch.zeros((P, 9, 6), device=device, dtype=dtype)
+        # In final-global 15DoF mode, the shared variable must see the same
+        # complete [t0, t1) state interval as global BA. Restricting it to the
+        # last online window would recreate the post-hoc observability issue
+        # this path is designed to test. The legacy 9DoF path intentionally
+        # retains its bounded local window.
+        joint_start_ix = (
+            t0
+            if full_joint_bias
+            else max(t0, max_pose_ix - self.imu_joint_bias_window)
+        )
+        joint_Hxb = torch.zeros((P, state_dim, 6), device=device, dtype=dtype)
         joint_Hbb_data = torch.zeros((6, 6), device=device, dtype=dtype)
         joint_gb = torch.zeros(6, device=device, dtype=dtype)
         joint_dst = []
@@ -1608,15 +1790,42 @@ class FactorGraph:
             "imu_global_bias_gyro", self.imu_gyro_bias, device, dtype
         )
         gravity = self._runtime_imu_gravity(device, dtype)
-        base_weights = (
-            [self.imu_full_pos_weight] * 3
-            + [self.imu_full_vel_weight] * 3
-            + [1.0] * 3
-        )
+        if self.use_learned_imu_precision or self.use_imu_full_covariance_weighting:
+            # p/v/R are already put in one calibrated covariance reference
+            # per edge below.  Keeping 0.05 here would reintroduce the old
+            # hand-tuned position/velocity suppression.
+            base_weights = [1.0] * 9
+            compatibility_base_weights = (
+                [self.imu_full_pos_weight] * 3
+                + [self.imu_full_vel_weight] * 3
+                + [1.0] * 3
+            )
+        else:
+            base_weights = (
+                [self.imu_full_pos_weight] * 3
+                + [self.imu_full_vel_weight] * 3
+                + [1.0] * 3
+            )
+            compatibility_base_weights = list(base_weights)
         if optimize_bias:
-            base_weights += [self.imu_full_bias_weight] * 3
-            base_weights += [self.imu_full_bias_weight] * 3
+            # In calibrated random-walk mode the two bias blocks receive
+            # their per-edge scale below.  Do not retain the legacy 0.001
+            # coefficient as a hidden second bias prior.
+            bias_base_weight = (
+                1.0
+                if self.use_imu_bias_random_walk
+                else self.imu_full_bias_weight
+            )
+            base_weights += [bias_base_weight] * 3
+            base_weights += [bias_base_weight] * 3
+            compatibility_base_weights += [bias_base_weight] * 3
+            compatibility_base_weights += [bias_base_weight] * 3
         base_scale = torch.as_tensor(base_weights, device=device, dtype=dtype).clamp_min(0.0).sqrt()
+        compatibility_base_scale = torch.as_tensor(
+            compatibility_base_weights,
+            device=device,
+            dtype=dtype,
+        ).clamp_min(0.0).sqrt()
         info_ref = self._imu_info_reference(t0, max_pose_ix, device, dtype)
         rad_to_deg = 180.0 / np.pi
         used = 0
@@ -1662,6 +1871,9 @@ class FactorGraph:
             motion_gate=1.0,
             consistency_gate=1.0,
             adaptive_gate=1.0,
+            bias_accel_rw_scale=1.0,
+            bias_gyro_rw_scale=1.0,
+            bias_rw_mode="legacy_fixed",
         ):
             if reason != "used":
                 mark_skip(reason)
@@ -1711,6 +1923,9 @@ class FactorGraph:
                 "motion_gate": float(motion_gate),
                 "consistency_gate": float(consistency_gate),
                 "adaptive_gate": float(adaptive_gate),
+                "bias_accel_rw_scale": float(bias_accel_rw_scale),
+                "bias_gyro_rw_scale": float(bias_gyro_rw_scale),
+                "bias_rw_mode": str(bias_rw_mode),
             })
 
         def debug_norm(value):
@@ -1800,11 +2015,6 @@ class FactorGraph:
                 )
                 continue
 
-            q_i = poses[prev_ix, 3:7].detach()
-            q_j = poses[curr_ix, 3:7].detach()
-            p_i = centers[prev_ix].detach()
-            p_j = centers[curr_ix].detach()
-
             v_i = velocities[prev_ix].detach()
             v_j = velocities[curr_ix].detach()
             if optimize_bias:
@@ -1817,9 +2027,6 @@ class FactorGraph:
                 ba_j = torch.zeros(3, device=device, dtype=dtype)
                 bg_i = torch.zeros(3, device=device, dtype=dtype)
                 bg_j = torch.zeros(3, device=device, dtype=dtype)
-
-            ba_total = ba_global + (ba_i if optimize_bias else 0.0)
-            bg_total = bg_global + (bg_i if optimize_bias else 0.0)
 
             bias_jac_source = getattr(self.video, "imu_bias_jacobian", None)
             bias_jac = select_imu_bias_jacobian(
@@ -1840,18 +2047,25 @@ class FactorGraph:
             J_v_bg = bias_jac[2]
             J_p_ba = bias_jac[3]
             J_p_bg = bias_jac[4]
-
-            rotvec = row[1:4] + J_R_bg @ bg_total
-            dv_imu = row[4:7] + J_v_ba @ ba_total + J_v_bg @ bg_total
-            dp_imu = row[7:10] + J_p_ba @ ba_total + J_p_bg @ bg_total
-
-            q_imu = rotvec_to_quat(rotvec)
             try:
-                q_pred = predict_imu_rotation(
-                    q_i,
-                    q_imu,
+                residual, Ji, Jj, factor_details = full_imu_factor_linearization(
+                    poses[prev_ix].detach(),
+                    poses[curr_ix].detach(),
+                    v_i,
+                    v_j,
+                    ba_i,
+                    ba_j,
+                    bg_i,
+                    bg_j,
+                    ba_global,
+                    bg_global,
+                    row,
+                    bias_jac,
+                    gravity,
+                    lever_arm,
                     compose_order=self.imu_full_compose_order,
                     inverse_imu=self.imu_full_inverse,
+                    optimize_bias=optimize_bias,
                 )
             except ValueError:
                 record_edge(
@@ -1868,22 +2082,22 @@ class FactorGraph:
                     dp_norm_internal=dp_norm_internal,
                 )
                 continue
-            r_R = quat_to_rotvec(quat_multiply(quat_inverse(q_pred), q_j))
 
-            p_world_delta = p_j - p_i - v_i * dt - 0.5 * gravity * dt * dt
-            v_world_delta = v_j - v_i - gravity * dt
-            p_cam_delta = quat_rotate(q_i, p_world_delta)
-            v_cam_delta = quat_rotate(q_i, v_world_delta)
-
-            r_p = p_cam_delta - dp_imu
-            r_v = v_cam_delta - dv_imu
-            r_ba = ba_j - ba_i if optimize_bias else torch.zeros(3, device=device, dtype=dtype)
-            r_bg = bg_j - bg_i if optimize_bias else torch.zeros(3, device=device, dtype=dtype)
-            residual = (
-                torch.cat([r_p, r_v, r_R, r_ba, r_bg], dim=0)
-                if optimize_bias
-                else torch.cat([r_p, r_v, r_R], dim=0)
-            )
+            # Keep the physical residual/Jacobian construction in
+            # ``geom.imu_factor`` so the finite-difference test exercises the
+            # exact code path used for runtime DBA.
+            q_i = factor_details["q_i"]
+            q_j = factor_details["q_j"]
+            q_pred = factor_details["q_pred"]
+            rotvec = factor_details["rotvec"]
+            r_p = factor_details["r_p"]
+            r_v = factor_details["r_v"]
+            r_R = factor_details["r_R"]
+            r_ba = factor_details["r_ba"]
+            r_bg = factor_details["r_bg"]
+            R_i = factor_details["R_i"]
+            R_pred = factor_details["R_pred"]
+            Jl_inv = factor_details["Jl_inv"]
 
             if not torch.isfinite(residual).all():
                 record_edge(
@@ -1977,89 +2191,93 @@ class FactorGraph:
                 )
                 continue
 
-            info_term_scale, info_scales = self._imu_info_term_scale(
-                curr_ix,
-                info_ref,
-                device,
-                dtype,
-            )
+            covariance_scale = None
+            if self.use_imu_full_covariance_weighting:
+                covariance_scale, info_scales = self._imu_full_covariance_term_scale(
+                    curr_ix,
+                    info_ref,
+                    device,
+                    dtype,
+                )
+            else:
+                info_scales = None
+
+            covariance_available = covariance_scale is not None
+            if covariance_available:
+                info_term_scale = covariance_scale
+            else:
+                # A malformed legacy row cannot safely supply cross-block
+                # covariance.  Preserve the established relative-row path for
+                # that individual edge, and expose the fallback in debug logs.
+                info_term_scale, fallback_info_scales = self._imu_info_term_scale(
+                    curr_ix,
+                    info_ref,
+                    device,
+                    dtype,
+                )
+                if info_scales is None:
+                    info_scales = fallback_info_scales
             if not optimize_bias:
                 info_term_scale = info_term_scale[:9]
 
-            Ji = torch.zeros((residual_dim, state_dim), device=device, dtype=dtype)
-            Jj = torch.zeros((residual_dim, state_dim), device=device, dtype=dtype)
-
-            R_i = quat_to_rotmat(q_i)
-            R_j = quat_to_rotmat(q_j)
-            R_pred = quat_to_rotmat(q_pred)
-            Ri_RjT = R_i @ R_j.transpose(0, 1)
-            Jl_inv = so3_left_jacobian_inv(r_R)
-
-            # DROID/LieTorch left-multiplies SE(3) perturbations. CUDA DBA
-            # expects normal-equation inputs built for residuals `r - J dx`.
-            Ji[0:3, 0:3] = -eye3
-            Jj[0:3, 0:3] = Ri_RjT
-            # The translational factor is measured at the IMU origin rather
-            # than the camera center.  A camera rotation moves that origin by
-            # the lever arm t_CI, so both pose endpoints receive its exact
-            # first-order contribution under DROID's left perturbation.
-            Ji[0:3, 3:6] = skew_symmetric(p_cam_delta + lever_arm)
-            Jj[0:3, 3:6] = -Ri_RjT @ skew_symmetric(lever_arm)
-            Ji[0:3, 6:9] = dt * R_i
-            if optimize_bias:
-                Ji[0:3, 9:12] = J_p_ba
-                Ji[0:3, 12:15] = J_p_bg
-
-            Ji[3:6, 3:6] = skew_symmetric(v_cam_delta)
-            Ji[3:6, 6:9] = R_i
-            Jj[3:6, 6:9] = -R_i
-            if optimize_bias:
-                Ji[3:6, 9:12] = J_v_ba
-                Ji[3:6, 12:15] = J_v_bg
-
-            if self.imu_full_compose_order == "dq_prev":
-                rot_i_map = R_i.transpose(0, 1)
-                gyro_map = R_pred.transpose(0, 1)
-            elif self.imu_full_compose_order == "prev_dq":
-                rot_i_map = R_pred.transpose(0, 1)
-                gyro_map = R_pred.transpose(0, 1) @ R_i
-            else:
-                record_edge(
-                    "bad_compose_order",
-                    prev_ix,
-                    curr_ix,
-                    dt_value=dt_value,
-                    row_weight=row_weight,
-                    row_scale=row_scale,
-                    dr_norm=dr_norm,
-                    dv_norm=dv_norm,
-                    dp_norm=dp_norm,
-                    dv_norm_internal=dv_norm_internal,
-                    dp_norm_internal=dp_norm_internal,
+            # The old fixed ``imu_full_bias_weight`` made a local bias step
+            # equally cheap at every time interval and for both sensors.  A
+            # real bias random walk instead has covariance rw^2 * dt.  Its
+            # information is normalized by the calibrated rotation reference,
+            # just as p/v/R information is normalized elsewhere in this
+            # factor; this retains a coherent visual-vs-IMU scale without an
+            # additional global lambda.
+            bias_rw_scale = None
+            bias_rw_mode = "legacy_fixed"
+            if optimize_bias and self.use_imu_bias_random_walk:
+                random_walk = getattr(self.video, "imu_bias_random_walk", None)
+                rotation_reference = (
+                    info_ref[0]
+                    if info_ref is not None and info_ref.numel() >= 1
+                    else None
                 )
-                continue
-
-            Ji[6:9, 3:6] = Jl_inv @ rot_i_map
-            Jj[6:9, 3:6] = -(Jl_inv @ R_pred.transpose(0, 1))
-            if optimize_bias:
-                gyro_sign = -1.0 if self.imu_full_inverse else 1.0
-                preintegration_map = gyro_sign * so3_left_jacobian(
-                    gyro_sign * rotvec
-                )
-                Ji[6:9, 12:15] = (
-                    Jl_inv @ gyro_map @ preintegration_map @ J_R_bg
-                )
-
-                Ji[9:12, 9:12] = eye3
-                Jj[9:12, 9:12] = -eye3
-
-                Ji[12:15, 12:15] = eye3
-                Jj[12:15, 12:15] = -eye3
+                if (
+                    random_walk is not None
+                    and curr_ix < int(random_walk.shape[0])
+                    and rotation_reference is not None
+                ):
+                    candidate_scale, candidate_valid = (
+                        bias_random_walk_relative_sqrt_information(
+                            random_walk[curr_ix].detach().to(
+                                device=device,
+                                dtype=dtype,
+                            ),
+                            dt,
+                            rotation_reference,
+                            eps=self.imu_info_weight_eps,
+                        )
+                    )
+                    if bool(candidate_valid.detach().cpu().item()):
+                        bias_rw_scale = candidate_scale
+                        bias_rw_mode = "sensor_rw_relative_to_rotation"
+                # A malformed/legacy prior has no physical rw value.  Preserve
+                # the exact historical behavior for that edge rather than
+                # pretending an arbitrary density is calibrated.
+                if bias_rw_scale is None:
+                    bias_rw_scale = torch.full(
+                        (6,),
+                        max(self.imu_full_bias_weight, 0.0) ** 0.5,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    bias_rw_mode = "legacy_fixed_missing_rw"
 
             # Residual rows are [p, v, R, ba, bg] while learned confidence is
             # [R, v, p].  Scaling both r and J by sqrt(c) adds the intended
             # component-wise Mahalanobis weight directly to the normal system.
-            bias_confidence = float(np.mean(confidence_components))
+            # Direct precision learns the R/v/p likelihood itself.  Bias
+            # random-walk rows remain a physical sensor model, rather than a
+            # fourth learned quality channel.
+            bias_confidence = (
+                1.0
+                if self.use_learned_imu_precision
+                else float(np.mean(confidence_components))
+            )
             component_scale = torch.as_tensor(
                 [confidence_pos] * 3
                 + [confidence_vel] * 3
@@ -2067,37 +2285,81 @@ class FactorGraph:
                 + ([bias_confidence] * 6 if optimize_bias else []),
                 device=device,
                 dtype=dtype,
-            ).clamp(0.0, 1.0).sqrt()
-            scale = base_scale * info_term_scale * component_scale
+            )
+            if self.use_learned_imu_precision:
+                component_scale = component_scale.clamp(1e-12, 1.0).sqrt()
+            else:
+                component_scale = component_scale.clamp(0.0, 1.0).sqrt()
+            # If one corrupt/missing IMU-information row occurs, retain the
+            # exact compatibility p/v/R scale for that row rather than turning
+            # it into an accidental high-weight factor.
+            edge_base_scale = (
+                # Direct precision has no legacy p/v compatibility scale,
+                # including on a malformed covariance row.  The information
+                # helper above supplies its safe per-row fallback instead.
+                base_scale
+                if (
+                    self.use_learned_imu_precision
+                    or not self.use_imu_full_covariance_weighting
+                    or covariance_available
+                )
+                else compatibility_base_scale
+            )
+            scale = edge_base_scale * info_term_scale * component_scale
+            if bias_rw_scale is not None:
+                scale[9:15] = scale[9:15] * bias_rw_scale
             residual = residual * scale
             Ji = Ji * scale.view(residual_dim, 1)
             Jj = Jj * scale.view(residual_dim, 1)
             w = torch.as_tensor(weight, device=device, dtype=dtype)
 
-            # Shared global bias Jacobian for the fixed-bias 9D path.  It
-            # follows the same `r - J dx` sign convention as Ji/Jj above.
-            # Only recent temporal factors participate in this one local
-            # 6D block; backend-wide visual refinement therefore does not
-            # create a quadratic number of cross-state prior blocks.
+            # Shared global-bias Jacobian, in the same ``r - J dx`` convention
+            # as ``Ji/Jj``. In 15DoF mode the global bias has exactly the
+            # measurement-row derivative of source local [ba, bg], but it has
+            # *no* derivative for local random-walk rows r_ba/r_bg. Keeping
+            # those rows zero is essential: a global bias is constant over an
+            # edge, whereas local biases are innovations around that centre.
             if joint_bias_enabled and prev_ix >= joint_start_ix:
-                Jb = torch.zeros((9, 6), device=device, dtype=dtype)
-                Jb[0:3, 0:3] = J_p_ba
-                Jb[0:3, 3:6] = J_p_bg
-                Jb[3:6, 0:3] = J_v_ba
-                Jb[3:6, 3:6] = J_v_bg
-                gyro_sign = -1.0 if self.imu_full_inverse else 1.0
-                preintegration_map = gyro_sign * so3_left_jacobian(
-                    gyro_sign * rotvec
-                )
-                Jb[6:9, 3:6] = (
-                    Jl_inv @ gyro_map @ preintegration_map @ J_R_bg
-                )
-                Jb = Jb * scale[:9].view(9, 1)
+                if full_joint_bias:
+                    Jb = torch.zeros((15, 6), device=device, dtype=dtype)
+                    # ``Ji`` has already received every row's information,
+                    # confidence, and random-walk scaling. Its source-local
+                    # bias measurement rows are therefore the exact scaled
+                    # global derivative we need for r_p/r_v/r_R.
+                    Jb[:9] = Ji[:9, 9:15]
+                else:
+                    Jb = torch.zeros((9, 6), device=device, dtype=dtype)
+                    Jb[0:3, 0:3] = J_p_ba
+                    Jb[0:3, 3:6] = J_p_bg
+                    Jb[3:6, 0:3] = J_v_ba
+                    Jb[3:6, 3:6] = J_v_bg
+                    gyro_sign = -1.0 if self.imu_full_inverse else 1.0
+                    preintegration_map = gyro_sign * so3_left_jacobian(
+                        gyro_sign * rotvec
+                    )
+                    if self.imu_full_compose_order == "dq_prev":
+                        gyro_map = R_pred.transpose(0, 1)
+                    else:  # ``full_imu_factor_linearization`` has validated it.
+                        gyro_map = R_pred.transpose(0, 1) @ R_i
+                    Jb[6:9, 3:6] = (
+                        Jl_inv @ gyro_map @ preintegration_map @ J_R_bg
+                    )
+                    Jb = Jb * scale[:9].view(9, 1)
 
-                joint_Hxb[prev_local] += w * (Ji.transpose(0, 1) @ Jb)
+                # The first global-backend factor can connect fixed frame 0
+                # to optimized frame 1 (t0=1). Do not let Python's negative
+                # index accidentally attach that fixed endpoint to the final
+                # state block of the Schur system.
+                if 0 <= prev_local < P:
+                    joint_Hxb[prev_local] += w * (Ji.transpose(0, 1) @ Jb)
                 joint_Hxb[curr_local] += w * (Jj.transpose(0, 1) @ Jb)
                 joint_Hbb_data += w * (Jb.transpose(0, 1) @ Jb)
-                joint_gb += w * (Jb.transpose(0, 1) @ residual[:9])
+                # The legacy 9D factor has only measurement rows. The 15D
+                # factor additionally contains local random-walk rows; Jb is
+                # intentionally zero there, so retain the full residual to
+                # keep the matrix product/state layout exact.
+                joint_residual = residual if full_joint_bias else residual[:9]
+                joint_gb += w * (Jb.transpose(0, 1) @ joint_residual)
                 joint_dst.append(curr_ix)
                 joint_used += 1
                 joint_duration += dt_value
@@ -2146,6 +2408,17 @@ class FactorGraph:
                 info_rot_scale=info_scales[0],
                 info_vel_scale=info_scales[1],
                 info_pos_scale=info_scales[2],
+                bias_accel_rw_scale=(
+                    float(bias_rw_scale[0].detach().cpu().item())
+                    if bias_rw_scale is not None
+                    else 1.0
+                ),
+                bias_gyro_rw_scale=(
+                    float(bias_rw_scale[3].detach().cpu().item())
+                    if bias_rw_scale is not None
+                    else 1.0
+                ),
+                bias_rw_mode=bias_rw_mode,
                 **gate_parts,
             )
 
@@ -2259,7 +2532,7 @@ class FactorGraph:
                 else:
                     local_count = int(local_indices.numel())
                     H_blocks.extend(
-                        correction_h.reshape(-1, 9, 9).unbind(0)
+                        correction_h.reshape(-1, state_dim, state_dim).unbind(0)
                     )
                     block_i = local_indices[:, None].expand(local_count, local_count)
                     block_j = local_indices[None, :].expand(local_count, local_count)
@@ -2270,6 +2543,8 @@ class FactorGraph:
                         "Hbb": joint_hessian,
                         "gb": joint_gb,
                         "Hxb": joint_hxb,
+                        "state_dim": int(state_dim),
+                        "mode": "full_15dof" if full_joint_bias else "fixed_bias_9dof",
                         "state_locals": local_indices,
                         "edges": float(joint_used),
                         "duration_sec": float(joint_duration),
@@ -2304,8 +2579,9 @@ class FactorGraph:
                 f"edges={used}, blocks={len(H_blocks)}, "
                 f"weight={self.imu_ba_prior_weight}, conf_mean={conf_mean:.4f}, "
                 f"adaptive_gate_mean={gate_mean:.4f}, "
-                f"pos_w={self.imu_full_pos_weight}, vel_w={self.imu_full_vel_weight}, "
-                f"bias_w={self.imu_full_bias_weight if optimize_bias else 0.0}, "
+                f"pos_w={'covariance' if self.use_imu_full_covariance_weighting else self.imu_full_pos_weight}, "
+                f"vel_w={'covariance' if self.use_imu_full_covariance_weighting else self.imu_full_vel_weight}, "
+                f"bias_w={'sensor_random_walk' if (optimize_bias and self.use_imu_bias_random_walk) else (self.imu_full_bias_weight if optimize_bias else 0.0)}, "
                 f"state_dim={state_dim}, max_dt={self.imu_full_max_dt}, "
                 f"compose_order={self.imu_full_compose_order}, "
                 f"inverse_imu={self.imu_full_inverse}, "
@@ -2324,12 +2600,12 @@ class FactorGraph:
         return (*result, joint_info) if return_joint_info else result
 
     def _apply_joint_shared_bias_update(self, ba_result, joint_info, stage):
-        """Recover the shared-bias increment after one coupled 9D DBA step.
+        """Recover the shared-bias increment after one coupled DBA step.
 
-        CUDA receives the Schur-reduced pose/velocity system.  Once it returns
-        the matching state increment, back-substitution recovers the same
-        six-dimensional bias update that a monolithic ``[T, v, b]`` solve
-        would produce for this linearization.
+        CUDA receives the Schur-reduced 9D or 15D state system. Once it
+        returns the matching state increment, back-substitution recovers the
+        same six-dimensional global-bias update that a monolithic
+        ``[T, v, ba, bg, b_global]`` solve would produce for this linearization.
         """
 
         if joint_info is None:
@@ -2338,7 +2614,10 @@ class FactorGraph:
             return {"updated": 0.0, "reason": "missing_ba_increment"}
 
         dx = ba_result[0]
-        if not torch.is_tensor(dx) or dx.ndim != 2 or dx.shape[-1] < 9:
+        state_dim = int(joint_info.get("state_dim", 9))
+        if state_dim not in (9, 15):
+            return {"updated": 0.0, "reason": "invalid_joint_state_dim"}
+        if not torch.is_tensor(dx) or dx.ndim != 2 or dx.shape[-1] < state_dim:
             return {"updated": 0.0, "reason": "invalid_ba_increment"}
 
         state_locals = joint_info["state_locals"]
@@ -2348,7 +2627,9 @@ class FactorGraph:
         Hbb = joint_info["Hbb"]
         Hxb = joint_info["Hxb"]
         gb = joint_info["gb"]
-        dx_local = dx[state_locals, :9].to(device=Hbb.device, dtype=Hbb.dtype)
+        dx_local = dx[state_locals, :state_dim].to(
+            device=Hbb.device, dtype=Hbb.dtype
+        )
         rhs = gb - torch.einsum("aik,ai->k", Hxb, dx_local)
         try:
             step = torch.linalg.solve(Hbb, rhs) * self.imu_joint_bias_step_scale
@@ -2435,6 +2716,8 @@ class FactorGraph:
         result = {
             "updated": 1.0,
             "joint": 1.0,
+            "joint_state_dim": float(state_dim),
+            "joint_full_15dof": float(state_dim == 15),
             "edges": float(joint_info["edges"]),
             "duration_sec": float(joint_info["duration_sec"]),
             "rotation_excitation_deg": float(joint_info["rotation_excitation_deg"]),
@@ -2463,7 +2746,7 @@ class FactorGraph:
         if updates <= 3 or updates % 20 == 0:
             print(
                 "[VI-BIAS-JOINT] coupled shared block accepted "
-                f"stage={stage}, edges={int(result['edges'])}, "
+                f"stage={stage}, state_dim={state_dim}, edges={int(result['edges'])}, "
                 f"gain={improvement_value:.6g}, "
                 f"|dba|={result['accel_step_norm']:.6g}, "
                 f"|dbg|={result['gyro_step_norm']:.6g}, "
@@ -2519,7 +2802,7 @@ class FactorGraph:
         for outer_index in range(outer_iterations):
             joint_bias_info = None
             if self.use_full_imu_ba:
-                if self.use_joint_shared_bias_ba:
+                if self._joint_shared_bias_enabled():
                     (
                         pose_prior_H,
                         pose_prior_v,
@@ -3079,13 +3362,14 @@ class FactorGraph:
             motn,
             self.ii,
             self.jj,
-            return_imu_confidence=self.use_learned_imu_confidence,
+            return_imu_confidence=self.use_learned_imu_prediction,
             return_component_imu_confidence=self.use_component_imu_confidence,
             use_dvi_imu_confidence=self.use_dvi_imu_confidence,
             use_dvi_imu_quality_fusion=self.use_dvi_imu_quality_fusion,
+            use_learned_imu_precision=self.use_learned_imu_precision,
             imu_quality=self._edge_imu_quality(self.ii, self.jj),
         )
-        if self.use_learned_imu_confidence:
+        if self.use_learned_imu_prediction:
             self.net, delta, weight, damping, upmask, imu_edge_confidence = update_out
             self.last_imu_confidence, confidence_coverage = (
                 self._edge_confidence_to_frame_confidence(
@@ -3182,7 +3466,7 @@ class FactorGraph:
             )
             joint_bias_active = bool(
                 self.use_full_imu_ba
-                and self.use_joint_shared_bias_ba
+                and self._joint_shared_bias_enabled()
                 and self._joint_shared_bias_due()
                 and aligned_for_imu
             )
@@ -3342,8 +3626,11 @@ class FactorGraph:
                 # backend factor가 많을 때 메모리 절약 목적.
                 s = 8
                 edge_confidence = None
-                if self.use_learned_imu_confidence:
-                    confidence_channels = 3 if self.use_component_imu_confidence else 1
+                if self.use_learned_imu_prediction:
+                    confidence_channels = 3 if (
+                        self.use_component_imu_confidence
+                        or self.use_learned_imu_precision
+                    ) else 1
                     edge_confidence = torch.zeros(
                         (1, self.ii.numel(), confidence_channels),
                         device=self.device,
@@ -3388,13 +3675,14 @@ class FactorGraph:
                             motn[:, v],
                             iis,
                             jjs,
-                            return_imu_confidence=self.use_learned_imu_confidence,
+                            return_imu_confidence=self.use_learned_imu_prediction,
                             return_component_imu_confidence=self.use_component_imu_confidence,
                             use_dvi_imu_confidence=self.use_dvi_imu_confidence,
                             use_dvi_imu_quality_fusion=self.use_dvi_imu_quality_fusion,
+                            use_learned_imu_precision=self.use_learned_imu_precision,
                             imu_quality=self._edge_imu_quality(iis, jjs),
                         )
-                        if self.use_learned_imu_confidence:
+                        if self.use_learned_imu_prediction:
                             net, delta, weight, damping, upmask, imu_edge_confidence = update_out
                         else:
                             net, delta, weight, damping, upmask = update_out
@@ -3412,13 +3700,16 @@ class FactorGraph:
                     self.weight[:, v] = weight.float()
                     self.damping[torch.unique(iis)] = damping
 
-                    if self.use_learned_imu_confidence:
+                    if self.use_learned_imu_prediction:
                         pooled_confidence = imu_edge_confidence.float().mean(dim=(2, 3))
-                        if not self.use_component_imu_confidence:
+                        if not (
+                            self.use_component_imu_confidence
+                            or self.use_learned_imu_precision
+                        ):
                             pooled_confidence = pooled_confidence[..., :1]
                         edge_confidence[:, v] = pooled_confidence
 
-                if self.use_learned_imu_confidence:
+                if self.use_learned_imu_prediction:
                     self.last_imu_confidence, confidence_coverage = (
                         self._edge_confidence_to_frame_confidence(
                             edge_confidence, return_coverage=True
@@ -3475,7 +3766,7 @@ class FactorGraph:
                 )
                 joint_bias_active = bool(
                     self.use_full_imu_ba
-                    and self.use_joint_shared_bias_ba
+                    and self._joint_shared_bias_enabled()
                     and self._joint_shared_bias_due()
                     and aligned_for_imu
                 )

@@ -14,6 +14,7 @@ from align import align_pose_fragements
 from imu_runtime import (
     apply_learned_imu_ba_weight,
     configure_confidence_only_imu_weighting,
+    configure_learned_imu_precision_weighting,
 )
 
 from collections import OrderedDict
@@ -68,6 +69,7 @@ def backend_process(args, depth_video1, depth_video2, device="cuda"):
                     "[IMU] initialized scalar DVI IMU-quality fusion from "
                     "an older checkpoint; quality contribution is neutral"
                 )
+        configure_learned_imu_precision_weighting(args, source="async_backend")
         configure_confidence_only_imu_weighting(args, source="async_backend")
         apply_learned_imu_ba_weight(args, net, source="async_backend")
 
@@ -221,6 +223,9 @@ class DroidAsync:
                     "[IMU] initialized scalar DVI IMU-quality fusion from "
                     "an older checkpoint; quality contribution is neutral"
                 )
+        configure_learned_imu_precision_weighting(
+            self.args, source="async_frontend"
+        )
         configure_confidence_only_imu_weighting(
             self.args, source="async_frontend"
         )

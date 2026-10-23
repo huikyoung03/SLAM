@@ -16,6 +16,16 @@ from scipy.spatial.transform import Rotation, Slerp
 
 from .augmentation import RGBDAugmentor
 from .base import RGBDDataset, _copy_bias_jacobian_fields
+from .euroc_protocol import (
+    EUROC_CAM0_K,
+    EUROC_CAM0_P,
+    EUROC_DROID_IMAGE_SIZE,
+    rectified_imu_calibration,
+    rectified_t_body_cam,
+    strict_cam0_intrinsics,
+    strict_cam0_rectify_map,
+    strict_rectify_cam0,
+)
 
 
 def _read_yaml_vector(path, key):
@@ -150,6 +160,7 @@ class EuRoC(data.Dataset):
         euroc_keyframe_manifest_root=None,
         euroc_sequence_include=None,
         euroc_sequence_exclude=None,
+        euroc_original_protocol=False,
         placeholder_depth=1.0,
         **kwargs,
     ):
@@ -196,7 +207,13 @@ class EuRoC(data.Dataset):
             euroc_sequence_exclude,
             "euroc_sequence_exclude",
         )
+        self.euroc_original_protocol = bool(euroc_original_protocol)
         self.placeholder_depth = float(placeholder_depth)
+        # Runtime uses the original paper's 320x512 rectified input.  Training
+        # therefore emits that same geometry (augmentation may still apply a
+        # normal DROID colour/scale perturbation before its final crop).
+        if self.euroc_original_protocol:
+            crop_size = list(EUROC_DROID_IMAGE_SIZE)
         self.aug = RGBDAugmentor(crop_size=crop_size) if do_aug else None
 
         self.scenes = self._build_scenes()
@@ -222,6 +239,11 @@ class EuRoC(data.Dataset):
             print(
                 "[EuRoC DATA] using frozen DROID MotionFilter manifests from "
                 f"{self.euroc_keyframe_manifest_root}"
+            )
+        if self.euroc_original_protocol:
+            print(
+                "[EuRoC DATA] original DROID protocol: rectified cam0, "
+                "output crop=320x512, rectified camera/IMU coordinates"
             )
         if self.use_imu:
             gyro_source = (
@@ -344,6 +366,11 @@ class EuRoC(data.Dataset):
         body_pos, body_rot = _interpolate_body_poses(timestamps, gt_ts, gt_pos, gt_quat)
 
         T_body_cam = _read_yaml_matrix4(cam_yaml, "T_BS")
+        if self.euroc_original_protocol:
+            # The image rectification rotates the camera coordinate axes.  GT
+            # pose labels must use the same C' coordinate system as the image
+            # and the 15DoF IMU factor, not the raw cam0 one.
+            T_body_cam = rectified_t_body_cam(T_body_cam)
         poses_w2c = []
         for pos, rot in zip(body_pos, body_rot):
             T_world_body = np.eye(4, dtype=np.float64)
@@ -354,19 +381,26 @@ class EuRoC(data.Dataset):
             T_cam_world = np.linalg.inv(T_world_cam)
             poses_w2c.append(_matrix_to_se3_vec(T_cam_world))
 
-        intrinsics = _read_yaml_vector(cam_yaml, "intrinsics")
-        if intrinsics is None or intrinsics.size != 4:
+        raw_intrinsics = _read_yaml_vector(cam_yaml, "intrinsics")
+        if raw_intrinsics is None or raw_intrinsics.size != 4:
             raise ValueError(f"cam0 intrinsics not found in {cam_yaml}")
 
-        distortion = _read_yaml_vector(cam_yaml, "distortion_coefficients")
-        K = np.array(
-            [
-                [intrinsics[0], 0.0, intrinsics[2]],
-                [0.0, intrinsics[1], intrinsics[3]],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float64,
-        )
+        raw_distortion = _read_yaml_vector(cam_yaml, "distortion_coefficients")
+        if self.euroc_original_protocol:
+            intrinsics = strict_cam0_intrinsics((480, 752)).astype(np.float64)
+            distortion = None
+            K = EUROC_CAM0_K.copy()
+        else:
+            intrinsics = raw_intrinsics
+            distortion = raw_distortion
+            K = np.array(
+                [
+                    [intrinsics[0], 0.0, intrinsics[2]],
+                    [0.0, intrinsics[1], intrinsics[3]],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
 
         imu_priors = None
         if self.use_imu:
@@ -388,6 +422,8 @@ class EuRoC(data.Dataset):
             "intrinsics": np.tile(intrinsics.astype(np.float32)[None], (len(valid_rows), 1)),
             "K": K,
             "distortion": None if distortion is None else distortion.astype(np.float64),
+            "euroc_original_protocol": self.euroc_original_protocol,
+            "strict_rectify_map": None,
             "imu_priors": imu_priors,
             "imu_info_reference": RGBDDataset._estimate_imu_info_reference(imu_priors),
         }
@@ -493,6 +529,8 @@ class EuRoC(data.Dataset):
             cam_sensor_yaml=Path(cam_yaml),
             imu_sensor_yaml=Path(imu_yaml),
         )
+        if self.euroc_original_protocol:
+            calibration = rectified_imu_calibration(calibration)
         # Official EuRoC noise values from imu0/sensor.yaml are the default.
         # Training commands can intentionally substitute a target phone noise
         # model, but the override must affect the covariance/info fields rather
@@ -558,9 +596,16 @@ class EuRoC(data.Dataset):
         if image is None:
             raise FileNotFoundError(scene["images"][index])
 
-        distortion = scene["distortion"]
-        if distortion is not None and np.any(np.abs(distortion) > 0.0):
-            image = cv2.undistort(image, scene["K"], distortion, None, scene["K"])
+        if scene.get("euroc_original_protocol", False):
+            rectify_map = scene.get("strict_rectify_map")
+            if rectify_map is None:
+                rectify_map = strict_cam0_rectify_map(image.shape)
+                scene["strict_rectify_map"] = rectify_map
+            image = strict_rectify_cam0(image, rectify_map)
+        else:
+            distortion = scene["distortion"]
+            if distortion is not None and np.any(np.abs(distortion) > 0.0):
+                image = cv2.undistort(image, scene["K"], distortion, None, scene["K"])
 
         return image
 

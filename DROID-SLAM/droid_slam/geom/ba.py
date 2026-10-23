@@ -13,6 +13,7 @@ from .imu_factor import (
     quat_to_rotmat,
     quat_to_rotvec,
     rotvec_to_quat,
+    bias_random_walk_relative_sqrt_information,
     select_imu_bias_jacobian,
     skew_symmetric,
     so3_left_jacobian,
@@ -293,6 +294,96 @@ def _select_temporal_info_scale(
     return ratio.sqrt()
 
 
+def _select_temporal_full_covariance_scale(
+    imu_info,
+    imu_info_reference,
+    dst,
+    batch,
+    num_frames,
+    device,
+    dtype,
+    eps=1e-12,
+):
+    """Select calibrated p/v/R information in one rotation reference.
+
+    ``imu_info`` is ordered ``[rotation, velocity, position]``.  The legacy
+    path normalizes every component by its own median and then manually
+    suppresses position and velocity.  For the calibrated path we instead
+    divide *all* three components by the rotation-information reference.  It
+    therefore preserves the p/v/R ratio supplied by preintegration while
+    remaining dimensionless relative to DROID's visual normal equations.
+
+    The boolean return identifies edges for which this physical comparison is
+    available.  Callers must retain the legacy row weighting on invalid edges,
+    matching the runtime FactorGraph fallback rather than accidentally giving
+    a malformed interval full strength.
+    """
+
+    ones = torch.ones((batch, dst.numel(), 3), device=device, dtype=dtype)
+    invalid = torch.zeros((batch, dst.numel()), device=device, dtype=torch.bool)
+    if imu_info is None or imu_info_reference is None:
+        return ones, invalid
+
+    info = imu_info.to(device=device, dtype=dtype)
+    if info.ndim == 2:
+        if info.shape[0] < num_frames or info.shape[-1] < 3:
+            raise ValueError(
+                "imu_info must have shape [N, >=3] or [B, N, >=3], "
+                f"got {tuple(imu_info.shape)} for frames={num_frames}"
+            )
+        selected = info[dst, :3][None].expand(batch, -1, -1)
+    elif info.ndim == 3:
+        if info.shape[0] == 1 and batch > 1:
+            info = info.expand(batch, -1, -1)
+        if info.shape[0] != batch or info.shape[1] < num_frames or info.shape[-1] < 3:
+            raise ValueError(
+                "imu_info must have shape [N, >=3] or [B, N, >=3], "
+                f"got {tuple(imu_info.shape)} for batch={batch}, frames={num_frames}"
+            )
+        selected = info[:, dst, :3]
+    else:
+        raise ValueError(
+            "imu_info must be [N, >=3] or [B, N, >=3], "
+            f"got {tuple(imu_info.shape)}"
+        )
+
+    if torch.is_tensor(imu_info_reference):
+        reference = imu_info_reference.to(device=device, dtype=dtype)
+    else:
+        reference = torch.as_tensor(imu_info_reference, device=device, dtype=dtype)
+    if reference.ndim == 1:
+        if reference.numel() < 3:
+            raise ValueError("imu_info_reference must contain [rot, vel, pos] information")
+        reference = reference[:3].view(1, 3).expand(batch, -1)
+    elif reference.ndim == 2:
+        if reference.shape[-1] < 3:
+            raise ValueError("imu_info_reference must contain [rot, vel, pos] information")
+        reference = reference[:, :3]
+        if reference.shape[0] == 1 and batch > 1:
+            reference = reference.expand(batch, -1)
+        if reference.shape[0] != batch:
+            raise ValueError(
+                "imu_info_reference batch dimension must match IMU batch, "
+                f"got {tuple(reference.shape)} for batch={batch}"
+            )
+    else:
+        raise ValueError(
+            "imu_info_reference must have shape [3] or [B, 3], "
+            f"got {tuple(reference.shape)}"
+        )
+
+    rotation_reference = reference[:, 0:1]
+    valid = (
+        torch.isfinite(selected).all(dim=-1)
+        & (selected > float(eps)).all(dim=-1)
+        & torch.isfinite(rotation_reference).expand(-1, dst.numel())
+        & (rotation_reference > float(eps)).expand(-1, dst.numel())
+    )
+    ratio = selected / rotation_reference[:, None, :].clamp_min(float(eps))
+    scale = ratio.clamp_min(0.0).sqrt()
+    return torch.where(valid[..., None], scale, ones), valid
+
+
 def _global_factor_weight(factor_weight, batch, device, dtype):
     if torch.is_tensor(factor_weight):
         global_weight = factor_weight.to(device=device, dtype=dtype)
@@ -499,7 +590,11 @@ def _build_full_imu_system(
     use_imu_info_weighting=False,
     imu_info_weight_clip=4.0,
     imu_info_weight_eps=1e-12,
+    use_imu_full_covariance_weighting=False,
+    use_learned_imu_precision=False,
     imu_optimize_bias=True,
+    use_imu_bias_random_walk=False,
+    imu_bias_random_walk=None,
 ):
     """Build first-order full IMU normal-equation blocks.
 
@@ -753,17 +848,41 @@ def _build_full_imu_system(
     vel_weight = scalar_weight(vel_weight, "vel_weight")
     rot_weight = scalar_weight(rot_weight, "rot_weight")
     bias_weight = scalar_weight(bias_weight, "bias_weight")
-    base_weight_terms = [
+    use_imu_bias_random_walk = bool(use_imu_bias_random_walk)
+    use_imu_full_covariance_weighting = bool(use_imu_full_covariance_weighting)
+    legacy_base_weight_terms = [
         pos_weight.expand(3),
         vel_weight.expand(3),
         rot_weight.expand(3),
     ]
+    # The calibrated path preserves p/v/R covariance ratios through
+    # ``_select_temporal_full_covariance_scale`` below.  Retaining 0.05 here
+    # would silently restore the historical manual translation suppression.
+    if use_imu_full_covariance_weighting:
+        base_weight_terms = [
+            torch.ones_like(pos_weight).expand(3),
+            torch.ones_like(vel_weight).expand(3),
+            torch.ones_like(rot_weight).expand(3),
+        ]
+    else:
+        base_weight_terms = list(legacy_base_weight_terms)
     if imu_optimize_bias:
-        base_weight_terms.extend([bias_weight.expand(3), bias_weight.expand(3)])
+        # Match FactorGraph runtime semantics: a calibrated random-walk prior
+        # replaces rather than multiplies the historical scalar 0.001 weight.
+        if use_imu_bias_random_walk:
+            bias_terms = [
+                torch.ones_like(bias_weight).expand(3),
+                torch.ones_like(bias_weight).expand(3),
+            ]
+        else:
+            bias_terms = [bias_weight.expand(3), bias_weight.expand(3)]
+        base_weight_terms.extend(bias_terms)
+        legacy_base_weight_terms.extend(bias_terms)
     base_scale = torch.cat(base_weight_terms).clamp_min(0.0).sqrt()
+    legacy_base_scale = torch.cat(legacy_base_weight_terms).clamp_min(0.0).sqrt()
 
     if use_imu_info_weighting:
-        info_scale = _select_temporal_info_scale(
+        legacy_info_scale = _select_temporal_info_scale(
             imu_info,
             imu_info_reference,
             dst,
@@ -774,10 +893,10 @@ def _build_full_imu_system(
             clip=imu_info_weight_clip,
             eps=imu_info_weight_eps,
         )
-        rot_scale = info_scale[:, :, 0:1]
-        vel_scale = info_scale[:, :, 1:2]
-        pos_scale = info_scale[:, :, 2:3]
-        residual_info_scale = torch.cat(
+        rot_scale = legacy_info_scale[:, :, 0:1]
+        vel_scale = legacy_info_scale[:, :, 1:2]
+        pos_scale = legacy_info_scale[:, :, 2:3]
+        legacy_residual_info_scale = torch.cat(
             [
                 pos_scale.expand(-1, -1, 3),
                 vel_scale.expand(-1, -1, 3),
@@ -791,16 +910,134 @@ def _build_full_imu_system(
             dim=-1,
         )
     else:
-        residual_info_scale = pose_data.new_ones((B, edge_count, residual_dim))
+        legacy_residual_info_scale = pose_data.new_ones((B, edge_count, residual_dim))
+
+    if use_imu_full_covariance_weighting:
+        covariance_info_scale, covariance_available = (
+            _select_temporal_full_covariance_scale(
+                imu_info,
+                imu_info_reference,
+                dst,
+                B,
+                num_frames,
+                pose_data.device,
+                pose_data.dtype,
+                eps=imu_info_weight_eps,
+            )
+        )
+        covariance_residual_scale = torch.cat(
+            [
+                covariance_info_scale[:, :, 2:3].expand(-1, -1, 3),
+                covariance_info_scale[:, :, 1:2].expand(-1, -1, 3),
+                covariance_info_scale[:, :, 0:1].expand(-1, -1, 3),
+                torch.ones(
+                    (B, edge_count, 6 if imu_optimize_bias else 0),
+                    device=pose_data.device,
+                    dtype=pose_data.dtype,
+                ),
+            ],
+            dim=-1,
+        )
+        residual_info_scale = torch.where(
+            covariance_available[..., None],
+            covariance_residual_scale,
+            legacy_residual_info_scale,
+        )
+        edge_base_scale = (
+            base_scale.view(1, 1, residual_dim).expand(B, edge_count, -1)
+            if use_learned_imu_precision
+            else torch.where(
+                covariance_available[..., None],
+                base_scale.view(1, 1, residual_dim),
+                legacy_base_scale.view(1, 1, residual_dim),
+            )
+        )
+    else:
+        residual_info_scale = legacy_residual_info_scale
+        edge_base_scale = base_scale.view(1, 1, residual_dim)
+
+    bias_rw_scale = None
+    if use_imu_bias_random_walk and imu_optimize_bias:
+        if imu_bias_random_walk is None or imu_info_reference is None:
+            # Preserve backward-compatible training behavior for samples which
+            # do not carry calibrated sensor metadata.  The CLI rejects this
+            # configuration for the EuRoC learned experiment; this fallback
+            # keeps generic legacy datasets loadable.
+            bias_rw_scale = torch.full(
+                (B, edge_count, 6),
+                float(torch.sqrt(bias_weight.clamp_min(0.0)).detach().item()),
+                device=pose_data.device,
+                dtype=pose_data.dtype,
+            )
+        else:
+            reference = imu_info_reference.to(
+                device=pose_data.device,
+                dtype=pose_data.dtype,
+            )
+            if reference.ndim == 1:
+                if reference.numel() < 1:
+                    raise ValueError("imu_info_reference must include rotation information")
+                reference = reference[0].reshape(1, 1)
+            elif reference.ndim == 2:
+                if reference.shape[-1] < 1:
+                    raise ValueError("imu_info_reference must include rotation information")
+                reference = reference[:, 0:1]
+            else:
+                raise ValueError(
+                    "imu_info_reference must be [3] or [B, 3] for bias random walk"
+                )
+            if reference.shape[0] == 1 and B > 1:
+                reference = reference.expand(B, -1)
+            if reference.shape[0] != B:
+                raise ValueError(
+                    "imu_info_reference batch must match poses for bias random walk"
+                )
+
+            random_walk = torch.as_tensor(
+                imu_bias_random_walk,
+                device=pose_data.device,
+                dtype=pose_data.dtype,
+            )
+            if random_walk.ndim == 1:
+                random_walk = random_walk.view(1, 1, -1)
+            elif random_walk.ndim == 2:
+                if random_walk.shape[-1] != 2:
+                    raise ValueError("imu_bias_random_walk must end in two densities")
+                random_walk = random_walk[:, None, :]
+            if random_walk.shape[-1] < 2:
+                raise ValueError("imu_bias_random_walk must end in [accel, gyro]")
+            if random_walk.shape[0] == 1 and B > 1:
+                random_walk = random_walk.expand(B, -1, -1)
+            if random_walk.shape[0] != B:
+                raise ValueError("imu_bias_random_walk batch must match poses")
+
+            candidate_scale, candidate_valid = (
+                bias_random_walk_relative_sqrt_information(
+                    random_walk,
+                    dt,
+                    reference,
+                    eps=imu_info_weight_eps,
+                )
+            )
+            legacy_scale = torch.sqrt(bias_weight.clamp_min(0.0))
+            bias_rw_scale = torch.where(
+                candidate_valid[..., None],
+                candidate_scale,
+                legacy_scale,
+            )
 
     # Channel order is [rotation, velocity, position], while the factor rows
-    # are [position, velocity, rotation, accel-bias, gyro-bias].  Multiplying
-    # residual and Jacobian by sqrt(confidence) yields the standard weighted
-    # least-squares / Mahalanobis normal equations without ad-hoc H scaling.
+    # are [position, velocity, rotation, accel-bias, gyro-bias]. Direct
+    # precision is a full positive inverse-variance multiplier; legacy
+    # confidence remains a probability and is therefore capped at one.
     rot_confidence = confidence[:, :, 0:1]
     vel_confidence = confidence[:, :, 1:2]
     pos_confidence = confidence[:, :, 2:3]
-    bias_confidence = confidence.mean(dim=-1, keepdim=True)
+    bias_confidence = (
+        torch.ones_like(rot_confidence)
+        if use_learned_imu_precision
+        else confidence.mean(dim=-1, keepdim=True)
+    )
     confidence_scale = torch.cat(
         [
             pos_confidence.expand(-1, -1, 3),
@@ -809,9 +1046,16 @@ def _build_full_imu_system(
             bias_confidence.expand(-1, -1, 6 if imu_optimize_bias else 0),
         ],
         dim=-1,
-    ).clamp(0.0, 1.0).sqrt()
+    )
+    confidence_scale = (
+        confidence_scale.clamp_min(1e-12).sqrt()
+        if use_learned_imu_precision
+        else confidence_scale.clamp(0.0, 1.0).sqrt()
+    )
 
-    scale = base_scale.view(1, 1, residual_dim) * residual_info_scale * confidence_scale
+    scale = edge_base_scale * residual_info_scale * confidence_scale
+    if bias_rw_scale is not None:
+        scale[:, :, 9:15] = scale[:, :, 9:15] * bias_rw_scale
     residual = residual * scale
     Ji = Ji * scale.unsqueeze(-1)
     Jj = Jj * scale.unsqueeze(-1)
@@ -941,7 +1185,11 @@ def BA(
     use_imu_info_weighting=False,
     imu_info_weight_clip=4.0,
     imu_info_weight_eps=1e-12,
+    use_imu_full_covariance_weighting=False,
+    use_learned_imu_precision=False,
     imu_optimize_bias=True,
+    use_imu_bias_random_walk=False,
+    imu_bias_random_walk=None,
 ):
     """ Full Bundle Adjustment """
 
@@ -1042,7 +1290,11 @@ def BA(
             use_imu_info_weighting=use_imu_info_weighting,
             imu_info_weight_clip=imu_info_weight_clip,
             imu_info_weight_eps=imu_info_weight_eps,
+            use_imu_full_covariance_weighting=use_imu_full_covariance_weighting,
+            use_learned_imu_precision=use_learned_imu_precision,
             imu_optimize_bias=imu_optimize_bias,
+            use_imu_bias_random_walk=use_imu_bias_random_walk,
+            imu_bias_random_walk=imu_bias_random_walk,
         )
         if H_imu is not None and v_imu is not None:
             H = H + H_imu

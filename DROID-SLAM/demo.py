@@ -58,6 +58,21 @@ try:
 except ImportError:
     from droid_slam.imu_prior import load_imu_prior_csv
 
+try:
+    from data_readers.euroc_protocol import (
+        EUROC_DROID_IMAGE_SIZE,
+        strict_cam0_intrinsics,
+        strict_cam0_rectify_map,
+        strict_rectify_cam0,
+    )
+except ImportError:
+    from droid_slam.data_readers.euroc_protocol import (
+        EUROC_DROID_IMAGE_SIZE,
+        strict_cam0_intrinsics,
+        strict_cam0_rectify_map,
+        strict_rectify_cam0,
+    )
+
 import torch.nn.functional as F
 
 
@@ -583,7 +598,14 @@ def maybe_build_imu_prior_from_raw(args):
     return output
 
 
-def image_stream(imagedir, calib, stride, max_frames=None, frame_records=None):
+def image_stream(
+    imagedir,
+    calib,
+    stride,
+    max_frames=None,
+    frame_records=None,
+    euroc_original_protocol=False,
+):
     """
     image generator
 
@@ -645,6 +667,12 @@ def image_stream(imagedir, calib, stride, max_frames=None, frame_records=None):
 
     # principal point y
     K[1, 2] = cy
+
+    # The original EuRoC benchmark evaluates rectified images at 320x512,
+    # rather than the generic demo's adaptive-area resize.  Keep this as an
+    # explicit opt-in profile because its camera coordinate frame also fixes
+    # the IMU prior/calibration contract.
+    strict_rectify_map = None
 
     ############################################################
     # 3. 이미지 목록 구성
@@ -729,7 +757,12 @@ def image_stream(imagedir, calib, stride, max_frames=None, frame_records=None):
         #
         # 주의:
         #   distortion 모델과 calib 형식이 OpenCV가 기대하는 형식과 맞아야 한다.
-        if len(calib) > 4:
+        if euroc_original_protocol:
+            if strict_rectify_map is None:
+                strict_rectify_map = strict_cam0_rectify_map(image.shape)
+            image = strict_rectify_cam0(image, strict_rectify_map)
+            fx, fy, cx, cy = strict_cam0_intrinsics((480, 752)).tolist()
+        elif len(calib) > 4:
             image = cv2.undistort(image, K, calib[4:])
 
         ########################################################
@@ -750,8 +783,11 @@ def image_stream(imagedir, calib, stride, max_frames=None, frame_records=None):
         # scale = sqrt((384*512) / (h0*w0))
         # h1 = h0 * scale
         # w1 = w0 * scale
-        h1 = int(h0 * np.sqrt((384 * 512) / (h0 * w0)))
-        w1 = int(w0 * np.sqrt((384 * 512) / (h0 * w0)))
+        if euroc_original_protocol:
+            h1, w1 = EUROC_DROID_IMAGE_SIZE
+        else:
+            h1 = int(h0 * np.sqrt((384 * 512) / (h0 * w0)))
+            w1 = int(w0 * np.sqrt((384 * 512) / (h0 * w0)))
 
         ########################################################
         # 4-4. 이미지 resize
@@ -795,6 +831,45 @@ def image_stream(imagedir, calib, stride, max_frames=None, frame_records=None):
         # image[None]을 하는 이유:
         #   batch/frame dimension을 추가해서 [1, 3, H, W] 형태로 만들기 위함
         yield t, image[None], intrinsics
+
+
+def apply_euroc_original_protocol(args):
+    """Apply the fixed visual settings from DROID's published EuRoC evaluator.
+
+    This is a named reproducibility profile, not an optimizer or an ATE-tuning
+    switch.  It deliberately overwrites the generic-demo defaults so a run
+    cannot accidentally compare adaptive 384-area images or changed frontend
+    thresholds against the paper's 320x512 visual baseline.
+    """
+
+    if not getattr(args, "euroc_original_protocol", False):
+        return
+
+    args.stride = 2
+    args.trajectory_fill_stride = 1
+    # Manifest-only mode bypasses the frontend/backend on purpose, so it also
+    # bypasses the normal keyframe retirement that keeps an online DROID run
+    # inside its 512-slot video buffer.  Its larger buffer is storage only:
+    # MotionFilter's visual decision is unchanged.  Real baseline/learned
+    # executions always receive the published 512-slot setting below.
+    if not getattr(args, "motion_filter_manifest_only", False):
+        args.buffer = 512
+    args.image_size = list(EUROC_DROID_IMAGE_SIZE)
+    args.filter_thresh = 2.4
+    args.warmup = 15
+    args.keyframe_thresh = 3.0
+    args.frontend_thresh = 17.5
+    args.frontend_window = 20
+    args.frontend_radius = 2
+    args.frontend_nms = 1
+    args.backend_thresh = 24.0
+    args.backend_radius = 2
+    args.backend_nms = 2
+    print(
+        "[EuRoC ORIGINAL PROTOCOL] rectified_cam0=752x480->320x512, "
+        f"track_stride=2, fill_stride=1, buffer={args.buffer}, filter=2.4, warmup=15, "
+        "keyframe=3.0, frontend=(17.5,20,2,1), backend=(24.0,2,2)"
+    )
 
 
 def write_motion_filter_manifest(path, selected_rows):
@@ -860,6 +935,13 @@ def _reconstruction_input_provenance(args):
     calibration = Path(getattr(args, "calib", "")).expanduser().resolve()
     stride = max(1, int(getattr(args, "stride", 1) or 1))
     max_frames = max(0, int(getattr(args, "max_frames", 0) or 0))
+    euroc_original_protocol = bool(
+        getattr(args, "euroc_original_protocol", False)
+    )
+    local_tracking_only = bool(
+        getattr(args, "local_tracking_only", False)
+    )
+    local_vio_only = bool(getattr(args, "local_vio_only", False))
     frame_records = getattr(args, "frame_records", None)
     frame_manifest_path = getattr(args, "imu_frame_manifest_path", None)
 
@@ -896,6 +978,8 @@ def _reconstruction_input_provenance(args):
     manifest.update(b"\0")
     manifest.update(str(max_frames).encode("ascii"))
     manifest.update(b"\0")
+    manifest.update(str(int(euroc_original_protocol)).encode("ascii"))
+    manifest.update(b"\0")
     for original_index, name in selected:
         manifest.update(f"{original_index}:{name}\n".encode("utf-8", "surrogateescape"))
 
@@ -918,6 +1002,14 @@ def _reconstruction_input_provenance(args):
         "calibration_sha256": _sha256_file(calibration),
         "stride": stride,
         "max_frames": max_frames,
+        "euroc_original_protocol": euroc_original_protocol,
+        # A local-only reconstruction deliberately stops before DROID's
+        # termination-time backend and PoseTrajectoryFiller. Persist this so
+        # it cannot later be mistaken for a paper-facing dense SLAM result.
+        "local_tracking_only": local_tracking_only,
+        # This mode produces a dense trajectory but intentionally skips every
+        # termination-time global backend pass.
+        "local_vio_only": local_vio_only,
         "selected_image_count": len(selected),
         "first_selected_image": (
             f"{selected[0][0]}:{selected[0][1]}" if selected else None
@@ -944,7 +1036,13 @@ def _reconstruction_input_provenance(args):
     }
 
 
-def save_reconstruction(droid, save_path, dense_tstamps=None, dense_poses=None):
+def save_reconstruction(
+    droid,
+    save_path,
+    dense_tstamps=None,
+    dense_poses=None,
+    dense_protocol=None,
+):
     """
     DROID-SLAM 결과를 .pth 파일로 저장하는 함수.
 
@@ -965,10 +1063,15 @@ def save_reconstruction(droid, save_path, dense_tstamps=None, dense_poses=None):
             frame별 camera intrinsics
 
         dense_tstamps, dense_poses:
-            ``Droid.terminate()``가 PoseTrajectoryFiller로 완성한 모든
-            입력 frame의 trajectory. ``video``에는 MotionFilter가 남긴
-            keyframe만 있으므로, DVI-style 전체 입력 시간축 평가는 이
-            dense trajectory를 사용해야 한다.
+            ``Droid.terminate()`` 또는 ``Droid.terminate_local()``가
+            PoseTrajectoryFiller로 완성한 trajectory.
+            ``video``에는 MotionFilter가 남긴 keyframe만 있으므로, 전체
+            camera 시간축 평가는 이 dense trajectory를 사용해야 한다.
+
+        dense_protocol:
+            Dense trajectory를 만들 때의 tracking/filling stride와 frame
+            수를 기록한다. 이전 10 Hz reconstruction을 실수로 20 Hz
+            paper-protocol 평가에 재사용하지 않기 위한 재현성 메타데이터다.
 
     입력:
         droid:
@@ -1141,6 +1244,10 @@ def save_reconstruction(droid, save_path, dense_tstamps=None, dense_poses=None):
                 "dense_pose_format": "camera_c2w_wxyz",
             }
         )
+        if dense_protocol is not None:
+            if not isinstance(dense_protocol, dict):
+                raise TypeError("dense_protocol must be a dictionary when supplied")
+            save_data["dense_protocol"] = dict(dense_protocol)
 
     ############################################################
     # 4. torch save
@@ -1168,7 +1275,33 @@ if __name__ == '__main__':
 
     # frame stride
     # 예: 3이면 전체 이미지 중 3개마다 하나씩 사용
-    parser.add_argument("--stride", default=3, type=int, help="frame stride")
+    parser.add_argument("--stride", default=3, type=int, help="tracking frame stride")
+    parser.add_argument(
+        "--trajectory_fill_stride",
+        default=1,
+        type=int,
+        help=(
+            "frame stride used by PoseTrajectoryFiller after local or global BA; "
+            "use 1 to recover the full raw camera timeline while tracking with --stride 2"
+        ),
+    )
+    parser.add_argument(
+        "--local_tracking_only",
+        action="store_true",
+        help=(
+            "diagnostic local-VO/VIO export: save only online "
+            "MotionFilter-selected keyframe states; skip every termination-time "
+            "global backend pass and PoseTrajectoryFiller"
+        ),
+    )
+    parser.add_argument(
+        "--local_vio_only",
+        action="store_true",
+        help=(
+            "local VO/VIO evaluation export: skip termination-time global BA, "
+            "but fill non-keyframe poses from the online local-BA state"
+        ),
+    )
     parser.add_argument("--max_frames", default=0, type=int, help="maximum number of selected frames to process")
 
     ############################################################
@@ -1184,6 +1317,16 @@ if __name__ == '__main__':
     # 초기 image size
     # 실제 실행 중 첫 이미지 크기로 다시 설정됨
     parser.add_argument("--image_size", default=[240, 320])
+
+    parser.add_argument(
+        "--euroc_original_protocol",
+        action="store_true",
+        help=(
+            "use the original DROID EuRoC visual protocol exactly: fixed cam0 "
+            "rectification, 320x512 input, track stride 2, dense fill stride 1, "
+            "and the published frontend/backend settings"
+        ),
+    )
 
     # visualization 비활성화 옵션
     parser.add_argument("--disable_vis", action="store_true")
@@ -1422,6 +1565,24 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
+        "--imu_two_stage_visual_steps",
+        type=int,
+        default=3,
+        help=(
+            "visual pose/depth-only local DBA updates before each two-stage "
+            "15DoF update; default preserves the published experiment path"
+        ),
+    )
+    parser.add_argument(
+        "--imu_two_stage_full_steps",
+        type=int,
+        default=2,
+        help=(
+            "joint 15DoF local DBA updates after VI alignment in each "
+            "two-stage frontend update; default preserves the experiment path"
+        ),
+    )
+    parser.add_argument(
         "--imu_two_stage_global_steps",
         type=int,
         default=12,
@@ -1460,6 +1621,24 @@ if __name__ == '__main__':
     parser.add_argument("--imu_full_pos_weight", type=float, default=0.05, help="position residual weight inside full IMU DBA prior")
     parser.add_argument("--imu_full_vel_weight", type=float, default=0.05, help="velocity residual weight inside full IMU DBA prior")
     parser.add_argument("--imu_full_bias_weight", type=float, default=0.001, help="bias smoothness residual weight inside full IMU DBA prior")
+    parser.add_argument(
+        "--use_imu_bias_random_walk",
+        action="store_true",
+        help=(
+            "replace the fixed 15DoF local-bias transition coefficient with "
+            "per-edge sensor random-walk covariance, normalized to calibrated "
+            "rotation information; requires --use_imu_noise_model"
+        ),
+    )
+    parser.add_argument(
+        "--use_imu_full_covariance_weighting",
+        action="store_true",
+        help=(
+            "use calibrated diagonal preintegration information to preserve "
+            "the p/v/R cross-block covariance ratio; replaces the historical "
+            "0.05 position/velocity DBA weights and requires --use_imu_noise_model"
+        ),
+    )
     parser.add_argument("--imu_full_compose_order", type=str, default="dq_prev", choices=["prev_dq", "dq_prev"], help="quaternion compose order for full IMU BA")
     parser.add_argument("--imu_full_inverse", dest="imu_full_inverse", action="store_true", default=True, help="invert IMU delta rotation before full IMU BA")
     parser.add_argument("--no_imu_full_inverse", dest="imu_full_inverse", action="store_false", help="do not invert IMU delta rotation before full IMU BA")
@@ -1608,6 +1787,15 @@ if __name__ == '__main__':
             "9DoF DBA window through Schur elimination"
         ),
     )
+    parser.add_argument(
+        "--use_joint_shared_bias_15dof",
+        action="store_true",
+        help=(
+            "two-stage 15DoF only: jointly eliminate/recover one shared "
+            "6D accel/gyro bias block inside the final full-sequence global "
+            "DBA, coupled to pose, velocity, and local bias states"
+        ),
+    )
     parser.add_argument("--imu_joint_bias_interval", type=int, default=10, help="keyframe interval between coupled shared-bias DBA updates")
     parser.add_argument("--imu_joint_bias_window", type=int, default=30, help="recent keyframes coupled to one shared 6D bias block")
     parser.add_argument("--imu_joint_bias_damping", type=float, default=1e-4, help="damping added to the shared-bias normal block")
@@ -1635,6 +1823,33 @@ if __name__ == '__main__':
             "shared accel/gyro bias block across the full sequence and rerun "
             "a short 15DoF backend pass"
         ),
+    )
+    parser.add_argument(
+        "--use_online_global_bias_15dof_refinement",
+        action="store_true",
+        help=(
+            "during local two-stage 15DoF tracking, periodically solve one "
+            "observability-checked shared accel/gyro bias block over the recent "
+            "active keyframes, then rerun local 15DoF DBA"
+        ),
+    )
+    parser.add_argument(
+        "--imu_online_global_bias_refine_interval",
+        type=int,
+        default=20,
+        help="selected-keyframe interval between online shared 15DoF bias attempts",
+    )
+    parser.add_argument(
+        "--imu_online_global_bias_refine_window",
+        type=int,
+        default=30,
+        help="recent selected-keyframe window used by each online shared 15DoF bias solve",
+    )
+    parser.add_argument(
+        "--imu_online_global_bias_refine_post_iterations",
+        type=int,
+        default=1,
+        help="local full-15DoF DBA iterations after an accepted online shared-bias update",
     )
     parser.add_argument(
         "--imu_global_bias_refine_post_steps",
@@ -1715,6 +1930,14 @@ if __name__ == '__main__':
         help="scale IMU residual/prior strength with the GRU IMU confidence head",
     )
     parser.add_argument(
+        "--use_learned_imu_precision",
+        action="store_true",
+        help=(
+            "learn covariance-relative GRU+IMU-quality R/v/p IMU attenuation; "
+            "uses no global IMU lambda or fixed R/v/p compatibility weights"
+        ),
+    )
+    parser.add_argument(
         "--use_component_imu_confidence",
         action="store_true",
         help=(
@@ -1767,6 +1990,8 @@ if __name__ == '__main__':
     # 7. 추가 설정
     ############################################################
 
+    apply_euroc_original_protocol(args)
+
     # demo.py는 monocular 입력을 기준으로 사용
     args.stereo = False
 
@@ -1818,9 +2043,42 @@ if __name__ == '__main__':
         args.imu_full_frontend = True
         args.use_imu_ba_prior = True
         args.use_vi_initialization = True
+        if args.imu_two_stage_visual_steps < 0:
+            raise ValueError("--imu_two_stage_visual_steps must be non-negative")
+        if args.imu_two_stage_full_steps < 0:
+            raise ValueError("--imu_two_stage_full_steps must be non-negative")
         print(
             "[IMU] two-stage mode: local pose-only -> full 15DoF; "
-            "one global full-state backend pass."
+            "one global full-state backend pass; "
+            f"local_steps=visual:{args.imu_two_stage_visual_steps},"
+            f"full:{args.imu_two_stage_full_steps}."
+        )
+        if args.imu_two_stage_full_steps == 0:
+            print(
+                "[IMU] local full 15DoF updates are disabled: keep online "
+                "tracking visual-only and estimate velocity/local bias only "
+                "in the final global 15DoF backend pass."
+            )
+
+    if args.use_joint_shared_bias_15dof:
+        if not args.use_two_stage_imu_ba:
+            raise ValueError(
+                "--use_joint_shared_bias_15dof requires --use_two_stage_imu_ba "
+                "so the final backend owns 15DoF local bias states."
+            )
+        if args.use_joint_shared_bias_ba:
+            raise ValueError(
+                "Choose --use_joint_shared_bias_15dof or the legacy 9DoF "
+                "--use_joint_shared_bias_ba, not both."
+            )
+        if args.use_global_bias_15dof_refinement:
+            raise ValueError(
+                "--use_joint_shared_bias_15dof replaces the post-hoc "
+                "--use_global_bias_15dof_refinement path; do not enable both."
+            )
+        print(
+            "[IMU] final global joint shared-bias 15DoF DBA enabled: "
+            "shared 6D bias is Schur-coupled to the full pose/velocity/local-bias state."
         )
 
     if args.use_global_bias_15dof_refinement:
@@ -1864,6 +2122,32 @@ if __name__ == '__main__':
                 "injected only at termination; use --imu_local_bias_prior_weight "
                 "for an explicit, consistently applied regularizer."
             )
+
+    if args.use_online_global_bias_15dof_refinement:
+        if not args.use_two_stage_imu_ba:
+            raise ValueError(
+                "--use_online_global_bias_15dof_refinement requires "
+                "--use_two_stage_imu_ba so the local state contains per-keyframe "
+                "velocity and bias corrections."
+            )
+        if args.imu_online_global_bias_refine_interval < 1:
+            raise ValueError(
+                "--imu_online_global_bias_refine_interval must be at least one."
+            )
+        if args.imu_online_global_bias_refine_window < 2:
+            raise ValueError(
+                "--imu_online_global_bias_refine_window must be at least two."
+            )
+        if args.imu_online_global_bias_refine_post_iterations < 1:
+            raise ValueError(
+                "--imu_online_global_bias_refine_post_iterations must be at least one."
+            )
+        print(
+            "[IMU] online shared global-bias 15DoF block enabled: "
+            f"interval={args.imu_online_global_bias_refine_interval}, "
+            f"window={args.imu_online_global_bias_refine_window}, "
+            f"post_iterations={args.imu_online_global_bias_refine_post_iterations}"
+        )
 
     if args.use_pose_velocity_imu_ba:
         args.use_full_imu_ba = True
@@ -1982,6 +2266,40 @@ if __name__ == '__main__':
         raise ValueError("--use_learned_imu_residual_weights requires --use_full_imu_ba")
     if args.use_imu_noise_model and not args.use_full_imu_ba:
         raise ValueError("--use_imu_noise_model requires --use_full_imu_ba")
+    if args.use_imu_bias_random_walk:
+        if not args.use_full_imu_ba:
+            raise ValueError(
+                "--use_imu_bias_random_walk requires --use_full_imu_ba "
+                "with the 15DoF local bias state."
+            )
+        if not args.use_imu_noise_model:
+            raise ValueError(
+                "--use_imu_bias_random_walk requires --use_imu_noise_model "
+                "so its rotation-information reference is calibrated."
+            )
+        if args.use_pose_velocity_imu_ba:
+            raise ValueError(
+                "--use_imu_bias_random_walk is a 15DoF local-bias factor and "
+                "cannot be used with --use_pose_velocity_imu_ba."
+            )
+        print(
+            "[IMU] local bias transitions use sensor random-walk covariance; "
+            "the legacy --imu_full_bias_weight is disabled for valid IMU rows."
+        )
+    if args.use_imu_full_covariance_weighting:
+        if not args.use_full_imu_ba:
+            raise ValueError(
+                "--use_imu_full_covariance_weighting requires --use_full_imu_ba."
+            )
+        if not args.use_imu_noise_model:
+            raise ValueError(
+                "--use_imu_full_covariance_weighting requires --use_imu_noise_model "
+                "and a calibrated --imu_info_reference."
+            )
+        print(
+            "[IMU] full p/v/R covariance-relative weighting enabled; historical "
+            "--imu_full_pos_weight/--imu_full_vel_weight are disabled on valid rows."
+        )
 
     # multiprocessing 시작 방식을 spawn으로 설정
     # CUDA + multiprocessing 환경에서 안전하게 process를 만들기 위해 사용
@@ -2096,6 +2414,30 @@ if __name__ == '__main__':
             "so skipped IMU rows can be composed between selected frames."
         )
 
+    if args.trajectory_fill_stride < 1:
+        raise ValueError("--trajectory_fill_stride must be a positive integer")
+    if args.local_tracking_only and args.local_vio_only:
+        raise ValueError(
+            "choose only one of --local_tracking_only and --local_vio_only"
+        )
+    if args.local_tracking_only:
+        print(
+            "[TRAJECTORY] local_tracking_only=1: exporting online selected "
+            "keyframe poses only; global BA and trajectory filling are disabled"
+        )
+    elif args.local_vio_only:
+        print(
+            "[TRAJECTORY] local_vio_only=1: global BA is disabled; "
+            "PoseTrajectoryFiller will export the full camera timeline from "
+            "the online local-BA state"
+        )
+    else:
+        print(
+            "[TRAJECTORY] tracking_stride="
+            f"{args.stride}, fill_stride={args.trajectory_fill_stride} "
+            "(fill is applied only after global BA)"
+        )
+
     if args.use_imu_residual and args.imu_prior is None:
         print("[IMU WARNING] --use_imu_residual requires --imu_prior; residual will be disabled.")
 
@@ -2104,6 +2446,36 @@ if __name__ == '__main__':
 
     if args.use_learned_imu_confidence and not (args.use_imu_residual or args.use_imu_ba_prior):
         print("[IMU WARNING] --use_learned_imu_confidence has no effect without an IMU residual/prior term.")
+
+    if args.use_learned_imu_precision:
+        if not args.use_full_imu_ba or not args.use_imu_ba_prior:
+            raise ValueError(
+                '--use_learned_imu_precision requires --use_full_imu_ba and --use_imu_ba_prior'
+            )
+        if not args.use_imu_noise_model or not args.use_imu_full_covariance_weighting:
+            raise ValueError(
+                '--use_learned_imu_precision requires --use_imu_noise_model and '
+                '--use_imu_full_covariance_weighting'
+            )
+        if not args.use_imu_bias_random_walk:
+            raise ValueError(
+                '--use_learned_imu_precision requires --use_imu_bias_random_walk '
+                'so bias rows retain a physical prior'
+            )
+        if (
+            args.use_learned_imu_confidence
+            or args.use_component_imu_confidence
+            or args.use_dvi_imu_confidence
+            or args.use_dvi_imu_quality_fusion
+            or args.imu_confidence_only_weighting
+            or args.use_learned_imu_ba_weight
+            or args.use_learned_imu_residual_weights
+            or args.imu_tuned_confidence_schedule is not None
+        ):
+            raise ValueError(
+                '--use_learned_imu_precision is a standalone direct-precision mode; '
+                'do not combine it with legacy confidence/lambda/residual-weight controls'
+            )
 
     if args.use_component_imu_confidence and not args.use_learned_imu_confidence:
         raise ValueError('--use_component_imu_confidence requires --use_learned_imu_confidence')
@@ -2176,6 +2548,7 @@ if __name__ == '__main__':
             args.stride,
             args.max_frames,
             frame_records=args.frame_records,
+            euroc_original_protocol=args.euroc_original_protocol,
         )
     ):
 
@@ -2295,28 +2668,87 @@ if __name__ == '__main__':
         print("[MOTION-FILTER MANIFEST] frontend/backend refinement skipped")
         raise SystemExit(0)
 
-    # terminate()는 backend refinement를 마무리하고,
-    # keyframe이 아닌 skipped frame의 pose까지 채운 trajectory를 반환한다.
-    #
-    # image_stream을 다시 넘기는 이유:
-    #   PoseTrajectoryFiller가 원본 stream의 전체 frame에 대한 pose를 채울 때
-    #   다시 이미지 stream을 참고할 수 있기 때문.
-    dense_stream = (
-        (t, image, intrinsics)
-        for t, image, intrinsics in image_stream(
-            args.imagedir,
-            args.calib,
-            args.stride,
-            args.max_frames,
-            frame_records=args.frame_records,
+    if args.local_tracking_only:
+        # Do not call ``terminate()`` here. It runs one or more global backend
+        # passes and then PoseTrajectoryFiller, so either would turn this into
+        # an offline SLAM result. ``video.poses`` and ``video.tstamp`` retain
+        # the online frontend state for exactly the selected tracking frames.
+        if hasattr(droid, "video2"):
+            raise ValueError(
+                "--local_tracking_only currently supports synchronous Droid only; "
+                "DroidAsync has an independent backend process"
+            )
+        if hasattr(droid.frontend, "flush_imu_debug"):
+            droid.frontend.flush_imu_debug()
+        local_keyframes = int(droid.video.counter.value)
+        if local_keyframes < 5:
+            raise RuntimeError(
+                "local tracking produced fewer than five selected keyframes; "
+                "cannot evaluate a trajectory"
+            )
+        dense_tstamps = None
+        traj_est = None
+        print(
+            "[TRAJECTORY] local_keyframes="
+            f"{local_keyframes}, global_backend=skipped, pose_filler=skipped"
         )
-        if t >= args.t0
-    )
-    traj_est = droid.terminate(dense_stream)
-    if len(traj_est) != len(tstamps):
-        raise RuntimeError(
-            "dense trajectory length does not match the tracked input timeline: "
-            f"poses={len(traj_est)}, frame_ids={len(tstamps)}"
+    else:
+        # Both paths below fill poses on the raw camera time axis. The normal
+        # path first runs global BA; local_vio_only deliberately skips it and
+        # fills from the online local-BA state. The strides must be separate:
+        # the official DROID EuRoC protocol tracks every other 20 Hz image,
+        # but fills the trajectory on every raw 20 Hz image.
+        # Keeping --stride=2 preserves the trained IMU graph; setting
+        # --trajectory_fill_stride=1 changes only the final output timeline.
+        #
+        # With --max_frames, restrict filling to the raw-time span covered by the
+        # selected tracking window. Without this guard, a short debug run would
+        # extrapolate poses for the remainder of a full sequence.
+        fill_stop_t = None
+        if args.max_frames is not None and args.max_frames > 0:
+            fill_stop_t = int(tstamps[-1]) + max(0, int(args.stride) - 1)
+
+        dense_tstamps = []
+
+        def dense_image_stream():
+            for t, image, intrinsics in image_stream(
+                args.imagedir,
+                args.calib,
+                args.trajectory_fill_stride,
+                0,
+                frame_records=args.frame_records,
+                euroc_original_protocol=args.euroc_original_protocol,
+            ):
+                if t < args.t0:
+                    continue
+                if fill_stop_t is not None and t > fill_stop_t:
+                    break
+                dense_tstamps.append(int(t))
+                yield t, image, intrinsics
+
+        if args.local_vio_only:
+            if hasattr(droid, "video2"):
+                raise ValueError(
+                    "--local_vio_only currently supports synchronous Droid only; "
+                    "DroidAsync has an independent backend process"
+                )
+            traj_est = droid.terminate_local(dense_image_stream())
+        else:
+            traj_est = droid.terminate(dense_image_stream())
+        if len(traj_est) != len(dense_tstamps):
+            raise RuntimeError(
+                "dense trajectory length does not match the trajectory-fill timeline: "
+                f"poses={len(traj_est)}, frame_ids={len(dense_tstamps)}"
+            )
+        if args.trajectory_fill_stride == 1 and len(dense_tstamps) < len(tstamps):
+            raise RuntimeError(
+                "full-rate trajectory filling produced fewer poses than tracking; "
+                "check frame-manifest/image-stream alignment"
+            )
+        print(
+            "[TRAJECTORY] tracking_frames="
+            f"{len(tstamps)}, dense_output_frames={len(dense_tstamps)}, "
+            f"global_backend={'skipped' if args.local_vio_only else 'enabled'}"
         )
 
     if args.use_vi_initialization:
@@ -2342,9 +2774,27 @@ if __name__ == '__main__':
     # reconstruction_path가 지정되어 있으면
     # pose, disparity, image, intrinsics 등을 .pth 파일로 저장
     if args.reconstruction_path is not None:
-        save_reconstruction(
-            droid,
-            args.reconstruction_path,
-            dense_tstamps=tstamps,
-            dense_poses=traj_est,
-        )
+        if args.local_tracking_only:
+            # No dense trajectory is written: a dense export would imply the
+            # offline PoseTrajectoryFiller had been run. The evaluator must
+            # use --trajectory-source keyframes for this diagnostic result.
+            save_reconstruction(droid, args.reconstruction_path)
+        else:
+            save_reconstruction(
+                droid,
+                args.reconstruction_path,
+                dense_tstamps=dense_tstamps,
+                dense_poses=traj_est,
+                dense_protocol={
+                    "tracking_stride": int(args.stride),
+                    "trajectory_fill_stride": int(args.trajectory_fill_stride),
+                    "tracking_frame_count": int(len(tstamps)),
+                    "dense_frame_count": int(len(dense_tstamps)),
+                    "max_tracking_frames": int(args.max_frames),
+                    "euroc_original_protocol": bool(args.euroc_original_protocol),
+                    "local_tracking_only": False,
+                    "local_vio_only": bool(args.local_vio_only),
+                    "global_backend": not bool(args.local_vio_only),
+                    "trajectory_filler": True,
+                },
+            )

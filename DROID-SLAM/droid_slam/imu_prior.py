@@ -479,6 +479,11 @@ def compose_imu_prior_rows(rows, prev_frame_index=None, frame_index=None):
     out.update({
         "prev_frame_index": prev_frame_index,
         "frame_index": frame_index,
+        # The output row is initially copied from the final raw interval. Its
+        # endpoint metadata must nevertheless describe the *composed* edge;
+        # otherwise logs/audits misleadingly report only the final 50 ms.
+        "prev_timestamp_sec": _safe_float(rows[0].get("prev_timestamp_sec"), 0.0),
+        "prev_timestamp_ns": _safe_int(rows[0].get("prev_timestamp_ns"), 0),
         "dt": dt_total,
         "imu_count": imu_count,
         "imu_used_steps": imu_used_steps,

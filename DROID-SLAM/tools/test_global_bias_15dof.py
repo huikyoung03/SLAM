@@ -160,6 +160,49 @@ def assert_global_bias_jacobian_with_local_state():
         assert error < 1e-6, f"global bias Jacobian mismatch on axis {axis}: {error:.3e}"
 
 
+def assert_recent_window_global_bias_recovery():
+    """The online block must use a bounded recent 15DoF window, not all rows."""
+
+    video = make_consistent_video()
+    result = refine_global_bias_15dof(
+        video,
+        compose_order="dq_prev",
+        inverse_imu=False,
+        max_dt=0.0,
+        max_residual_deg=0.0,
+        pos_weight=1.0,
+        vel_weight=1.0,
+        damping=1e-10,
+        step_scale=1.0,
+        max_accel_step=1.0,
+        max_gyro_step=1.0,
+        max_accel_norm=1.0,
+        max_gyro_norm=1.0,
+        global_weight=1.0,
+        use_imu_info_weighting=True,
+        robust_delta=0.0,
+        min_edges=3,
+        min_duration=0.0,
+        min_rotation_deg=0.0,
+        max_condition=1e12,
+        min_relative_improvement=1e-8,
+        accel_prior_std=1e6,
+        gyro_prior_std=1e6,
+        relinearize_accel_threshold=0.0,
+        relinearize_gyro_threshold=0.0,
+        window=5,
+    )
+    assert result.get("updated", 0.0) == 1.0, result
+    assert result["window_t0"] == 7.0 and result["window_t1"] == 12.0, result
+    assert result["edges"] == 4.0, result
+    assert torch.allclose(
+        video.imu_global_bias_acc, video.true_accel_bias, atol=1e-8, rtol=1e-8
+    )
+    assert torch.allclose(
+        video.imu_global_bias_gyro, video.true_gyro_bias, atol=1e-8, rtol=1e-8
+    )
+
+
 def assert_recenter_preserves_total_bias():
     video = make_consistent_video()
     video.imu_global_bias_acc[:] = torch.tensor(
@@ -204,5 +247,6 @@ def assert_recenter_preserves_total_bias():
 if __name__ == "__main__":
     assert_global_bias_recovery()
     assert_global_bias_jacobian_with_local_state()
+    assert_recent_window_global_bias_recovery()
     assert_recenter_preserves_total_bias()
     print("global 15DoF shared-bias refinement checks passed")

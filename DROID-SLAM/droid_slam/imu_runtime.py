@@ -1,6 +1,61 @@
 import math
 
 
+def configure_learned_imu_precision_weighting(args, source="runtime"):
+    """Configure learned R/v/p IMU attenuation without a global lambda.
+
+    Each head output lies in ``(0, 1]`` and scales a covariance-normalized
+    physical preintegration block. It may reject unreliable information but
+    cannot strengthen an interval beyond the sensor covariance. It must not
+    be combined with a second global learned/tuned multiplier or historical
+    hand-set cross-block coefficients.
+    """
+
+    if not getattr(args, "use_learned_imu_precision", False):
+        return False
+    if not getattr(args, "use_full_imu_ba", False):
+        raise ValueError("--use_learned_imu_precision requires --use_full_imu_ba")
+    if not getattr(args, "use_imu_full_covariance_weighting", False):
+        raise ValueError(
+            "--use_learned_imu_precision requires "
+            "--use_imu_full_covariance_weighting so R/v/p share a physical base"
+        )
+    if getattr(args, "use_learned_imu_ba_weight", False):
+        raise ValueError(
+            "--use_learned_imu_precision cannot be combined with "
+            "--use_learned_imu_ba_weight"
+        )
+    if getattr(args, "use_learned_imu_residual_weights", False):
+        raise ValueError(
+            "--use_learned_imu_precision cannot be combined with "
+            "--use_learned_imu_residual_weights"
+        )
+    if getattr(args, "imu_confidence_only_weighting", False):
+        raise ValueError(
+            "--use_learned_imu_precision cannot be combined with "
+            "--imu_confidence_only_weighting"
+        )
+    if getattr(args, "imu_tuned_confidence_schedule", None) is not None:
+        raise ValueError(
+            "--use_learned_imu_precision cannot be combined with "
+            "--imu_tuned_confidence_schedule"
+        )
+
+    old_weight = float(getattr(args, "imu_ba_prior_weight", 0.0))
+    args.imu_ba_prior_weight = 1.0
+    args.use_adaptive_imu_gate = False
+    if hasattr(args, "imu_confidence_floor"):
+        args.imu_confidence_floor = 0.0
+    if hasattr(args, "imu_conf_floor"):
+        args.imu_conf_floor = 0.0
+    print(
+        "[IMU] learned R/v/p covariance-relative attenuation "
+        f"source={source}, global_weight=1, previous_cli={old_weight:.6g}, "
+        "legacy_confidence_gate=disabled"
+    )
+    return True
+
+
 def configure_confidence_only_imu_weighting(args, source="runtime"):
     """Use learned IMU confidence as the sole adaptive factor attenuation.
 
@@ -71,14 +126,15 @@ def configure_imu_noise_model(args, source="runtime"):
     args.use_imu_info_weighting = True
     args.imu_info_weight_clip = 0.0
 
-    # Under the covariance-relative path, these old limits are not quality
-    # measurements. A long interval can be valid when MotionFilter skipped
-    # visually redundant frames; its propagated covariance should reduce the
-    # factor contribution continuously instead of dropping it at a fixed
-    # duration/motion/angle threshold. Invalid timestamps and non-finite values
-    # are still rejected by the preintegration and factor-graph integrity checks.
+    # A residual magnitude is not an IMU-quality measurement, so leave those
+    # old heuristic gates disabled.  Duration is different: the present
+    # keyframe-only factor carries one first-order bias linearization and only
+    # a diagonal covariance.  It cannot faithfully represent an arbitrary
+    # MotionFilter gap (observed gaps reach 7--10 s).  Preserve the caller's
+    # physical maximum duration, whose parser default is 0.5 s, instead of
+    # silently replacing it with zero.  A caller may explicitly set zero only
+    # when it supplies a model with intervening inertial states/full covariance.
     args.imu_ba_prior_max_deg = 0.0
-    args.imu_full_max_dt = 0.0
     args.imu_full_max_dv = 0.0
     args.imu_full_max_dp = 0.0
     # Training-side PyTorch DBA/full loss used this as a hard rotational
@@ -100,10 +156,11 @@ def configure_imu_noise_model(args, source="runtime"):
         args.imu_conf_floor = 0.0
 
     args._imu_noise_model_configured = True
+    max_dt = float(getattr(args, "imu_full_max_dt", 0.5))
     print(
         "[IMU] using covariance-relative IMU information "
-        f"source={source}, info_clip=disabled, legacy_limits=disabled, "
-        "residual_gate=disabled, adaptive_gate=disabled, "
+        f"source={source}, info_clip=disabled, max_dt={max_dt:.6g}, "
+        "dv_dp_residual_gates=disabled, adaptive_gate=disabled, "
         "confidence_floor=disabled"
     )
     if legacy_gate_enabled:

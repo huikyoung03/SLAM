@@ -20,6 +20,7 @@ from imu_runtime import (
     apply_learned_imu_ba_weight,
     apply_learned_imu_residual_weights,
     configure_confidence_only_imu_weighting,
+    configure_learned_imu_precision_weighting,
     configure_imu_noise_model,
 )
 
@@ -105,10 +106,15 @@ class Droid:
         self.args = args
         if getattr(self.args, "use_component_imu_confidence", False):
             loaded_keys = getattr(self.net, "_loaded_state_keys", set())
-            has_component_head = any(
-                key.startswith("update.imu_component_confidence.")
-                or key.startswith("update.imu_quality_fusion.")
-                for key in loaded_keys
+            has_component_head = (
+                any(
+                    key.startswith("update.imu_component_confidence.")
+                    for key in loaded_keys
+                )
+                and any(
+                    key.startswith("update.imu_quality_fusion.")
+                    for key in loaded_keys
+                )
             )
             if not has_component_head:
                 self.net.initialize_component_imu_confidence_from_scalar()
@@ -129,6 +135,7 @@ class Droid:
                     "an older checkpoint; quality contribution is neutral"
                 )
         configure_imu_noise_model(self.args, source="droid")
+        configure_learned_imu_precision_weighting(self.args, source="droid")
         configure_confidence_only_imu_weighting(self.args, source="droid")
         apply_learned_imu_ba_weight(self.args, self.net, source="droid")
         apply_learned_imu_residual_weights(self.args, self.net, source="droid")
@@ -806,4 +813,42 @@ class Droid:
 
         # DROID 내부 pose convention을 camera trajectory convention으로 맞추기 위해 inverse 적용
         # GPU tensor -> CPU numpy 변환
+        return camera_trajectory.inv().data.cpu().numpy()
+
+    def terminate_local(self, stream=None):
+        """Return a dense local VO/VIO trajectory without global BA.
+
+        The normal :meth:`terminate` executes the termination-time global
+        backend.  This method deliberately does not: it preserves the online
+        frontend's sliding-window local-BA state and only invokes
+        ``PoseTrajectoryFiller`` to recover poses for input timestamps that
+        MotionFilter skipped.  The filler uses temporary, motion-only query
+        poses and restores ``video.counter`` afterwards.
+
+        It is therefore suitable for a DVI-style *local* VO/VIO ATE-scale
+        evaluation on the full camera timeline.  It must not be reported as a
+        global SLAM result.
+        """
+
+        if stream is None:
+            raise ValueError("terminate_local requires an image stream for pose filling")
+
+        if hasattr(self.frontend, "flush_imu_debug"):
+            self.frontend.flush_imu_debug()
+
+        record_imu_state_diagnostics(self.video, "post_local_frontend_before_fill")
+        local_keyframes = int(self.video.counter.value)
+        if local_keyframes < 5:
+            raise RuntimeError(
+                "local tracking produced fewer than five selected keyframes; "
+                "cannot construct a local trajectory"
+            )
+
+        print(
+            "[TRAJECTORY] local VIO export: "
+            f"keyframes={local_keyframes}, global_backend=skipped, "
+            "pose_filler=enabled"
+        )
+        torch.cuda.empty_cache()
+        camera_trajectory = self.traj_filler(stream)
         return camera_trajectory.inv().data.cpu().numpy()

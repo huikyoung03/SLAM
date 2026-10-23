@@ -26,6 +26,84 @@ IMU_CONFIDENCE_COMPONENTS = ("rotation", "velocity", "position")
 IMU_QUALITY_FEATURE_DIM = 7
 
 
+def bias_random_walk_relative_sqrt_information(
+    bias_random_walk: torch.Tensor,
+    dt: torch.Tensor,
+    rotation_information_reference: torch.Tensor,
+    eps: float = 1e-12,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return calibrated bias-transition row scales relative to rotation.
+
+    A continuous-time accelerometer/gyroscope bias random walk with density
+    ``sigma_rw`` has discrete transition covariance
+
+    ``Cov(b_{k+1} - b_k) = sigma_rw**2 * dt * I``.
+
+    The runtime IMU information is intentionally used only *relatively*: its
+    absolute scale cannot be mixed directly with DROID's learned visual
+    covariance.  Dividing the bias-transition information by the calibrated
+    rotation information therefore gives a dimensionless row scale while
+    preserving the physical ``1 / sqrt(dt)`` random-walk law.  The returned
+    rows are ordered ``[accel x3, gyro x3]``.
+
+    ``valid`` is false when the source prior has no usable sensor random-walk
+    calibration.  Callers must then choose an explicit compatibility fallback
+    rather than silently inventing a physical noise value.
+    """
+
+    rw = torch.as_tensor(bias_random_walk)
+    if rw.shape[-1] < 2:
+        raise ValueError(
+            "bias_random_walk must end in [accel_random_walk, gyro_random_walk]"
+        )
+    rw = rw[..., :2]
+
+    dt_tensor = torch.as_tensor(dt, device=rw.device, dtype=rw.dtype)
+    reference = torch.as_tensor(
+        rotation_information_reference,
+        device=rw.device,
+        dtype=rw.dtype,
+    )
+    # ``dt`` is commonly [B, E, 1] in training and scalar at runtime.  Treat
+    # a trailing singleton as a coordinate channel, not as a batch dimension.
+    if dt_tensor.ndim > 0 and dt_tensor.shape[-1] == 1:
+        dt_tensor = dt_tensor.squeeze(-1)
+    # Keep [B, 1] references intact: it broadcasts across the edge dimension.
+    if reference.ndim == 1 and reference.shape[-1] == 1:
+        reference = reference.squeeze(-1)
+    target_shape = torch.broadcast_shapes(
+        rw.shape[:-1], dt_tensor.shape, reference.shape
+    )
+    rw = torch.broadcast_to(rw, target_shape + (2,))
+    dt_tensor = torch.broadcast_to(dt_tensor, target_shape)
+    reference = torch.broadcast_to(reference, target_shape)
+    valid = (
+        torch.isfinite(rw).all(dim=-1)
+        & torch.isfinite(dt_tensor)
+        & torch.isfinite(reference)
+        & (rw[..., 0] > eps)
+        & (rw[..., 1] > eps)
+        & (dt_tensor > eps)
+        & (reference > eps)
+    )
+
+    # Keep arithmetic finite even for invalid rows.  The validity mask tells
+    # the caller not to use this placeholder result.
+    safe_dt = dt_tensor.clamp_min(eps)
+    safe_reference = reference.clamp_min(eps)
+    safe_rw = rw.clamp_min(eps)
+    # ``safe_dt`` and ``safe_reference`` have the common interval shape
+    # ``[..., E]``.  Form their product *before* adding the residual-channel
+    # dimension.  Unsqueezing only dt lets a [B, 1] reference accidentally
+    # broadcast to [B, E, E] when B != E (the ordinary batch=1 training
+    # case), which then cannot multiply the two accel/gyro densities.
+    interval_variance = (safe_dt * safe_reference).unsqueeze(-1)
+    scales = 1.0 / (safe_rw * torch.sqrt(interval_variance))
+    scales = torch.cat([scales[..., 0:1].expand(*scales.shape[:-1], 3),
+                        scales[..., 1:2].expand(*scales.shape[:-1], 3)], dim=-1)
+    return scales, valid
+
+
 def quat_normalize(q: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     return q / q.norm(dim=-1, keepdim=True).clamp_min(eps)
 
@@ -359,15 +437,16 @@ def imu_center_from_pose_data(
     return camera_centers + torch.matmul(R_wc, translation.unsqueeze(-1)).squeeze(-1)
 
 
-def temporal_imu_confidence_from_edges(
+def _temporal_imu_values_from_edges(
     edge_confidence: Optional[torch.Tensor],
     ii: torch.Tensor,
     jj: torch.Tensor,
     num_frames: int,
     fallback: Union[float, torch.Tensor] = 1.0,
     return_coverage: bool = False,
+    clamp_values: Optional[Tuple[float, float]] = None,
 ):
-    """Convert GRU edge confidence maps into confidence for temporal IMU factors.
+    """Convert direct graph-edge values into values for temporal IMU factors.
 
     The IMU factor for keyframe ``j`` is specifically the interval
     ``(j - 1, j)``.  Averaging confidence over every graph edge that merely
@@ -452,11 +531,66 @@ def temporal_imu_confidence_from_edges(
             temporal[:, dst] = confidence[:, direct].mean(dim=1)
             coverage[dst] = True
 
-    temporal = temporal.clamp(0.0, 1.0)
+    if clamp_values is not None:
+        temporal = temporal.clamp(*clamp_values)
     if temporal.shape[-1] == 1:
         temporal = temporal[..., 0]
     if return_coverage:
         return temporal, coverage
+    return temporal
+
+
+def temporal_imu_confidence_from_edges(
+    edge_confidence: Optional[torch.Tensor],
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    num_frames: int,
+    fallback: Union[float, torch.Tensor] = 1.0,
+    return_coverage: bool = False,
+):
+    """Convert sigmoid confidence maps into temporal confidences in [0, 1]."""
+
+    return _temporal_imu_values_from_edges(
+        edge_confidence,
+        ii,
+        jj,
+        num_frames=num_frames,
+        fallback=fallback,
+        return_coverage=return_coverage,
+        clamp_values=(0.0, 1.0),
+    )
+
+
+def temporal_imu_precision_from_edges(
+    edge_precision: Optional[torch.Tensor],
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    num_frames: int,
+    fallback: Union[float, torch.Tensor] = 1.0,
+    return_coverage: bool = False,
+):
+    """Convert R/v/p edge reliabilities into temporal factor weights.
+
+    The public function name is retained for compatibility with the original
+    direct-precision experiment. ``1`` retains the full IMU factor defined by
+    propagated sensor covariance; values below one attenuate it. Clamp here
+    as a BA-side invariant so stale edge caches cannot over-trust an interval.
+    """
+
+    temporal = _temporal_imu_values_from_edges(
+        edge_precision,
+        ii,
+        jj,
+        num_frames=num_frames,
+        fallback=fallback,
+        return_coverage=return_coverage,
+        clamp_values=(1e-12, 1.0),
+    )
+    values = temporal[0] if return_coverage else temporal
+    if values is not None and (
+        not torch.isfinite(values).all() or bool((values <= 0.0).any().item())
+    ):
+        raise ValueError("learned IMU attenuation must be finite and strictly positive")
     return temporal
 
 
@@ -1081,6 +1215,192 @@ def rotation_only_cost(
         residual = residual * edge_info.reshape(-1, 1)
 
     return 0.5 * torch.sum(residual * residual)
+
+
+def full_imu_factor_linearization(
+    pose_i: torch.Tensor,
+    pose_j: torch.Tensor,
+    velocity_i: torch.Tensor,
+    velocity_j: torch.Tensor,
+    local_accel_bias_i: torch.Tensor,
+    local_accel_bias_j: torch.Tensor,
+    local_gyro_bias_i: torch.Tensor,
+    local_gyro_bias_j: torch.Tensor,
+    global_accel_bias: torch.Tensor,
+    global_gyro_bias: torch.Tensor,
+    imu_delta: torch.Tensor,
+    bias_jacobian: torch.Tensor,
+    gravity: torch.Tensor,
+    imu_to_camera_translation: Optional[torch.Tensor] = None,
+    compose_order: str = "dq_prev",
+    inverse_imu: bool = True,
+    optimize_bias: bool = True,
+):
+    """Linearize one full 15DoF preintegrated-IMU factor.
+
+    The residual is ordered as ``[r_p, r_v, r_R, r_ba, r_bg]`` and the
+    returned Jacobians use DROID DBA's normal-equation convention
+    ``r - J dx``.  ``pose_i`` and ``pose_j`` are DROID pose data
+    ``[t_CW, q_CW]``; they are deliberately accepted in that representation
+    so the camera-to-IMU lever arm and DROID's left pose perturbation are
+    exercised by the same code in runtime and finite-difference tests.
+
+    This function intentionally contains no confidence, robust gate, or
+    hand-tuned residual scaling.  Those are weighting decisions made by the
+    caller *after* the physical factor has been formed.
+    """
+
+    if pose_i.shape[-1] != 7 or pose_j.shape[-1] != 7:
+        raise ValueError("full IMU factor poses must end in seven DROID pose values")
+    if imu_delta.numel() < 10:
+        raise ValueError("full IMU factor imu_delta must contain [dt, dr, dv, dp]")
+    if tuple(bias_jacobian.shape[-3:]) != (
+        len(IMU_BIAS_JACOBIAN_NAMES),
+        3,
+        3,
+    ):
+        raise ValueError(
+            "full IMU factor bias_jacobian must end in [5, 3, 3], got "
+            f"{tuple(bias_jacobian.shape)}"
+        )
+
+    # Runtime invokes this for one temporal edge at a time.  Keeping the
+    # small factor unbatched makes its state layout explicit and avoids
+    # accidentally broadcasting one edge's bias into another edge.
+    pose_i = pose_i.reshape(-1)[:7]
+    pose_j = pose_j.reshape(-1)[:7]
+    dtype = pose_i.dtype
+    device = pose_i.device
+    velocity_i = velocity_i.to(device=device, dtype=dtype).reshape(-1)[:3]
+    velocity_j = velocity_j.to(device=device, dtype=dtype).reshape(-1)[:3]
+    local_accel_bias_i = local_accel_bias_i.to(device=device, dtype=dtype).reshape(-1)[:3]
+    local_accel_bias_j = local_accel_bias_j.to(device=device, dtype=dtype).reshape(-1)[:3]
+    local_gyro_bias_i = local_gyro_bias_i.to(device=device, dtype=dtype).reshape(-1)[:3]
+    local_gyro_bias_j = local_gyro_bias_j.to(device=device, dtype=dtype).reshape(-1)[:3]
+    global_accel_bias = global_accel_bias.to(device=device, dtype=dtype).reshape(-1)[:3]
+    global_gyro_bias = global_gyro_bias.to(device=device, dtype=dtype).reshape(-1)[:3]
+    gravity = gravity.to(device=device, dtype=dtype).reshape(-1)[:3]
+    row = imu_delta.to(device=device, dtype=dtype).reshape(-1)
+    bias_jacobian = bias_jacobian.to(device=device, dtype=dtype)
+
+    if imu_to_camera_translation is None:
+        lever_arm = torch.zeros(3, device=device, dtype=dtype)
+    else:
+        lever_arm = torch.as_tensor(
+            imu_to_camera_translation, device=device, dtype=dtype
+        ).reshape(-1)[:3]
+
+    centers = imu_center_from_pose_data(
+        torch.stack((pose_i, pose_j), dim=0), lever_arm
+    )
+    p_i, p_j = centers[0], centers[1]
+    q_i, q_j = pose_i[3:7], pose_j[3:7]
+    dt = row[0].clamp_min(0.0)
+
+    J_R_bg, J_v_ba, J_v_bg, J_p_ba, J_p_bg = bias_jacobian
+    accel_total = global_accel_bias + (local_accel_bias_i if optimize_bias else 0.0)
+    gyro_total = global_gyro_bias + (local_gyro_bias_i if optimize_bias else 0.0)
+
+    rotvec = row[1:4] + J_R_bg @ gyro_total
+    dv_imu = row[4:7] + J_v_ba @ accel_total + J_v_bg @ gyro_total
+    dp_imu = row[7:10] + J_p_ba @ accel_total + J_p_bg @ gyro_total
+
+    q_pred = predict_imu_rotation(
+        q_i,
+        rotvec_to_quat(rotvec),
+        compose_order=compose_order,
+        inverse_imu=inverse_imu,
+    )
+    r_R = quat_to_rotvec(quat_multiply(quat_inverse(q_pred), q_j))
+
+    p_world_delta = p_j - p_i - velocity_i * dt - 0.5 * gravity * dt * dt
+    v_world_delta = velocity_j - velocity_i - gravity * dt
+    p_cam_delta = quat_rotate(q_i, p_world_delta)
+    v_cam_delta = quat_rotate(q_i, v_world_delta)
+    r_p = p_cam_delta - dp_imu
+    r_v = v_cam_delta - dv_imu
+    r_ba = local_accel_bias_j - local_accel_bias_i
+    r_bg = local_gyro_bias_j - local_gyro_bias_i
+
+    state_dim = 15 if optimize_bias else 9
+    residual = (
+        torch.cat((r_p, r_v, r_R, r_ba, r_bg), dim=0)
+        if optimize_bias
+        else torch.cat((r_p, r_v, r_R), dim=0)
+    )
+    Ji = torch.zeros((residual.numel(), state_dim), device=device, dtype=dtype)
+    Jj = torch.zeros_like(Ji)
+    eye3 = torch.eye(3, device=device, dtype=dtype)
+
+    R_i = quat_to_rotmat(q_i)
+    R_j = quat_to_rotmat(q_j)
+    R_pred = quat_to_rotmat(q_pred)
+    Ri_RjT = R_i @ R_j.transpose(0, 1)
+    Jl_inv = so3_left_jacobian_inv(r_R)
+
+    Ji[0:3, 0:3] = -eye3
+    Jj[0:3, 0:3] = Ri_RjT
+    Ji[0:3, 3:6] = skew_symmetric(p_cam_delta + lever_arm)
+    Jj[0:3, 3:6] = -Ri_RjT @ skew_symmetric(lever_arm)
+    Ji[0:3, 6:9] = dt * R_i
+
+    Ji[3:6, 3:6] = skew_symmetric(v_cam_delta)
+    Ji[3:6, 6:9] = R_i
+    Jj[3:6, 6:9] = -R_i
+
+    if compose_order == "dq_prev":
+        rot_i_map = R_i.transpose(0, 1)
+        gyro_map = R_pred.transpose(0, 1)
+    elif compose_order == "prev_dq":
+        rot_i_map = R_pred.transpose(0, 1)
+        gyro_map = R_pred.transpose(0, 1) @ R_i
+    else:
+        raise ValueError(f"Unknown compose_order: {compose_order}")
+
+    Ji[6:9, 3:6] = Jl_inv @ rot_i_map
+    Jj[6:9, 3:6] = -(Jl_inv @ R_pred.transpose(0, 1))
+    if optimize_bias:
+        Ji[0:3, 9:12] = J_p_ba
+        Ji[0:3, 12:15] = J_p_bg
+        Ji[3:6, 9:12] = J_v_ba
+        Ji[3:6, 12:15] = J_v_bg
+        gyro_sign = -1.0 if inverse_imu else 1.0
+        preintegration_map = gyro_sign * so3_left_jacobian(gyro_sign * rotvec)
+        Ji[6:9, 12:15] = (
+            Jl_inv @ gyro_map @ preintegration_map @ J_R_bg
+        )
+        Ji[9:12, 9:12] = eye3
+        Jj[9:12, 9:12] = -eye3
+        Ji[12:15, 12:15] = eye3
+        Jj[12:15, 12:15] = -eye3
+
+    details = {
+        "dt": dt,
+        "q_i": q_i,
+        "q_j": q_j,
+        "q_pred": q_pred,
+        "rotvec": rotvec,
+        "dv_imu": dv_imu,
+        "dp_imu": dp_imu,
+        "p_cam_delta": p_cam_delta,
+        "v_cam_delta": v_cam_delta,
+        "r_p": r_p,
+        "r_v": r_v,
+        "r_R": r_R,
+        "r_ba": r_ba,
+        "r_bg": r_bg,
+        "lever_arm": lever_arm,
+        "R_i": R_i,
+        "R_j": R_j,
+        "R_pred": R_pred,
+        "Jl_inv": Jl_inv,
+        "J_R_bg": J_R_bg,
+        "J_v_ba": J_v_ba,
+        "J_v_bg": J_v_bg,
+        "J_p_ba": J_p_ba,
+        "J_p_bg": J_p_bg,
+    }
+    return residual, Ji, Jj, details
 
 
 def finite_difference_jacobian(

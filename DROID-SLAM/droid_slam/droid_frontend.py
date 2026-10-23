@@ -12,6 +12,7 @@ from vi_initialization import (
     capture_vi_initialization_snapshot,
     record_window_bias_refinement,
     rebase_vi_alignment_result,
+    refine_global_bias_15dof,
     try_visual_inertial_initialization,
     vi_initialization_observability,
 )
@@ -39,6 +40,7 @@ class DroidFrontend:
             imu_regularizer=self.imu_regularizer,
             apply_imu_residual=getattr(args, "use_imu_residual", False),
             use_learned_imu_confidence=getattr(args, "use_learned_imu_confidence", False),
+            use_learned_imu_precision=getattr(args, "use_learned_imu_precision", False),
             use_component_imu_confidence=getattr(args, "use_component_imu_confidence", False),
             use_dvi_imu_confidence=getattr(args, "use_dvi_imu_confidence", False),
             use_dvi_imu_quality_fusion=getattr(args, "use_dvi_imu_quality_fusion", False),
@@ -55,6 +57,10 @@ class DroidFrontend:
             imu_full_pos_weight=getattr(args, "imu_full_pos_weight", 0.05),
             imu_full_vel_weight=getattr(args, "imu_full_vel_weight", 0.05),
             imu_full_bias_weight=getattr(args, "imu_full_bias_weight", 0.001),
+            use_imu_bias_random_walk=getattr(args, "use_imu_bias_random_walk", False),
+            use_imu_full_covariance_weighting=getattr(
+                args, "use_imu_full_covariance_weighting", False
+            ),
             imu_motion_prior_weight=getattr(args, "imu_motion_prior_weight", 0.0),
             imu_local_bias_prior_weight=getattr(args, "imu_local_bias_prior_weight", 0.0),
             imu_gravity=getattr(args, "imu_gravity", None),
@@ -82,6 +88,11 @@ class DroidFrontend:
             imu_gyro_bias=getattr(net, "imu_gyro_bias", None),
             imu_acc_bias=getattr(net, "imu_acc_bias", None),
             use_joint_shared_bias_ba=getattr(args, "use_joint_shared_bias_ba", False),
+            # The 15DoF shared variable is deliberately final-global only.
+            # Local two-stage updates keep their established 3 visual + 2
+            # full-state schedule; otherwise a local window could absorb the
+            # common bias before the full-sequence solve sees it.
+            use_joint_shared_bias_15dof=False,
             imu_joint_bias_interval=getattr(args, "imu_joint_bias_interval", 10),
             imu_joint_bias_window=getattr(args, "imu_joint_bias_window", 30),
             imu_joint_bias_damping=getattr(args, "imu_joint_bias_damping", 1e-4),
@@ -119,16 +130,30 @@ class DroidFrontend:
         self.count = 0
 
         self.max_age = 20
-        self.iters1 = 3
-        self.iters2 = 2
+        # Keep the historical 3 visual + 2 full-state local updates as the
+        # default, but make the split explicit for a controlled two-stage
+        # ablation.  A schedule change must never be hidden inside a factor or
+        # confidence experiment.
+        self.iters1 = int(getattr(args, "imu_two_stage_visual_steps", 3))
+        self.iters2 = int(getattr(args, "imu_two_stage_full_steps", 2))
         self.use_two_stage_imu_ba = bool(
             getattr(args, "use_two_stage_imu_ba", False)
         )
         if self.use_two_stage_imu_ba:
+            if self.iters1 < 0 or self.iters2 < 0:
+                raise ValueError(
+                    "two-stage frontend requires visual and local-full steps >= 0"
+                )
             print(
                 "[IMU] local two-stage DBA enabled: "
-                "visual pose-only -> joint pose/velocity/bias 15DoF"
+                "visual pose-only -> joint pose/velocity/bias 15DoF, "
+                f"steps=({self.iters1}, {self.iters2})"
             )
+            if self.iters2 == 0:
+                print(
+                    "[IMU] local full-state stage deferred to the final "
+                    "global backend pass."
+                )
 
         self.keyframe_removal_index = 3
 
@@ -191,6 +216,16 @@ class DroidFrontend:
             )
         )
         self._last_bias_refinement_frame = 0
+        self.use_online_global_bias_15dof_refinement = bool(
+            getattr(args, "use_online_global_bias_15dof_refinement", False)
+        )
+        self._last_online_global_bias_refinement_frame = 0
+        if self.use_online_global_bias_15dof_refinement:
+            print(
+                "[IMU] online shared global-bias refinement enabled: "
+                f"interval={getattr(args, 'imu_online_global_bias_refine_interval', 20)}, "
+                f"window={getattr(args, 'imu_online_global_bias_refine_window', 30)}"
+            )
 
     def _run_local_dba_stage(self, stage, iterations):
         """Run one local stage, keeping stage one strictly visual."""
@@ -455,6 +490,159 @@ class DroidFrontend:
             return True
         return False
 
+    def _maybe_refine_online_global_15dof_biases(self):
+        """Update the physical shared bias centre on the active 15DoF window.
+
+        The regular full-state CUDA DBA owns pose, velocity, and one local
+        accel/gyro correction per keyframe.  It does not include the shared
+        global bias in its state vector.  This explicitly solves that missing
+        six-dimensional block with those local corrections held fixed, then
+        the caller runs a normal 15DoF update to relinearize all local states.
+        """
+
+        if (
+            not self.use_online_global_bias_15dof_refinement
+            or not self.use_two_stage_imu_ba
+            or not self._has_vi_alignment()
+        ):
+            return False
+
+        count = int(self.video.counter.value)
+        interval = max(
+            1,
+            int(
+                getattr(
+                    self.args, "imu_online_global_bias_refine_interval", 20
+                )
+            ),
+        )
+        if count - self._last_online_global_bias_refinement_frame < interval:
+            return False
+
+        window = max(
+            2,
+            int(
+                getattr(self.args, "imu_online_global_bias_refine_window", 30)
+            ),
+        )
+        start = max(0, count - window)
+        info_reference = self.graph._imu_info_reference(
+            start,
+            count,
+            self.video.poses.device,
+            self.video.poses.dtype,
+        )
+
+        # The cache is a direct temporal prediction.  Missing rows are neutral
+        # rather than borrowing confidence from an unrelated graph edge.
+        learned_confidence = None
+        if getattr(self.args, "use_learned_imu_confidence", False):
+            cache = getattr(self.video, "imu_learned_confidence", None)
+            coverage = getattr(self.video, "imu_learned_confidence_valid", None)
+            if cache is not None and cache.shape[0] >= count:
+                learned_confidence = cache[:count].detach().clone()
+                if coverage is not None and coverage.numel() >= count:
+                    coverage = coverage[:count].detach().to(dtype=torch.bool)
+                    learned_confidence = torch.where(
+                        coverage[:, None]
+                        if learned_confidence.ndim == 2
+                        else coverage,
+                        learned_confidence,
+                        torch.ones_like(learned_confidence),
+                    )
+                if learned_confidence.ndim == 2:
+                    learned_confidence = learned_confidence.mean(dim=-1)
+
+        result = refine_global_bias_15dof(
+            self.video,
+            compose_order=getattr(self.args, "imu_full_compose_order", "dq_prev"),
+            inverse_imu=getattr(self.args, "imu_full_inverse", True),
+            max_dt=getattr(self.args, "imu_full_max_dt", 0.5),
+            max_residual_deg=getattr(self.args, "imu_ba_prior_max_deg", 45.0),
+            pos_weight=getattr(self.args, "imu_full_pos_weight", 0.05),
+            vel_weight=getattr(self.args, "imu_full_vel_weight", 0.05),
+            damping=getattr(self.args, "imu_global_bias_refine_damping", 1e-4),
+            step_scale=getattr(
+                self.args, "imu_global_bias_refine_step_scale", 0.5
+            ),
+            max_accel_step=getattr(
+                self.args, "imu_global_bias_refine_max_accel_step", 0.15
+            ),
+            max_gyro_step=getattr(
+                self.args, "imu_global_bias_refine_max_gyro_step", 0.015
+            ),
+            max_accel_norm=getattr(
+                self.args, "imu_global_bias_refine_max_accel_norm", 2.0
+            ),
+            max_gyro_norm=getattr(
+                self.args, "imu_global_bias_refine_max_gyro_norm", 0.2
+            ),
+            global_weight=getattr(self.args, "imu_global_bias_refine_weight", 1.0),
+            imu_confidence=learned_confidence,
+            use_imu_info_weighting=getattr(
+                self.args, "use_imu_info_weighting", False
+            ),
+            imu_info_reference=info_reference,
+            imu_info_weight_clip=getattr(self.args, "imu_info_weight_clip", 4.0),
+            imu_info_weight_eps=getattr(self.args, "imu_info_weight_eps", 1e-12),
+            robust_delta=getattr(self.args, "imu_global_bias_refine_robust_delta", 3.0),
+            min_edges=getattr(self.args, "imu_global_bias_refine_min_edges", 20),
+            min_duration=getattr(
+                self.args, "imu_global_bias_refine_min_duration", 2.0
+            ),
+            min_rotation_deg=getattr(
+                self.args, "imu_global_bias_refine_min_rotation_deg", 5.0
+            ),
+            max_condition=getattr(
+                self.args, "imu_global_bias_refine_max_condition", 1e8
+            ),
+            min_relative_improvement=getattr(
+                self.args,
+                "imu_global_bias_refine_min_relative_improvement",
+                1e-4,
+            ),
+            accel_random_walk=getattr(
+                self.args, "imu_global_bias_refine_accel_random_walk", -1.0
+            ),
+            gyro_random_walk=getattr(
+                self.args, "imu_global_bias_refine_gyro_random_walk", -1.0
+            ),
+            accel_prior_std=getattr(
+                self.args, "imu_global_bias_refine_accel_prior_std", 0.5
+            ),
+            gyro_prior_std=getattr(
+                self.args, "imu_global_bias_refine_gyro_prior_std", 0.05
+            ),
+            relinearize_accel_threshold=getattr(
+                self.args, "imu_global_bias_relinearize_accel", 0.05
+            ),
+            relinearize_gyro_threshold=getattr(
+                self.args, "imu_global_bias_relinearize_gyro", 0.005
+            ),
+            window=window,
+        )
+        self._last_online_global_bias_refinement_frame = count
+        record_window_bias_refinement(self.video, result, "frontend_global_15dof")
+        if result.get("updated", 0.0) <= 0.0:
+            print(
+                "[VI-BIAS-ONLINE-15DOF] skipped: "
+                f"{result.get('reason', 'unknown')}, "
+                f"edges={int(result.get('edges', 0.0))}, "
+                f"window=[{int(result.get('window_t0', start))},{int(result.get('window_t1', count))})"
+            )
+            return False
+
+        print(
+            "[VI-BIAS-ONLINE-15DOF] accepted "
+            f"window=[{int(result.get('window_t0', start))},{int(result.get('window_t1', count))}), "
+            f"edges={int(result.get('edges', 0.0))}, "
+            f"cost={result.get('cost_before', 0.0):.6g}->{result.get('cost_after', 0.0):.6g}, "
+            f"|dba|={result.get('accel_step_norm', 0.0):.6g}, "
+            f"|dbg|={result.get('gyro_step_norm', 0.0):.6g}, "
+            f"cond={result.get('condition', float('nan')):.3g}"
+        )
+        return True
+
     def _init_next_state(self):
         # set pose / depth for next iteration
         self.video.poses[self.t1] = self.video.poses[self.t1 - 1]
@@ -537,6 +725,23 @@ class DroidFrontend:
             # initialization has supplied gravity, velocity, and bias seeds.
             post_bias_iterations = self.iters2 if self._has_vi_alignment() else 0
             self._run_local_dba_stage("full_15dof", post_bias_iterations)
+            if self._maybe_refine_online_global_15dof_biases():
+                # Rebuild the local normal system at the accepted shared bias;
+                # without this pass the new block would not influence T/v/b_i
+                # until a later keyframe update.
+                self._run_local_dba_stage(
+                    "full_15dof",
+                    max(
+                        1,
+                        int(
+                            getattr(
+                                self.args,
+                                "imu_online_global_bias_refine_post_iterations",
+                                1,
+                            )
+                        ),
+                    ),
+                )
         else:
             # A newly accepted shared-bias step must be followed by at least
             # one regular 9DoF CUDA DBA pass so T, v and dense depth react to

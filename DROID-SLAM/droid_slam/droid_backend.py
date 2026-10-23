@@ -22,7 +22,9 @@ def _maybe_refine_runtime_bias(graph, args, stage):
         getattr(args, "use_low_rate_bias_refinement", False)
         or getattr(args, "use_window_bias_refinement", False)
         or getattr(args, "use_shared_bias_local_ba", False)
-    ) or getattr(args, "use_joint_shared_bias_ba", False):
+    ) or getattr(args, "use_joint_shared_bias_ba", False) or getattr(
+        args, "use_joint_shared_bias_15dof", False
+    ):
         return False
     video = graph.video
     ready = getattr(video, "imu_alignment_ready", None)
@@ -101,6 +103,7 @@ class DroidBackend:
             imu_regularizer=self.imu_regularizer,
             apply_imu_residual=getattr(self.args, "use_imu_residual", False),
             use_learned_imu_confidence=getattr(self.args, "use_learned_imu_confidence", False),
+            use_learned_imu_precision=getattr(self.args, "use_learned_imu_precision", False),
             use_component_imu_confidence=getattr(self.args, "use_component_imu_confidence", False),
             use_dvi_imu_confidence=getattr(self.args, "use_dvi_imu_confidence", False),
             use_dvi_imu_quality_fusion=getattr(self.args, "use_dvi_imu_quality_fusion", False),
@@ -114,6 +117,10 @@ class DroidBackend:
             imu_full_pos_weight=getattr(self.args, "imu_full_pos_weight", 0.05),
             imu_full_vel_weight=getattr(self.args, "imu_full_vel_weight", 0.05),
             imu_full_bias_weight=getattr(self.args, "imu_full_bias_weight", 0.001),
+            use_imu_bias_random_walk=getattr(self.args, "use_imu_bias_random_walk", False),
+            use_imu_full_covariance_weighting=getattr(
+                self.args, "use_imu_full_covariance_weighting", False
+            ),
             imu_motion_prior_weight=getattr(self.args, "imu_motion_prior_weight", 0.0),
             imu_local_bias_prior_weight=getattr(self.args, "imu_local_bias_prior_weight", 0.0),
             imu_gravity=getattr(self.args, "imu_gravity", None),
@@ -141,6 +148,9 @@ class DroidBackend:
             imu_gyro_bias=getattr(self.net, "imu_gyro_bias", None),
             imu_acc_bias=getattr(self.net, "imu_acc_bias", None),
             use_joint_shared_bias_ba=getattr(self.args, "use_joint_shared_bias_ba", False),
+            use_joint_shared_bias_15dof=getattr(
+                self.args, "use_joint_shared_bias_15dof", False
+            ),
             imu_joint_bias_interval=getattr(self.args, "imu_joint_bias_interval", 10),
             imu_joint_bias_window=getattr(self.args, "imu_joint_bias_window", 30),
             imu_joint_bias_damping=getattr(self.args, "imu_joint_bias_damping", 1e-4),
@@ -215,6 +225,7 @@ class DroidAsyncBackend:
             imu_regularizer=self.imu_regularizer,
             apply_imu_residual=getattr(args, "use_imu_residual", False),
             use_learned_imu_confidence=getattr(args, "use_learned_imu_confidence", False),
+            use_learned_imu_precision=getattr(args, "use_learned_imu_precision", False),
             use_component_imu_confidence=getattr(args, "use_component_imu_confidence", False),
             use_dvi_imu_confidence=getattr(args, "use_dvi_imu_confidence", False),
             use_dvi_imu_quality_fusion=getattr(args, "use_dvi_imu_quality_fusion", False),
@@ -228,6 +239,10 @@ class DroidAsyncBackend:
             imu_full_pos_weight=getattr(args, "imu_full_pos_weight", 0.05),
             imu_full_vel_weight=getattr(args, "imu_full_vel_weight", 0.05),
             imu_full_bias_weight=getattr(args, "imu_full_bias_weight", 0.001),
+            use_imu_bias_random_walk=getattr(args, "use_imu_bias_random_walk", False),
+            use_imu_full_covariance_weighting=getattr(
+                args, "use_imu_full_covariance_weighting", False
+            ),
             imu_motion_prior_weight=getattr(args, "imu_motion_prior_weight", 0.0),
             imu_local_bias_prior_weight=getattr(args, "imu_local_bias_prior_weight", 0.0),
             imu_gravity=getattr(args, "imu_gravity", None),
@@ -255,6 +270,9 @@ class DroidAsyncBackend:
             imu_gyro_bias=getattr(net, "imu_gyro_bias", None),
             imu_acc_bias=getattr(net, "imu_acc_bias", None),
             use_joint_shared_bias_ba=getattr(args, "use_joint_shared_bias_ba", False),
+            # Async graphs are not the final full-sequence termination pass.
+            # Keep the 15DoF shared-bias solve exclusive to DroidBackend.
+            use_joint_shared_bias_15dof=False,
             imu_joint_bias_interval=getattr(args, "imu_joint_bias_interval", 10),
             imu_joint_bias_window=getattr(args, "imu_joint_bias_window", 30),
             imu_joint_bias_damping=getattr(args, "imu_joint_bias_damping", 1e-4),

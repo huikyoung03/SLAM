@@ -87,6 +87,101 @@ def geodesic_loss(Ps, Gs, graph, gamma=0.9, do_scale=True):
     return geodesic_loss, metrics
 
 
+def final_ba_pose_loss(Ps, Gs, graph, temporal_only=True, multi_horizon=False):
+    """Pose supervision on the *final* differentiable BA output.
+
+    This is deliberately different from :func:`geodesic_loss`: it does not
+    sum losses over every recurrent update and it never fits a scale.  The
+    intended use is to train the IMU-confidence branch from the actual pose
+    produced after the final full 15DoF BA update.  Consequently, an
+    interval receives a useful gradient only when its confidence improves the
+    final visual--inertial estimate, rather than simply agreeing with a
+    visual-prefix pose before BA.
+
+    Args:
+        Ps: ground-truth camera poses, ``[batch, frames]`` SE3.
+        Gs: final full-BA camera poses, ``[batch, frames]`` SE3.
+        graph: DROID optimization graph.
+        temporal_only: restrict supervision to adjacent frame edges.  These
+            are the edges on which the IMU factor exists; it avoids turning
+            non-temporal visual loop edges into a separate confidence target.
+        multi_horizon: supervise every sequential relative-pose horizon in
+            the training clip, with each horizon weighted equally.  This
+            complements adjacent IMU-factor supervision with a short
+            trajectory-shape objective, without GT Sim(3) alignment.
+    """
+    if multi_horizon:
+        num_frames = int(Ps.data.shape[1])
+        if num_frames < 2:
+            ii = torch.empty(0, dtype=torch.long, device=Ps.data.device)
+            jj = ii
+        else:
+            # Do not let horizon one dominate merely because it has more
+            # pairs. Each duration estimates one scale of trajectory drift.
+            horizon_terms = []
+            translation_terms = []
+            rotation_terms = []
+            for horizon in range(1, num_frames):
+                ii_h = torch.arange(
+                    0, num_frames - horizon, dtype=torch.long, device=Ps.data.device
+                )
+                jj_h = ii_h + horizon
+                dP_h = Ps[:, jj_h] * Ps[:, ii_h].inv()
+                dG_h = Gs[:, jj_h] * Gs[:, ii_h].inv()
+                tau_h, phi_h = (dG_h * dP_h.inv()).log().split([3, 3], dim=-1)
+                translation_h = tau_h.norm(dim=-1).mean()
+                rotation_h = phi_h.norm(dim=-1).mean()
+                translation_terms.append(translation_h)
+                rotation_terms.append(rotation_h)
+                horizon_terms.append(translation_h + rotation_h)
+
+            translation = torch.stack(translation_terms).mean()
+            rotation = torch.stack(rotation_terms).mean()
+            total = torch.stack(horizon_terms).mean()
+            return total, {
+                "post_ba_pose_loss": float(total.detach().item()),
+                "post_ba_pose_translation": float(translation.detach().item()),
+                "post_ba_pose_rotation": float(rotation.detach().item()),
+                "post_ba_pose_edges": float(sum(num_frames - h for h in range(1, num_frames))),
+                "post_ba_pose_horizons": float(num_frames - 1),
+            }
+    else:
+        ii, jj, _ = graph_to_edge_list(graph)
+        if temporal_only:
+            temporal = (ii - jj).abs() == 1
+            if temporal.any():
+                ii = ii[temporal]
+                jj = jj[temporal]
+
+    if ii.numel() == 0:
+        zero = torch.zeros((), dtype=Gs.data.dtype, device=Gs.data.device)
+        return zero, {
+            "post_ba_pose_loss": 0.0,
+            "post_ba_pose_translation": 0.0,
+            "post_ba_pose_rotation": 0.0,
+            "post_ba_pose_edges": 0.0,
+            "post_ba_pose_horizons": 0.0,
+        }
+
+    # No Sim(3)/scale alignment belongs in this training objective.  The
+    # evaluation protocol may use global Sim(3), but confidence must improve
+    # the metric pose and relative motion supplied by the training sequence.
+    dP = Ps[:, jj] * Ps[:, ii].inv()
+    dG = Gs[:, jj] * Gs[:, ii].inv()
+    tau, phi = (dG * dP.inv()).log().split([3, 3], dim=-1)
+    translation = tau.norm(dim=-1).mean()
+    rotation = phi.norm(dim=-1).mean()
+    total = translation + rotation
+
+    return total, {
+        "post_ba_pose_loss": float(total.detach().item()),
+        "post_ba_pose_translation": float(translation.detach().item()),
+        "post_ba_pose_rotation": float(rotation.detach().item()),
+        "post_ba_pose_edges": float(ii.numel()),
+        "post_ba_pose_horizons": 1.0,
+    }
+
+
 def residual_loss(residuals, gamma=0.9):
     """ loss on system residuals """
     residual_loss = 0.0
