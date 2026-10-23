@@ -1589,6 +1589,15 @@ if __name__ == '__main__':
         help="iterations in the primary final global 15DoF backend pass",
     )
     parser.add_argument(
+        "--imu_two_stage_global_visual_pre_steps",
+        type=int,
+        default=0,
+        help=(
+            "DROID visual-only global-BA iterations before the final 15DoF "
+            "backend pass; zero keeps the historical VI schedule"
+        ),
+    )
+    parser.add_argument(
         "--imu_two_stage_matched_post_steps",
         type=int,
         default=0,
@@ -2047,6 +2056,10 @@ if __name__ == '__main__':
             raise ValueError("--imu_two_stage_visual_steps must be non-negative")
         if args.imu_two_stage_full_steps < 0:
             raise ValueError("--imu_two_stage_full_steps must be non-negative")
+        if args.imu_two_stage_global_visual_pre_steps < 0:
+            raise ValueError(
+                "--imu_two_stage_global_visual_pre_steps must be non-negative"
+            )
         print(
             "[IMU] two-stage mode: local pose-only -> full 15DoF; "
             "one global full-state backend pass; "

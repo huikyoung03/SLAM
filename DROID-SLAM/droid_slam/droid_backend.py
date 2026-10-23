@@ -86,8 +86,14 @@ class DroidBackend:
         )
 
     @torch.no_grad()
-    def __call__(self, steps=12, normalize=True):
-        """ main update """
+    def __call__(self, steps=12, normalize=True, visual_only=False):
+        """Run one global backend pass.
+
+        ``visual_only`` retains DROID's original visual global BA as a
+        preconditioning step before the two-stage 15DoF backend solve.  It is
+        local to this call so an IMU pass that follows cannot inherit disabled
+        inertial flags from the visual pass.
+        """
 
         t = self.video.counter.value
         if normalize:
@@ -101,19 +107,42 @@ class DroidBackend:
             max_factors=16 * t,
             upsample=self.upsample,
             imu_regularizer=self.imu_regularizer,
-            apply_imu_residual=getattr(self.args, "use_imu_residual", False),
-            use_learned_imu_confidence=getattr(self.args, "use_learned_imu_confidence", False),
-            use_learned_imu_precision=getattr(self.args, "use_learned_imu_precision", False),
-            use_component_imu_confidence=getattr(self.args, "use_component_imu_confidence", False),
-            use_dvi_imu_confidence=getattr(self.args, "use_dvi_imu_confidence", False),
-            use_dvi_imu_quality_fusion=getattr(self.args, "use_dvi_imu_quality_fusion", False),
+            apply_imu_residual=(
+                not visual_only and getattr(self.args, "use_imu_residual", False)
+            ),
+            use_learned_imu_confidence=(
+                not visual_only
+                and getattr(self.args, "use_learned_imu_confidence", False)
+            ),
+            use_learned_imu_precision=(
+                not visual_only
+                and getattr(self.args, "use_learned_imu_precision", False)
+            ),
+            use_component_imu_confidence=(
+                not visual_only
+                and getattr(self.args, "use_component_imu_confidence", False)
+            ),
+            use_dvi_imu_confidence=(
+                not visual_only
+                and getattr(self.args, "use_dvi_imu_confidence", False)
+            ),
+            use_dvi_imu_quality_fusion=(
+                not visual_only
+                and getattr(self.args, "use_dvi_imu_quality_fusion", False)
+            ),
             imu_confidence_floor=getattr(self.args, "imu_confidence_floor", 0.0),
             imu_tuned_confidence_schedule=getattr(self.args, "imu_tuned_confidence_schedule", None),
-            use_imu_ba_prior=getattr(self.args, "use_imu_ba_prior", False),
+            use_imu_ba_prior=(
+                not visual_only and getattr(self.args, "use_imu_ba_prior", False)
+            ),
             imu_ba_prior_weight=getattr(self.args, "imu_ba_prior_weight", 0.0),
             imu_ba_prior_max_deg=getattr(self.args, "imu_ba_prior_max_deg", 45.0),
-            use_full_imu_ba=getattr(self.args, "use_full_imu_ba", False),
-            require_imu_alignment=getattr(self.args, "use_vi_initialization", False),
+            use_full_imu_ba=(
+                not visual_only and getattr(self.args, "use_full_imu_ba", False)
+            ),
+            require_imu_alignment=(
+                not visual_only and getattr(self.args, "use_vi_initialization", False)
+            ),
             imu_full_pos_weight=getattr(self.args, "imu_full_pos_weight", 0.05),
             imu_full_vel_weight=getattr(self.args, "imu_full_vel_weight", 0.05),
             imu_full_bias_weight=getattr(self.args, "imu_full_bias_weight", 0.001),
@@ -147,10 +176,13 @@ class DroidBackend:
             imu_optimize_bias=not getattr(self.args, "use_pose_velocity_imu_ba", False),
             imu_gyro_bias=getattr(self.net, "imu_gyro_bias", None),
             imu_acc_bias=getattr(self.net, "imu_acc_bias", None),
-            use_joint_shared_bias_ba=getattr(self.args, "use_joint_shared_bias_ba", False),
+            use_joint_shared_bias_ba=(
+                not visual_only
+                and getattr(self.args, "use_joint_shared_bias_ba", False)
+            ),
             use_joint_shared_bias_15dof=getattr(
                 self.args, "use_joint_shared_bias_15dof", False
-            ),
+            ) and not visual_only,
             imu_joint_bias_interval=getattr(self.args, "imu_joint_bias_interval", 10),
             imu_joint_bias_window=getattr(self.args, "imu_joint_bias_window", 30),
             imu_joint_bias_damping=getattr(self.args, "imu_joint_bias_damping", 1e-4),

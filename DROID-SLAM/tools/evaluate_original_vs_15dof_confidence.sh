@@ -103,6 +103,9 @@ USE_JOINT_SHARED_BIAS_15DOF="${USE_JOINT_SHARED_BIAS_15DOF:-0}"
 # the same final global 15DoF solve.
 IMU_TWO_STAGE_VISUAL_STEPS="${IMU_TWO_STAGE_VISUAL_STEPS:-3}"
 IMU_TWO_STAGE_FULL_STEPS="${IMU_TWO_STAGE_FULL_STEPS:-2}"
+# Set to seven to reproduce DROID's first termination-time global visual BA
+# before the final VI backend pass. Zero preserves prior 15DoF experiments.
+IMU_TWO_STAGE_GLOBAL_VISUAL_PRE_STEPS="${IMU_TWO_STAGE_GLOBAL_VISUAL_PRE_STEPS:-0}"
 
 export LD_LIBRARY_PATH="/home/ubuntu/miniconda3/envs/droid_env/lib:${LD_LIBRARY_PATH:-}"
 cd "$ROOT"
@@ -247,6 +250,10 @@ if ! [[ "$IMU_TWO_STAGE_FULL_STEPS" =~ ^[0-9]+$ ]]; then
   echo "IMU_TWO_STAGE_FULL_STEPS must be a non-negative integer, got: $IMU_TWO_STAGE_FULL_STEPS" >&2
   exit 2
 fi
+if ! [[ "$IMU_TWO_STAGE_GLOBAL_VISUAL_PRE_STEPS" =~ ^[0-9]+$ ]]; then
+  echo "IMU_TWO_STAGE_GLOBAL_VISUAL_PRE_STEPS must be a non-negative integer, got: $IMU_TWO_STAGE_GLOBAL_VISUAL_PRE_STEPS" >&2
+  exit 2
+fi
 if ! "$PYTHON" - "$GLOBAL_BIAS_REFINEMENT_WEIGHT" <<'PY'
 import math
 import sys
@@ -374,6 +381,7 @@ mkdir -p "$OUT_DIR"
   echo "use_joint_shared_bias_15dof=$USE_JOINT_SHARED_BIAS_15DOF"
   echo "imu_two_stage_visual_steps=$IMU_TWO_STAGE_VISUAL_STEPS"
   echo "imu_two_stage_full_steps=$IMU_TWO_STAGE_FULL_STEPS"
+  echo "imu_two_stage_global_visual_pre_steps=$IMU_TWO_STAGE_GLOBAL_VISUAL_PRE_STEPS"
   git rev-parse HEAD
   git status --short
 } > "$OUT_DIR/run_manifest.txt"
@@ -453,6 +461,7 @@ echo "[RUN] $RUN_LABEL"
   --use_two_stage_imu_ba \
   --imu_two_stage_visual_steps "$IMU_TWO_STAGE_VISUAL_STEPS" \
   --imu_two_stage_full_steps "$IMU_TWO_STAGE_FULL_STEPS" \
+  --imu_two_stage_global_visual_pre_steps "$IMU_TWO_STAGE_GLOBAL_VISUAL_PRE_STEPS" \
   --no_vi_init_bootstrap \
   --use_imu_noise_model \
   "${IMU_OBJECTIVE_ARGS[@]}" \

@@ -743,6 +743,32 @@ class Droid:
                 global_steps = max(
                     1, int(getattr(self.args, "imu_two_stage_global_steps", 12))
                 )
+                visual_pre_steps = max(
+                    0,
+                    int(
+                        getattr(
+                            self.args,
+                            "imu_two_stage_global_visual_pre_steps",
+                            0,
+                        )
+                    ),
+                )
+                if visual_pre_steps > 0:
+                    # Stock DROID performs an initial global visual BA pass
+                    # before its final global refinement.  The historical
+                    # two-stage VI path replaced that pass with the full IMU
+                    # objective, so it did not start its global solve from
+                    # the same visual optimum as the baseline.  Keep the
+                    # visual pass explicit, then construct a fresh full-IMU
+                    # graph for the actual VI refinement below.
+                    print(
+                        "[IMU] running DROID-compatible visual-only global "
+                        f"pre-pass (steps={visual_pre_steps}) before 15DoF BA"
+                    )
+                    self.backend(visual_pre_steps, visual_only=True)
+                    record_imu_state_diagnostics(
+                        self.video, "post_backend_visual_pre_15dof"
+                    )
                 print("[IMU] running one global joint 15DoF backend refinement")
                 self.backend(global_steps)
                 record_imu_state_diagnostics(self.video, "post_backend_final")
