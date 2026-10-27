@@ -1,5 +1,0 @@
-label,checkpoint
-learned_002000,/home/ubuntu/DROID-SLAM/checkpoints/dvi_mh03_10fps_parity_ramp_8000_002000.pth
-learned_004000,/home/ubuntu/DROID-SLAM/checkpoints/dvi_mh03_10fps_parity_ramp_8000_004000.pth
-learned_006000,/home/ubuntu/DROID-SLAM/checkpoints/dvi_mh03_10fps_parity_ramp_8000_006000.pth
-learned_008000,/home/ubuntu/DROID-SLAM/checkpoints/dvi_mh03_10fps_parity_ramp_8000_008000.pth

@@ -86,6 +86,8 @@ class ImuCalibration:
     gyro_random_walk: float = 0.0
     accel_noise_density: float = 0.0
     accel_random_walk: float = 0.0
+    # Applied as t_imu_aligned = t_imu_raw + offset before matching camera frames.
+    imu_time_offset_sec: float = 0.0
 
 
 def to_float(value: Any, default: float = 0.0) -> float:
@@ -329,6 +331,11 @@ def build_imu_calibration(
     imu_to_cam_translation: Optional[Sequence[float]] = None,
     gyro_bias: Optional[Sequence[float]] = None,
     acc_bias: Optional[Sequence[float]] = None,
+    gyro_noise_density: Optional[float] = None,
+    gyro_random_walk: Optional[float] = None,
+    accel_noise_density: Optional[float] = None,
+    accel_random_walk: Optional[float] = None,
+    imu_time_offset_sec: Optional[float] = None,
 ) -> ImuCalibration:
     """
     Build the static transform used to express IMU measurements in camera frame.
@@ -389,6 +396,25 @@ def build_imu_calibration(
         )
 
     imu_yaml = imu_sensor_yaml if imu_sensor_yaml is not None else None
+
+    def calibrated_noise(value: Optional[float], yaml_key: str) -> float:
+        """Prefer an explicit device profile value over optional EuRoC YAML."""
+        if value is not None:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                parsed = float("nan")
+            if math.isfinite(parsed) and parsed > 0.0:
+                return parsed
+        return read_yaml_scalar(imu_yaml, yaml_key)
+
+    try:
+        time_offset = float(imu_time_offset_sec) if imu_time_offset_sec is not None else 0.0
+    except (TypeError, ValueError):
+        time_offset = 0.0
+    if not math.isfinite(time_offset):
+        raise ValueError("imu_time_offset_sec must be finite")
+
     return ImuCalibration(
         R_imu_to_camera=R_imu_to_camera,
         t_imu_to_camera=t_imu_to_camera,
@@ -397,10 +423,11 @@ def build_imu_calibration(
         source=source,
         gyro_bias=parse_vector3(gyro_bias),
         acc_bias=parse_vector3(acc_bias),
-        gyro_noise_density=read_yaml_scalar(imu_yaml, "gyroscope_noise_density"),
-        gyro_random_walk=read_yaml_scalar(imu_yaml, "gyroscope_random_walk"),
-        accel_noise_density=read_yaml_scalar(imu_yaml, "accelerometer_noise_density"),
-        accel_random_walk=read_yaml_scalar(imu_yaml, "accelerometer_random_walk"),
+        gyro_noise_density=calibrated_noise(gyro_noise_density, "gyroscope_noise_density"),
+        gyro_random_walk=calibrated_noise(gyro_random_walk, "gyroscope_random_walk"),
+        accel_noise_density=calibrated_noise(accel_noise_density, "accelerometer_noise_density"),
+        accel_random_walk=calibrated_noise(accel_random_walk, "accelerometer_random_walk"),
+        imu_time_offset_sec=time_offset,
     )
 
 
@@ -747,8 +774,8 @@ def load_imu(
             gx, gy, gz = mat3_vec(calibration.R_imu_to_camera, (gx, gy, gz))
             ax, ay, az = mat3_vec(calibration.R_imu_to_camera, (ax, ay, az))
 
-            timestamp_ns = to_int_ns(row)
-            timestamp_sec = to_float(row.get("timestamp_sec"), timestamp_ns / 1e9)
+            timestamp_ns = to_int_ns(row) + int(round(calibration.imu_time_offset_sec * 1e9))
+            timestamp_sec = timestamp_ns / 1e9
 
             samples.append({
                 "timestamp_sec": timestamp_sec,
@@ -1413,6 +1440,7 @@ def build_imu_prior(
             "gyro_random_walk": f"{calibration.gyro_random_walk:.12e}",
             "accel_noise_density": f"{calibration.accel_noise_density:.12e}",
             "accel_random_walk": f"{calibration.accel_random_walk:.12e}",
+            "imu_time_offset_sec": f"{calibration.imu_time_offset_sec:.12e}",
             "rot_var": f"{uncertainty['rot_var']:.12e}",
             "vel_var": f"{uncertainty['vel_var']:.12e}",
             "pos_var": f"{uncertainty['pos_var']:.12e}",
@@ -1478,6 +1506,7 @@ def build_imu_prior(
         f"{calibration.t_imu_to_camera[1]:.6f}, "
         f"{calibration.t_imu_to_camera[2]:.6f})"
     )
+    print(f"[INFO] imu_time_offset_sec={calibration.imu_time_offset_sec:.9f}")
 
     return {
         "frames": len(frames),
@@ -1560,6 +1589,36 @@ def parse_args() -> argparse.Namespace:
         metavar=("BAX", "BAY", "BAZ"),
         help="constant accelerometer bias to subtract before integration",
     )
+    parser.add_argument(
+        "--gyro_noise_density",
+        type=float,
+        default=None,
+        help="calibrated gyroscope noise density in rad/s/sqrt(Hz)",
+    )
+    parser.add_argument(
+        "--gyro_random_walk",
+        type=float,
+        default=None,
+        help="calibrated gyroscope bias random walk in rad/s^2/sqrt(Hz)",
+    )
+    parser.add_argument(
+        "--accel_noise_density",
+        type=float,
+        default=None,
+        help="calibrated accelerometer noise density in m/s^2/sqrt(Hz)",
+    )
+    parser.add_argument(
+        "--accel_random_walk",
+        type=float,
+        default=None,
+        help="calibrated accelerometer bias random walk in m/s^3/sqrt(Hz)",
+    )
+    parser.add_argument(
+        "--imu_time_offset_sec",
+        type=float,
+        default=None,
+        help="apply t_imu_aligned = t_imu_raw + offset before camera-frame matching",
+    )
     return parser.parse_args()
 
 
@@ -1600,6 +1659,11 @@ def main() -> None:
         imu_to_cam_translation=args.imu_to_cam_translation,
         gyro_bias=args.gyro_bias,
         acc_bias=args.acc_bias,
+        gyro_noise_density=args.gyro_noise_density,
+        gyro_random_walk=args.gyro_random_walk,
+        accel_noise_density=args.accel_noise_density,
+        accel_random_walk=args.accel_random_walk,
+        imu_time_offset_sec=args.imu_time_offset_sec,
     )
 
     build_imu_prior(frames_csv, imu_csv, output_csv, calibration=calibration)

@@ -2,7 +2,7 @@ import torch
 import lietorch
 import numpy as np
 
-from droid_net import DroidNet
+from droid_net import DroidNet, upgrade_direct_precision_quality_checkpoint
 from depth_video import DepthVideo
 from motion_filter import MotionFilter
 from droid_frontend import DroidFrontend
@@ -293,6 +293,11 @@ class Droid:
         ])
 
         model_state = self.net.state_dict()
+        if upgrade_direct_precision_quality_checkpoint(state_dict, model_state):
+            print(
+                "[CKPT] expanded direct IMU-quality input 7D -> 10D; "
+                "new discrepancy columns are zero-initialized"
+            )
         incompatible = [
             key for key, value in state_dict.items()
             if key in model_state and value.shape != model_state[key].shape

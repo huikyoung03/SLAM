@@ -32,7 +32,7 @@ from geom.imu_factor import temporal_imu_quality_features
 from geom.graph_utils import build_frame_graph
 
 # DROID neural network
-from droid_net import DroidNet
+from droid_net import DroidNet, upgrade_direct_precision_quality_checkpoint
 from imu_runtime import (
     configure_imu_noise_model,
     configure_learned_imu_precision_weighting,
@@ -139,6 +139,11 @@ def freeze_non_imu_parameters(
     use_dvi_imu_confidence=False,
     use_dvi_imu_quality_fusion=False,
     use_learned_imu_precision=False,
+    use_imu_precision_discrepancy=False,
+    use_imu_precision_innovation=False,
+    use_imu_precision_visual_innovation=False,
+    use_imu_precision_edge_fusion=False,
+    freeze_existing_imu_precision=False,
     freeze_imu_ba_weight=False,
     freeze_imu_confidence_head=False,
     imu_confidence_only_weighting=False,
@@ -200,12 +205,22 @@ def freeze_non_imu_parameters(
         # head at its neutral value so the two mechanisms are identifiable.
         if not freeze_imu_confidence_head:
             if use_learned_imu_precision:
-                for module in (
-                    model.update.imu_precision_visual,
-                    model.update.imu_precision_quality,
-                    model.update.imu_precision_fusion,
-                ):
-                    for p in module.parameters():
+                if not freeze_existing_imu_precision:
+                    for module in (
+                        model.update.imu_precision_visual,
+                        model.update.imu_precision_quality,
+                        model.update.imu_precision_fusion,
+                    ):
+                        for p in module.parameters():
+                            p.requires_grad_(True)
+                    if use_imu_precision_innovation:
+                        for p in model.update.imu_precision_innovation.parameters():
+                            p.requires_grad_(True)
+                if use_imu_precision_visual_innovation:
+                    for p in model.update.imu_precision_visual_innovation.parameters():
+                        p.requires_grad_(True)
+                if use_imu_precision_edge_fusion:
+                    for p in model.update.imu_precision_edge_fusion.parameters():
                         p.requires_grad_(True)
             elif use_component_imu_confidence:
                 for p in model.update.imu_component_confidence.parameters():
@@ -579,7 +594,8 @@ def augment_imu_confidence_inputs(
     corresponding integration powers of ``dt`` is therefore the equivalent
     of perturbing the raw gyro/accelerometer stream before preintegration:
 
-    * white gyro/accelerometer noise changes ``dR``/``dv``/``dp``;
+    * gyro noise changes ``dR`` while accelerometer noise changes ``dv`` and
+      ``dp`` in this factor-level model;
     * random-walk bias is cumulative over the selected clip;
     * a short sample dropout is represented as a held/incomplete interval
       with greatly reduced information, but remains a valid factor so the
@@ -591,11 +607,13 @@ def augment_imu_confidence_inputs(
 
     Returns augmented ``(delta, info, degraded_mask, dropout_mask,
     reliability_target)``. ``reliability_target`` is a known, train-only
-    R/v/p information fraction induced by this augmentation: one for a clean
-    interval, 0.5 for injected noise/drift, and ``dropout_info_scale`` for a
-    held/dropout interval. It is not used at inference. The two masks refer
-    to temporal factors and have the same ``[B, N]`` layout as ``imu_valid``;
-    frame zero is always false.
+    component-wise ``[R, v, p]`` information fraction induced by this
+    augmentation. A gyro corruption supervises only the rotation channel;
+    an accelerometer corruption supervises velocity and position; a dropout
+    attenuates every channel. This prevents the three-output precision head
+    from receiving the same synthetic target for every component. It is not
+    used at inference. The two masks refer to temporal factors and have the
+    same ``[B, N]`` layout as ``imu_valid``; frame zero is always false.
     """
 
     if imu_delta is None:
@@ -634,9 +652,31 @@ def augment_imu_confidence_inputs(
 
     temporal_valid = valid.clone()
     temporal_valid[:, 0] = False
-    random_bad = (
+    corruption_event = (
         torch.rand((batch, num_frames), device=delta.device) < probability
     ) & temporal_valid
+
+    # A factor-level corruption is assigned to gyro, accelerometer, or both
+    # sources. Keeping the *event* probability unchanged preserves the
+    # previous augmentation rate while creating R/v/p-specific supervision:
+    # 40% gyro-only, 20% joint, 40% accelerometer-only when both sources are
+    # enabled. If only one source is configured, every event affects it.
+    gyro_enabled = (
+        float(gyro_noise_std) > 0.0 or float(gyro_bias_drift_std) > 0.0
+    )
+    accel_enabled = (
+        float(accel_noise_std) > 0.0 or float(accel_bias_drift_std) > 0.0
+    )
+    gyro_event = torch.zeros_like(corruption_event)
+    accel_event = torch.zeros_like(corruption_event)
+    if gyro_enabled and accel_enabled:
+        source_draw = torch.rand((batch, num_frames), device=delta.device)
+        gyro_event = corruption_event & (source_draw < 0.6)
+        accel_event = corruption_event & (source_draw >= 0.4)
+    elif gyro_enabled:
+        gyro_event = corruption_event
+    elif accel_enabled:
+        accel_event = corruption_event
 
     # Draw contiguous short dropout runs per clip.  An actual invalid runtime
     # interval is omitted by BA; this train-only partial-dropout model instead
@@ -657,18 +697,36 @@ def augment_imu_confidence_inputs(
             batch_index, start:start + length
         ]
 
-    degraded = random_bad | dropout
-    # This target is derived from the same physically meaningful information
-    # reduction applied below. It supplies a direct discrimination signal to
-    # the learned attenuation head without introducing a global IMU lambda.
+    # A random-walk perturbation remains active after its first injected
+    # source event. Its target must cover that suffix too; otherwise the
+    # calibration loss would incorrectly label drift-corrupted rows as clean.
+    gyro_drift_active = torch.zeros_like(gyro_event)
+    accel_drift_active = torch.zeros_like(accel_event)
+    if float(gyro_bias_drift_std) > 0.0:
+        gyro_drift_active = gyro_event.cumsum(dim=1) > 0
+    if float(accel_bias_drift_std) > 0.0:
+        accel_drift_active = accel_event.cumsum(dim=1) > 0
+
+    gyro_affected = gyro_event | gyro_drift_active
+    accel_affected = accel_event | accel_drift_active
+    degraded = gyro_affected | accel_affected | dropout
+
+    # This target follows the same component-specific information reduction
+    # applied below. It supplies a direct discrimination signal to the
+    # learned attenuation head without introducing a global IMU lambda.
     ordinary_info_scale = 0.5
     reliability_target = torch.ones(
         (batch, num_frames, 3), device=delta.device, dtype=delta.dtype
     )
-    reliability_target = torch.where(
-        random_bad.unsqueeze(-1),
-        reliability_target * ordinary_info_scale,
-        reliability_target,
+    reliability_target[..., 0] = torch.where(
+        gyro_affected,
+        reliability_target[..., 0] * ordinary_info_scale,
+        reliability_target[..., 0],
+    )
+    reliability_target[..., 1:3] = torch.where(
+        accel_affected.unsqueeze(-1),
+        reliability_target[..., 1:3] * ordinary_info_scale,
+        reliability_target[..., 1:3],
     )
     reliability_target = torch.where(
         dropout.unsqueeze(-1),
@@ -679,28 +737,28 @@ def augment_imu_confidence_inputs(
         return delta, info, degraded, dropout, reliability_target
 
     dt = delta[..., 0:1].clamp_min(1e-4)
-    factor_mask = random_bad.unsqueeze(-1).to(dtype=delta.dtype)
+    gyro_event_mask = gyro_event.unsqueeze(-1).to(dtype=delta.dtype)
+    accel_event_mask = accel_event.unsqueeze(-1).to(dtype=delta.dtype)
     sqrt_dt = dt.sqrt()
 
     gyro_noise_std = float(gyro_noise_std)
     accel_noise_std = float(accel_noise_std)
     if gyro_noise_std > 0.0:
-        delta[..., 1:4] = delta[..., 1:4] + factor_mask * (
+        delta[..., 1:4] = delta[..., 1:4] + gyro_event_mask * (
             torch.randn_like(delta[..., 1:4]) * gyro_noise_std * sqrt_dt
         )
     if accel_noise_std > 0.0:
         acceleration_noise = (
             torch.randn_like(delta[..., 4:7]) * accel_noise_std * sqrt_dt
         )
-        delta[..., 4:7] = delta[..., 4:7] + factor_mask * acceleration_noise
-        delta[..., 7:10] = delta[..., 7:10] + factor_mask * (
+        delta[..., 4:7] = delta[..., 4:7] + accel_event_mask * acceleration_noise
+        delta[..., 7:10] = delta[..., 7:10] + accel_event_mask * (
             0.5 * acceleration_noise * dt
         )
 
-    # The drift is a per-clip random walk in physical bias units.  It is only
-    # active for clips that contain a synthetic bad interval, which keeps a
-    # clean clip genuinely clean and provides clean-vs-degraded ranking pairs.
-    clip_has_bad = random_bad.any(dim=1, keepdim=True).unsqueeze(-1)
+    # The drift is a per-clip random walk in physical bias units. It begins at
+    # the first matching source event and stays active afterwards, matching
+    # ``*_drift_active`` and the component-wise supervision above.
     gyro_bias_drift_std = float(gyro_bias_drift_std)
     accel_bias_drift_std = float(accel_bias_drift_std)
     if gyro_bias_drift_std > 0.0:
@@ -708,14 +766,19 @@ def augment_imu_confidence_inputs(
             torch.randn_like(delta[..., 1:4]) * gyro_bias_drift_std * sqrt_dt,
             dim=1,
         )
-        delta[..., 1:4] = delta[..., 1:4] + gyro_drift * dt * clip_has_bad
+        delta[..., 1:4] = delta[..., 1:4] + (
+            gyro_drift * dt * gyro_drift_active.unsqueeze(-1).to(delta.dtype)
+        )
     if accel_bias_drift_std > 0.0:
         accel_drift = torch.cumsum(
             torch.randn_like(delta[..., 4:7]) * accel_bias_drift_std * sqrt_dt,
             dim=1,
         )
-        delta[..., 4:7] = delta[..., 4:7] + accel_drift * dt * clip_has_bad
-        delta[..., 7:10] = delta[..., 7:10] + 0.5 * accel_drift * dt.square() * clip_has_bad
+        accel_drift_mask = accel_drift_active.unsqueeze(-1).to(delta.dtype)
+        delta[..., 4:7] = delta[..., 4:7] + accel_drift * dt * accel_drift_mask
+        delta[..., 7:10] = delta[..., 7:10] + (
+            0.5 * accel_drift * dt.square() * accel_drift_mask
+        )
 
     if bool(dropout.any().detach().cpu().item()):
         # A zero-order-held interval is a conservative proxy for a short raw
@@ -737,10 +800,15 @@ def augment_imu_confidence_inputs(
         # The raw-quality MLP can see the lower propagated information.  The
         # factor is still valid: confidence, rather than a hard validity gate,
         # learns the remaining attenuation.
-        info[..., :3] = torch.where(
-            random_bad.unsqueeze(-1),
-            info[..., :3] * ordinary_info_scale,
-            info[..., :3],
+        info[..., 0] = torch.where(
+            gyro_affected,
+            info[..., 0] * ordinary_info_scale,
+            info[..., 0],
+        )
+        info[..., 1:3] = torch.where(
+            accel_affected.unsqueeze(-1),
+            info[..., 1:3] * ordinary_info_scale,
+            info[..., 1:3],
         )
         info[..., :3] = torch.where(
             dropout.unsqueeze(-1),
@@ -878,8 +946,9 @@ def select_full_imu_stage_outputs(
     imu_confidences,
     imu_motions,
     pose_only_steps,
+    full_imu_schedule=None,
 ):
-    """Select only the full-IMU suffix of an unrolled two-stage solve.
+    """Select the full-IMU outputs of an unrolled two-stage solve.
 
     ``DroidNet`` keeps pose and confidence outputs aligned with every unroll
     step, but initializes and returns motion states only after the visual-only
@@ -900,14 +969,76 @@ def select_full_imu_stage_outputs(
             f"confidence={len(imu_confidences)}, poses={len(poses_est)}"
         )
 
-    stage_poses = poses_est[start:]
-    stage_confidences = imu_confidences[start:] if imu_confidences else []
+    if full_imu_schedule is None:
+        full_indices = list(range(start, len(poses_est)))
+    else:
+        if len(full_imu_schedule) != len(poses_est):
+            raise ValueError(
+                "full IMU schedule must align with unrolled poses: "
+                f"schedule={len(full_imu_schedule)}, poses={len(poses_est)}"
+            )
+        full_indices = [
+            index for index, enabled in enumerate(full_imu_schedule) if bool(enabled)
+        ]
+        if not full_indices:
+            raise ValueError("full IMU schedule must contain at least one full step")
+
+    stage_poses = [poses_est[index] for index in full_indices]
+    stage_confidences = (
+        [imu_confidences[index] for index in full_indices]
+        if imu_confidences
+        else []
+    )
     if imu_motions and len(imu_motions) != len(stage_poses):
         raise ValueError(
             "DroidNet IMU motion outputs must cover exactly the full-IMU "
-            f"suffix: motion={len(imu_motions)}, full_steps={len(stage_poses)}"
+            f"steps: motion={len(imu_motions)}, full_steps={len(stage_poses)}"
         )
     return stage_poses, stage_confidences, imu_motions
+
+
+def parse_imu_train_stage_schedule(spec, num_steps, use_full_imu_ba, pose_only_steps):
+    """Parse a runtime-matched visual/full DBA schedule.
+
+    The compact CLI grammar is ``visual:3,full:2,visual:7,full:12``.  The
+    result is a boolean list consumed by ``DroidNet``; ``True`` means one
+    full 15DoF DBA unroll.  If omitted, the historical visual-prefix/full-
+    suffix schedule remains exactly unchanged.
+    """
+
+    num_steps = int(num_steps)
+    if spec is None or not str(spec).strip():
+        return [step >= int(pose_only_steps) for step in range(num_steps)] if use_full_imu_ba else [False] * num_steps
+    if not use_full_imu_ba:
+        raise ValueError('--imu_train_stage_schedule requires --use_full_imu_ba')
+
+    schedule = []
+    for segment in str(spec).split(','):
+        name, separator, count_text = segment.strip().partition(':')
+        name = name.strip().lower()
+        if not separator or name not in ('visual', 'full'):
+            raise ValueError(
+                '--imu_train_stage_schedule expects e.g. '
+                'visual:3,full:2,visual:7,full:12'
+            )
+        try:
+            count = int(count_text.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f'invalid schedule count in {segment!r}'
+            ) from exc
+        if count < 0:
+            raise ValueError('IMU training schedule counts must be non-negative')
+        schedule.extend([name == 'full'] * count)
+
+    if len(schedule) != num_steps:
+        raise ValueError(
+            '--imu_train_stage_schedule length must equal --iters: '
+            f'{len(schedule)} != {num_steps}'
+        )
+    if not any(schedule):
+        raise ValueError('--imu_train_stage_schedule requires at least one full step')
+    return schedule
 
 
 def train(gpu, args):
@@ -969,6 +1100,13 @@ def train(gpu, args):
         # such stale auxiliary-head tensors while retaining all original
         # visual DROID weights.
         model_state = model.state_dict()
+        if upgrade_direct_precision_quality_checkpoint(
+            state_dict, model_state
+        ) and gpu == 0:
+            print(
+                "[CKPT] expanded direct IMU-quality input 7D -> 10D; "
+                "new discrepancy columns are zero-initialized"
+            )
         incompatible = [
             key for key, value in state_dict.items()
             if key in model_state and value.shape != model_state[key].shape
@@ -1070,11 +1208,20 @@ def train(gpu, args):
     imu_train_pose_only_steps = (
         args.imu_train_pose_only_steps if args.use_full_imu_ba else 0
     )
+    imu_train_full_schedule = list(getattr(args, 'imu_train_full_schedule', []))
+    if not imu_train_full_schedule:
+        imu_train_full_schedule = parse_imu_train_stage_schedule(
+            args.imu_train_stage_schedule,
+            args.iters,
+            args.use_full_imu_ba,
+            imu_train_pose_only_steps,
+        )
     if gpu == 0 and args.use_full_imu_ba:
+        stage_text = ''.join('F' if enabled else 'V' for enabled in imu_train_full_schedule)
         print(
             "[TRAIN] full IMU unroll schedule: "
-            f"pose_only={imu_train_pose_only_steps}, "
-            f"full_15dof={args.iters - imu_train_pose_only_steps}"
+            f"visual={sum(not enabled for enabled in imu_train_full_schedule)}, "
+            f"full_15dof={sum(imu_train_full_schedule)}, stages={stage_text}"
         )
 
     # IMU 데이터를 dataset에서 로드해야 하는지 여부
@@ -1205,6 +1352,12 @@ def train(gpu, args):
             p.requires_grad_(False)
         for p in model.update.imu_precision_fusion.parameters():
             p.requires_grad_(False)
+        for p in model.update.imu_precision_innovation.parameters():
+            p.requires_grad_(False)
+        for p in model.update.imu_precision_visual_innovation.parameters():
+            p.requires_grad_(False)
+        for p in model.update.imu_precision_edge_fusion.parameters():
+            p.requires_grad_(False)
 
     if (
         args.freeze_imu_ba_weight
@@ -1229,6 +1382,26 @@ def train(gpu, args):
             model.update.dvi_imu_quality_fusion,
         ):
             for p in module.parameters():
+                p.requires_grad_(False)
+        if (
+            args.freeze_existing_imu_precision
+            or not args.use_imu_precision_innovation
+        ):
+            for p in model.update.imu_precision_innovation.parameters():
+                p.requires_grad_(False)
+        if args.freeze_existing_imu_precision:
+            for module in (
+                model.update.imu_precision_visual,
+                model.update.imu_precision_quality,
+                model.update.imu_precision_fusion,
+            ):
+                for p in module.parameters():
+                    p.requires_grad_(False)
+        if not args.use_imu_precision_visual_innovation:
+            for p in model.update.imu_precision_visual_innovation.parameters():
+                p.requires_grad_(False)
+        if not args.use_imu_precision_edge_fusion:
+            for p in model.update.imu_precision_edge_fusion.parameters():
                 p.requires_grad_(False)
     elif args.use_component_imu_confidence:
         for p in model.update.imu_confidence.parameters():
@@ -1286,6 +1459,13 @@ def train(gpu, args):
             use_dvi_imu_confidence=args.use_dvi_imu_confidence,
             use_dvi_imu_quality_fusion=args.use_dvi_imu_quality_fusion,
             use_learned_imu_precision=args.use_learned_imu_precision,
+            use_imu_precision_discrepancy=args.use_imu_precision_discrepancy,
+            use_imu_precision_innovation=args.use_imu_precision_innovation,
+            use_imu_precision_visual_innovation=(
+                args.use_imu_precision_visual_innovation
+            ),
+            use_imu_precision_edge_fusion=args.use_imu_precision_edge_fusion,
+            freeze_existing_imu_precision=args.freeze_existing_imu_precision,
             freeze_imu_ba_weight=args.freeze_imu_ba_weight,
             freeze_imu_confidence_head=args.freeze_imu_confidence_head,
             imu_confidence_only_weighting=args.imu_confidence_only_weighting,
@@ -1675,10 +1855,21 @@ def train(gpu, args):
                         use_dvi_imu_confidence=args.use_dvi_imu_confidence,
                         use_dvi_imu_quality_fusion=args.use_dvi_imu_quality_fusion,
                         use_learned_imu_precision=args.use_learned_imu_precision,
+                        use_imu_precision_discrepancy=(
+                            args.use_imu_precision_discrepancy
+                        ),
+                        use_imu_precision_innovation=args.use_imu_precision_innovation,
+                        use_imu_precision_visual_innovation=(
+                            args.use_imu_precision_visual_innovation
+                        ),
+                        use_imu_precision_edge_fusion=(
+                            args.use_imu_precision_edge_fusion
+                        ),
 
                         # full IMU BA 관련 설정
                         use_full_imu_ba=args.use_full_imu_ba,
                         imu_pose_only_steps=imu_train_pose_only_steps,
+                        imu_full_stage_schedule=imu_train_full_schedule,
                         imu_full_pos_weight=args.imu_full_pos_weight,
                         imu_full_vel_weight=args.imu_full_vel_weight,
                         use_learned_imu_residual_weights=args.use_learned_imu_residual_weights,
@@ -1771,6 +1962,7 @@ def train(gpu, args):
                         imu_confidences,
                         imu_motions,
                         imu_train_pose_only_steps,
+                        full_imu_schedule=imu_train_full_schedule,
                     )
 
                 ################################################
@@ -2211,11 +2403,12 @@ def train(gpu, args):
                 args.w_imu_residual_weight_prior * residual_weight_prior_loss
             ).detach().item()
             metrics["loss_total"] = loss.detach().item()
-            metrics["imu_pose_only_unroll_steps"] = float(imu_train_pose_only_steps)
+            metrics["imu_pose_only_unroll_steps"] = float(
+                sum(not enabled for enabled in imu_train_full_schedule)
+                if args.use_full_imu_ba else 0
+            )
             metrics["imu_full_unroll_steps"] = float(
-                args.iters - imu_train_pose_only_steps
-                if args.use_full_imu_ba
-                else 0
+                sum(imu_train_full_schedule) if args.use_full_imu_ba else 0
             )
             if imu_confidence_augmented is not None:
                 temporal_augmented = imu_confidence_augmented[:, 1:]
@@ -2650,6 +2843,15 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
+        '--imu_train_stage_schedule',
+        type=str,
+        default=None,
+        help=(
+            'explicit unroll schedule, e.g. visual:3,full:2,visual:7,full:12; '
+            'the expanded step count must equal --iters'
+        ),
+    )
+    parser.add_argument(
         '--use_pose_velocity_imu_ba',
         action='store_true',
         help=(
@@ -2701,6 +2903,49 @@ if __name__ == '__main__':
             'state plus preintegration quality; no global IMU lambda, no '
             'fixed 0.05 position/velocity compatibility weights, and no '
             'weight above the physical covariance reference'
+        ),
+    )
+    parser.add_argument(
+        '--use_imu_precision_discrepancy',
+        action='store_true',
+        help=(
+            'append causal covariance-normalized visual--IMU R/v/p discrepancy '
+            'to the original direct precision quality input; requires '
+            '--use_learned_imu_precision and adds no output-logit adapter'
+        ),
+    )
+    parser.add_argument(
+        '--use_imu_precision_innovation',
+        action='store_true',
+        help=(
+            'feed causal visual--IMU R/v/p innovation into the direct '
+            'precision head; requires --use_learned_imu_precision'
+        ),
+    )
+    parser.add_argument(
+        '--use_imu_precision_visual_innovation',
+        action='store_true',
+        help=(
+            'conditionally fuse causal R/v/p innovation with DROID visual '
+            'BA-weight mean/spread; requires --use_imu_precision_innovation'
+        ),
+    )
+    parser.add_argument(
+        '--use_imu_precision_edge_fusion',
+        action='store_true',
+        help=(
+            'train a zero-initialized per-edge residual adapter over causal '
+            'IMU innovation, raw IMU quality, frozen ConvGRU visual evidence, '
+            'and DROID correspondence-correction statistics; requires '
+            '--use_imu_precision_innovation'
+        ),
+    )
+    parser.add_argument(
+        '--freeze_existing_imu_precision',
+        action='store_true',
+        help=(
+            'freeze the loaded direct-precision head and train only the new '
+            'visual-conditioned innovation residual adapter'
         ),
     )
 
@@ -3176,6 +3421,12 @@ if __name__ == '__main__':
             '--imu_train_pose_only_steps must be smaller than --iters so at '
             'least one full 15DoF IMU DBA step remains'
         )
+    args.imu_train_full_schedule = parse_imu_train_stage_schedule(
+        args.imu_train_stage_schedule,
+        args.iters,
+        args.use_full_imu_ba,
+        args.imu_train_pose_only_steps,
+    )
 
     if args.use_learned_imu_residual_weights and not args.use_full_imu_ba:
         raise ValueError('--use_learned_imu_residual_weights requires --use_full_imu_ba')
@@ -3233,6 +3484,44 @@ if __name__ == '__main__':
                 '--use_learned_imu_precision is standalone; do not combine it '
                 'with legacy confidence, lambda, or residual-weight controls'
             )
+    if (
+        args.use_imu_precision_discrepancy
+        and not args.use_learned_imu_precision
+    ):
+        raise ValueError(
+            '--use_imu_precision_discrepancy requires --use_learned_imu_precision'
+        )
+    if args.use_imu_precision_innovation and not args.use_learned_imu_precision:
+        raise ValueError(
+            '--use_imu_precision_innovation requires --use_learned_imu_precision'
+        )
+    if (
+        args.use_imu_precision_visual_innovation
+        and not args.use_imu_precision_innovation
+    ):
+        raise ValueError(
+            '--use_imu_precision_visual_innovation requires '
+            '--use_imu_precision_innovation'
+        )
+    if (
+        args.use_imu_precision_edge_fusion
+        and not args.use_imu_precision_innovation
+    ):
+        raise ValueError(
+            '--use_imu_precision_edge_fusion requires '
+            '--use_imu_precision_innovation'
+        )
+    if (
+        args.freeze_existing_imu_precision
+        and not (
+            args.use_imu_precision_visual_innovation
+            or args.use_imu_precision_edge_fusion
+        )
+    ):
+        raise ValueError(
+            '--freeze_existing_imu_precision requires '
+            'a new IMU precision adapter'
+        )
     if args.imu_confidence_only_weighting:
         if not args.use_full_imu_ba:
             raise ValueError(

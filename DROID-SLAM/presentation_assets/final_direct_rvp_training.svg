@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="820" viewBox="0 0 1600 820" role="img" aria-labelledby="title desc">
+  <title id="title">Training flow of final direct RVP IMU attenuation model</title>
+  <desc id="desc">MH03 and MH04 clips are preintegrated and passed through frozen DROID. Synthetic IMU corruption supplies a train-only attenuation calibration target. Final post-BA pose loss and calibration loss update only the direct precision head.</desc>
+  <defs>
+    <style>
+      .title { font: 700 34px Arial, 'Noto Sans KR', sans-serif; fill: #172234; }
+      .sub { font: 500 17px Arial, 'Noto Sans KR', sans-serif; fill: #536273; }
+      .head { font: 700 19px Arial, 'Noto Sans KR', sans-serif; fill: #172234; }
+      .body { font: 500 16px Arial, 'Noto Sans KR', sans-serif; fill: #26384b; }
+      .small { font: 500 14px Arial, 'Noto Sans KR', sans-serif; fill: #536273; }
+      .white { font: 700 14px Arial, 'Noto Sans KR', sans-serif; fill: #fff; }
+      .node { stroke-width: 2; rx: 15; ry: 15; }
+      .blue { fill: #eaf2ff; stroke: #3f7fca; }
+      .orange { fill: #fff2df; stroke: #db8c32; }
+      .purple { fill: #f5eeff; stroke: #8a64c4; }
+      .green { fill: #eef9f2; stroke: #3e9e69; }
+      .red { fill: #fff0f1; stroke: #d5616d; }
+      .gray { fill: #f5f7fa; stroke: #6c7b89; }
+      .av { fill:none; stroke:#3f7fca; stroke-width:3; marker-end:url(#blue); }
+      .ai { fill:none; stroke:#db8c32; stroke-width:3; marker-end:url(#orange); }
+      .ap { fill:none; stroke:#8a64c4; stroke-width:3; marker-end:url(#purple); }
+      .ag { fill:none; stroke:#3e9e69; stroke-width:3; marker-end:url(#green); }
+      .ar { fill:none; stroke:#d5616d; stroke-width:3; marker-end:url(#red); }
+    </style>
+    <marker id="blue" markerWidth="11" markerHeight="11" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8Z" fill="#3f7fca"/></marker>
+    <marker id="orange" markerWidth="11" markerHeight="11" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8Z" fill="#db8c32"/></marker>
+    <marker id="purple" markerWidth="11" markerHeight="11" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8Z" fill="#8a64c4"/></marker>
+    <marker id="green" markerWidth="11" markerHeight="11" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8Z" fill="#3e9e69"/></marker>
+    <marker id="red" markerWidth="11" markerHeight="11" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8Z" fill="#d5616d"/></marker>
+  </defs>
+  <rect width="1600" height="820" fill="#fff"/>
+  <text x="800" y="54" text-anchor="middle" class="title">최종 Direct R/V/P precision head의 학습 구조</text>
+  <text x="800" y="82" text-anchor="middle" class="sub">GT와 synthetic corruption은 training loss에만 사용되며, runtime 입력에는 포함되지 않는다</text>
+
+  <rect x="45" y="170" width="238" height="170" class="node blue"/>
+  <text x="164" y="210" text-anchor="middle" class="head">Training data</text>
+  <text x="164" y="240" text-anchor="middle" class="body">EuRoC MH_03_medium</text>
+  <text x="164" y="265" text-anchor="middle" class="body">EuRoC MH_04_difficult</text>
+  <text x="164" y="299" text-anchor="middle" class="small">original DROID MotionFilter manifest</text>
+  <text x="164" y="320" text-anchor="middle" class="small">7-frame clip, camera stride 2</text>
+
+  <rect x="350" y="145" width="275" height="126" class="node orange"/>
+  <text x="488" y="182" text-anchor="middle" class="head">Preintegrated IMU</text>
+  <text x="488" y="208" text-anchor="middle" class="small">nominal ΔR, Δv, Δp, covariance, Jᵦ</text>
+  <text x="488" y="234" text-anchor="middle" class="small">same physical input format as runtime</text>
+  <rect x="350" y="350" width="275" height="140" class="node red"/>
+  <text x="488" y="387" text-anchor="middle" class="head">Train-only IMU corruption</text>
+  <text x="488" y="413" text-anchor="middle" class="small">gyro/accel noise, bias drift, short dropout</text>
+  <text x="488" y="439" text-anchor="middle" class="small">known reliability target for L_aug</text>
+  <text x="488" y="466" text-anchor="middle" class="small">not present in evaluation</text>
+  <path d="M283 234 H350" class="ai"/>
+  <path d="M488 271 V350" class="ar"/>
+
+  <rect x="702" y="130" width="336" height="230" class="node blue"/>
+  <text x="870" y="169" text-anchor="middle" class="head">Frozen DROID visual optimizer</text>
+  <text x="870" y="198" text-anchor="middle" class="small">FNet / CNet / correlation / ConvGRU</text>
+  <text x="870" y="224" text-anchor="middle" class="small">visual correction Δ and visual weights wᵛ</text>
+  <text x="870" y="257" text-anchor="middle" class="body">training unroll: visual ×3 → full 15DoF ×4</text>
+  <text x="870" y="289" text-anchor="middle" class="small">no visual-loss fine-tuning: w₁=w₂=w₃=0</text>
+  <text x="870" y="316" text-anchor="middle" class="small">global IMU bias and global λIMU are frozen / unused</text>
+  <path d="M283 234 C455 234 510 220 702 220" class="av"/>
+  <path d="M625 420 C655 420 650 315 702 315" class="ar"/>
+
+  <rect x="1106" y="160" width="240" height="170" class="node purple"/>
+  <text x="1226" y="199" text-anchor="middle" class="head">Trainable direct head</text>
+  <text x="1226" y="228" text-anchor="middle" class="small">ConvGRU h + IMU quality q₇</text>
+  <text x="1226" y="254" text-anchor="middle" class="small">→ cᴿ, cⱽ, cᵖ ∈ (0,1]</text>
+  <text x="1226" y="286" text-anchor="middle" class="body">only 6,291 parameters update</text>
+  <path d="M1038 245 H1106" class="ap"/>
+
+  <rect x="1106" y="430" width="240" height="130" class="node green"/>
+  <text x="1226" y="466" text-anchor="middle" class="head">Final 15DoF BA state</text>
+  <text x="1226" y="493" text-anchor="middle" class="small">visual factor + attenuated IMU factor</text>
+  <text x="1226" y="520" text-anchor="middle" class="small">local velocity / local biases optimized</text>
+  <path d="M1226 330 V430" class="ag"/>
+
+  <rect x="1400" y="205" width="160" height="130" class="node gray"/>
+  <text x="1480" y="242" text-anchor="middle" class="head">Training GT</text>
+  <text x="1480" y="269" text-anchor="middle" class="small">pose only</text>
+  <text x="1480" y="294" text-anchor="middle" class="small">never inference input</text>
+  <path d="M1400 270 H1346" class="ag"/>
+
+  <rect x="700" y="600" width="355" height="130" class="node green"/>
+  <text x="877" y="637" text-anchor="middle" class="head">Primary task loss</text>
+  <text x="877" y="666" text-anchor="middle" class="body">L_pose = final post-BA pose loss</text>
+  <text x="877" y="695" text-anchor="middle" class="small">computed after the confidence-controlled BA suffix</text>
+  <path d="M1106 507 C1015 507 1000 635 1055 650" class="ag"/>
+  <path d="M1400 270 C1250 270 1190 665 1055 665" class="ag"/>
+
+  <rect x="350" y="600" width="275" height="130" class="node red"/>
+  <text x="488" y="637" text-anchor="middle" class="head">Auxiliary calibration loss</text>
+  <text x="488" y="666" text-anchor="middle" class="body">L_aug = log-space Smooth-L1</text>
+  <text x="488" y="695" text-anchor="middle" class="small">predicted c versus known corrupted reliability</text>
+  <path d="M488 490 V600" class="ar"/>
+
+  <rect x="1110" y="630" width="252" height="100" class="node purple"/>
+  <text x="1236" y="665" text-anchor="middle" class="head">Optimization target</text>
+  <text x="1236" y="692" text-anchor="middle" class="body">L = 1.0 L_pose + 1.0 L_aug</text>
+  <path d="M625 665 H1110" class="ap"/>
+  <path d="M1055 665 H1110" class="ap"/>
+  <path d="M1236 630 C1236 585 1226 570 1226 560" class="ap"/>
+
+  <rect x="50" y="765" width="1510" height="34" rx="10" fill="#f5f7fa"/>
+  <text x="805" y="788" text-anchor="middle" class="small">선택 checkpoint: 500-step calibration pretraining 후 joint fine-tuning의 1k checkpoint. 이후 component-target / discrepancy / innovation 실험은 최종 선택 모델에 포함하지 않는다.</text>
+</svg>

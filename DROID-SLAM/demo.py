@@ -1947,6 +1947,41 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
+        "--use_imu_precision_discrepancy",
+        action="store_true",
+        help=(
+            "append causal covariance-normalized visual--IMU R/v/p discrepancy "
+            "to the original direct precision quality input; requires "
+            "--use_learned_imu_precision and adds no output-logit adapter"
+        ),
+    )
+    parser.add_argument(
+        "--use_imu_precision_innovation",
+        action="store_true",
+        help=(
+            "add causal visual--IMU R/v/p innovation features to the direct "
+            "precision head; requires --use_learned_imu_precision"
+        ),
+    )
+    parser.add_argument(
+        "--use_imu_precision_visual_innovation",
+        action="store_true",
+        help=(
+            "conditionally fuse each causal R/v/p innovation with DROID's "
+            "current visual BA-weight mean/spread; requires "
+            "--use_imu_precision_innovation"
+        ),
+    )
+    parser.add_argument(
+        "--use_imu_precision_edge_fusion",
+        action="store_true",
+        help=(
+            "fuse each edge's causal IMU innovation, raw IMU quality, frozen "
+            "ConvGRU visual evidence, and DROID correspondence-correction "
+            "statistics; requires --use_imu_precision_innovation"
+        ),
+    )
+    parser.add_argument(
         "--use_component_imu_confidence",
         action="store_true",
         help=(
@@ -2489,6 +2524,34 @@ if __name__ == '__main__':
                 '--use_learned_imu_precision is a standalone direct-precision mode; '
                 'do not combine it with legacy confidence/lambda/residual-weight controls'
             )
+
+    if (
+        args.use_imu_precision_discrepancy
+        and not args.use_learned_imu_precision
+    ):
+        raise ValueError(
+            '--use_imu_precision_discrepancy requires --use_learned_imu_precision'
+        )
+    if args.use_imu_precision_innovation and not args.use_learned_imu_precision:
+        raise ValueError(
+            '--use_imu_precision_innovation requires --use_learned_imu_precision'
+        )
+    if (
+        args.use_imu_precision_visual_innovation
+        and not args.use_imu_precision_innovation
+    ):
+        raise ValueError(
+            '--use_imu_precision_visual_innovation requires '
+            '--use_imu_precision_innovation'
+        )
+    if (
+        args.use_imu_precision_edge_fusion
+        and not args.use_imu_precision_innovation
+    ):
+        raise ValueError(
+            '--use_imu_precision_edge_fusion requires '
+            '--use_imu_precision_innovation'
+        )
 
     if args.use_component_imu_confidence and not args.use_learned_imu_confidence:
         raise ValueError('--use_component_imu_confidence requires --use_learned_imu_confidence')

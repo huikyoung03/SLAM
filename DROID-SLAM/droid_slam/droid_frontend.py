@@ -41,6 +41,18 @@ class DroidFrontend:
             apply_imu_residual=getattr(args, "use_imu_residual", False),
             use_learned_imu_confidence=getattr(args, "use_learned_imu_confidence", False),
             use_learned_imu_precision=getattr(args, "use_learned_imu_precision", False),
+            use_imu_precision_discrepancy=getattr(
+                args, "use_imu_precision_discrepancy", False
+            ),
+            use_imu_precision_innovation=getattr(
+                args, "use_imu_precision_innovation", False
+            ),
+            use_imu_precision_visual_innovation=getattr(
+                args, "use_imu_precision_visual_innovation", False
+            ),
+            use_imu_precision_edge_fusion=getattr(
+                args, "use_imu_precision_edge_fusion", False
+            ),
             use_component_imu_confidence=getattr(args, "use_component_imu_confidence", False),
             use_dvi_imu_confidence=getattr(args, "use_dvi_imu_confidence", False),
             use_dvi_imu_quality_fusion=getattr(args, "use_dvi_imu_quality_fusion", False),

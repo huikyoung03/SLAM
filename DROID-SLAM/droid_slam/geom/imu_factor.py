@@ -712,6 +712,228 @@ def edge_imu_quality_features(
     return features
 
 
+@torch.no_grad()
+def temporal_imu_visual_innovation_features(
+    pose_data: torch.Tensor,
+    imu_delta: Optional[torch.Tensor],
+    imu_info: Optional[torch.Tensor] = None,
+    imu_info_reference: Optional[torch.Tensor] = None,
+    imu_motion: Optional[torch.Tensor] = None,
+    imu_bias_jacobian: Optional[torch.Tensor] = None,
+    gyro_bias: Optional[torch.Tensor] = None,
+    accel_bias: Optional[torch.Tensor] = None,
+    gravity: Optional[torch.Tensor] = None,
+    imu_camera_translation: Optional[torch.Tensor] = None,
+    imu_optimize_bias: bool = True,
+    compose_order: str = "dq_prev",
+    inverse_imu: bool = True,
+    eps: float = 1e-6,
+) -> Optional[torch.Tensor]:
+    """Return causal visual--IMU disagreement features for each interval.
+
+    The descriptor is evaluated *before* the full 15DoF BA update from the
+    current visual pose/depth state and the current velocity/bias state.  It
+    therefore contains neither GT nor a future measurement.  Its three
+    channels are the log-compressed covariance-relative norms of rotation,
+    velocity, and position innovations in ``[R, v, p]`` order.
+
+    A missing motion state is initialized from the current visual trajectory,
+    exactly as the full-IMU stage seeds its velocity.  This makes the first
+    inertial update after a visual-only prepass well-defined while preserving
+    the subsequently optimized motion state on later updates.
+    """
+
+    if imu_delta is None:
+        return None
+    if pose_data.ndim != 3 or pose_data.shape[-1] < 7:
+        raise ValueError(
+            "pose_data must be [B, N, >=7] for IMU innovation, got "
+            f"{tuple(pose_data.shape)}"
+        )
+
+    batch, num_poses = pose_data.shape[:2]
+    output = pose_data.new_zeros((batch, num_poses, 3))
+    if num_poses < 2:
+        return output
+
+    imu, _ = _as_batched("imu_delta", imu_delta, 10)
+    imu = imu.to(device=pose_data.device, dtype=pose_data.dtype)
+    if imu.shape[0] == 1 and batch > 1:
+        imu = imu.expand(batch, -1, -1)
+    if imu.shape[0] != batch or imu.shape[1] < num_poses:
+        raise ValueError(
+            "imu_delta must match pose_data for IMU innovation, got "
+            f"imu={tuple(imu.shape)}, pose_data={tuple(pose_data.shape)}"
+        )
+
+    src, dst = temporal_pairs(num_poses, pose_data.device)
+    dt = imu[:, dst, 0:1].clamp_min(0.0)
+    if imu_motion is None:
+        # Same pose-derived initial velocity convention as the first full IMU
+        # stage.  The feature is a detached observation for the precision
+        # head, not an additional optimization path through visual poses.
+        motion = pose_data.new_zeros((batch, num_poses, 9))
+        centers = imu_center_from_pose_data(pose_data, imu_camera_translation)
+        pair_velocity = (
+            centers[:, 1:num_poses] - centers[:, : num_poses - 1]
+        ) / dt.clamp_min(float(eps))
+        motion[:, : num_poses - 1, :3] = pair_velocity
+        motion[:, num_poses - 1, :3] = pair_velocity[:, -1]
+    else:
+        motion = _as_batched_motion(
+            imu_motion, batch, num_poses, pose_data.device, pose_data.dtype
+        )
+
+    q_i = pose_data[:, src, 3:7]
+    q_j = pose_data[:, dst, 3:7]
+    centers = imu_center_from_pose_data(pose_data, imu_camera_translation)
+    p_i = centers[:, src]
+    p_j = centers[:, dst]
+    v_i = motion[:, src, :3]
+    v_j = motion[:, dst, :3]
+
+    ba_global = _expand_global_vector(
+        accel_bias, src, batch, num_poses, pose_data.device, pose_data.dtype,
+        "accel_bias",
+    )
+    bg_global = _expand_global_vector(
+        gyro_bias, src, batch, num_poses, pose_data.device, pose_data.dtype,
+        "gyro_bias",
+    )
+    g_world = _expand_global_vector(
+        gravity, src, batch, num_poses, pose_data.device, pose_data.dtype,
+        "gravity",
+    )
+    if bool(imu_optimize_bias) and motion.shape[-1] >= 9:
+        ba_local = motion[:, src, 3:6]
+        bg_local = motion[:, src, 6:9]
+    else:
+        ba_local = torch.zeros_like(v_i)
+        bg_local = torch.zeros_like(v_i)
+
+    bias_jac = select_imu_bias_jacobian(
+        imu_bias_jacobian,
+        dst,
+        batch,
+        num_poses,
+        pose_data.device,
+        pose_data.dtype,
+        dt,
+    )
+    J_R_bg = bias_jac[:, :, 0]
+    J_v_ba = bias_jac[:, :, 1]
+    J_v_bg = bias_jac[:, :, 2]
+    J_p_ba = bias_jac[:, :, 3]
+    J_p_bg = bias_jac[:, :, 4]
+    accel_total = ba_global + ba_local
+    gyro_total = bg_global + bg_local
+
+    rotvec = imu[:, dst, 1:4] + torch.matmul(
+        J_R_bg, gyro_total[..., None]
+    ).squeeze(-1)
+    dv_imu = (
+        imu[:, dst, 4:7]
+        + torch.matmul(J_v_ba, accel_total[..., None]).squeeze(-1)
+        + torch.matmul(J_v_bg, gyro_total[..., None]).squeeze(-1)
+    )
+    dp_imu = (
+        imu[:, dst, 7:10]
+        + torch.matmul(J_p_ba, accel_total[..., None]).squeeze(-1)
+        + torch.matmul(J_p_bg, gyro_total[..., None]).squeeze(-1)
+    )
+    q_pred = predict_imu_rotation(
+        q_i,
+        rotvec_to_quat(rotvec),
+        compose_order=compose_order,
+        inverse_imu=inverse_imu,
+    )
+    r_R = quat_to_rotvec(quat_multiply(quat_inverse(q_pred), q_j))
+    p_world_delta = p_j - p_i - v_i * dt - 0.5 * g_world * dt * dt
+    v_world_delta = v_j - v_i - g_world * dt
+    r_p = quat_rotate(q_i, p_world_delta) - dp_imu
+    r_v = quat_rotate(q_i, v_world_delta) - dv_imu
+    residual_norm = torch.stack(
+        (r_R.norm(dim=-1), r_v.norm(dim=-1), r_p.norm(dim=-1)), dim=-1
+    )
+
+    # The calibrated full-covariance BA uses the rotation-information
+    # reference for all three blocks.  Reuse that same dimensionless
+    # normalisation here so an innovation of equal factor energy has a
+    # comparable feature magnitude across R/v/p.
+    information_scale = torch.ones_like(residual_norm)
+    if imu_info is not None and imu_info_reference is not None:
+        info = imu_info.to(device=pose_data.device, dtype=pose_data.dtype)
+        if info.ndim == 2:
+            info = info.unsqueeze(0)
+        if info.shape[0] == 1 and batch > 1:
+            info = info.expand(batch, -1, -1)
+        reference = torch.as_tensor(
+            imu_info_reference, device=pose_data.device, dtype=pose_data.dtype
+        )
+        if reference.ndim == 1:
+            reference = reference[:3].view(1, 3).expand(batch, -1)
+        elif reference.ndim == 2 and reference.shape[0] == 1 and batch > 1:
+            reference = reference[:, :3].expand(batch, -1)
+        elif reference.ndim == 2:
+            reference = reference[:, :3]
+        else:
+            raise ValueError(
+                "imu_info_reference must be [3] or [B, 3] for innovation"
+            )
+        if (
+            info.shape[0] == batch
+            and info.shape[1] >= num_poses
+            and info.shape[-1] >= 3
+            and reference.shape[0] == batch
+        ):
+            selected = info[:, dst, :3]
+            reference_rot = reference[:, None, 0:1].clamp_min(float(eps))
+            valid = torch.isfinite(selected).all(dim=-1) & (selected > float(eps)).all(dim=-1)
+            valid = valid & torch.isfinite(reference_rot[..., 0]) & (
+                reference_rot[..., 0] > float(eps)
+            )
+            candidate = (selected / reference_rot).clamp_min(0.0).sqrt()
+            information_scale = torch.where(
+                valid[..., None], candidate, information_scale
+            )
+
+    valid_dt = dt[..., 0] > float(eps)
+    feature = torch.log1p(residual_norm * information_scale).clamp(0.0, 20.0)
+    output[:, dst] = torch.where(valid_dt[..., None], feature, torch.zeros_like(feature))
+    return output
+
+
+def edge_imu_innovation_features(
+    temporal_innovation: Optional[torch.Tensor],
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Select causal R/v/p innovation features for direct temporal edges."""
+
+    if temporal_innovation is None:
+        return None
+    if temporal_innovation.ndim != 3 or temporal_innovation.shape[-1] != 3:
+        raise ValueError(
+            "temporal_innovation must be [B, N, 3], got "
+            f"{tuple(temporal_innovation.shape)}"
+        )
+    ii = ii.to(device=temporal_innovation.device, dtype=torch.long).reshape(-1)
+    jj = jj.to(device=temporal_innovation.device, dtype=torch.long).reshape(-1)
+    if ii.numel() != jj.numel():
+        raise ValueError("ii and jj must have matching edge counts")
+    features = temporal_innovation.new_zeros(
+        (temporal_innovation.shape[0], ii.numel(), 3)
+    )
+    direct = (ii - jj).abs() == 1
+    if bool(direct.any().item()):
+        dst = torch.maximum(ii[direct], jj[direct])
+        in_range = dst < temporal_innovation.shape[1]
+        if bool(in_range.any().item()):
+            edge_indices = torch.nonzero(direct, as_tuple=False).reshape(-1)[in_range]
+            features[:, edge_indices] = temporal_innovation[:, dst[in_range]]
+    return features
+
+
 def quat_to_rotvec(q: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     """Log-map xyzw quaternions to 3D rotation vectors."""
 

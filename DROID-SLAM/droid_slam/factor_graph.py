@@ -24,9 +24,11 @@ from geom.imu_factor import (
     skew_symmetric,
     so3_left_jacobian,
     so3_left_jacobian_inv,
+    edge_imu_innovation_features,
     edge_imu_quality_features,
     temporal_imu_confidence_from_edges,
     temporal_imu_precision_from_edges,
+    temporal_imu_visual_innovation_features,
     temporal_imu_quality_features,
 )
 
@@ -109,6 +111,10 @@ class FactorGraph:
         apply_imu_residual=None,
         use_learned_imu_confidence=False,
         use_learned_imu_precision=False,
+        use_imu_precision_discrepancy=False,
+        use_imu_precision_innovation=False,
+        use_imu_precision_visual_innovation=False,
+        use_imu_precision_edge_fusion=False,
         use_component_imu_confidence=False,
         use_dvi_imu_confidence=False,
         use_dvi_imu_quality_fusion=False,
@@ -242,6 +248,19 @@ class FactorGraph:
         # three R/v/p outputs are covariance-relative reliabilities: one
         # retains the physical IMU factor and values below one attenuate it.
         self.use_learned_imu_precision = bool(use_learned_imu_precision)
+        self.use_imu_precision_discrepancy = bool(
+            use_imu_precision_discrepancy and self.use_learned_imu_precision
+        )
+        self.use_imu_precision_innovation = bool(
+            use_imu_precision_innovation and self.use_learned_imu_precision
+        )
+        self.use_imu_precision_visual_innovation = bool(
+            use_imu_precision_visual_innovation
+            and self.use_imu_precision_innovation
+        )
+        self.use_imu_precision_edge_fusion = bool(
+            use_imu_precision_edge_fusion and self.use_imu_precision_innovation
+        )
         self.use_learned_imu_confidence = bool(
             use_learned_imu_confidence and not self.use_learned_imu_precision
         )
@@ -553,7 +572,7 @@ class FactorGraph:
             int(self.video.counter.value),
             int(torch.maximum(ii.max(), jj.max()).item()) + 1,
         )
-        if self.use_learned_imu_precision:
+        if getattr(self, "use_learned_imu_precision", False):
             quality_fallback = self._temporal_imu_quality_precision(num_frames)
             frame_confidence, coverage = temporal_imu_precision_from_edges(
                 edge_confidence.to(device=self.device, dtype=torch.float),
@@ -587,7 +606,7 @@ class FactorGraph:
         """Cache only direct temporal predictions for terminal VI refinement."""
 
         if (
-            self.use_learned_imu_precision
+            getattr(self, "use_learned_imu_precision", False)
             or frame_confidence is None
             or coverage is None
         ):
@@ -635,6 +654,85 @@ class FactorGraph:
             num_frames=count,
         )
 
+    def _temporal_imu_precision_innovation(self, count):
+        """Return causal visual--IMU disagreement features for direct precision.
+
+        This is deliberately evaluated from the *current* DBA state.  It does
+        not consult ground truth, future frames, or a post-hoc alignment: for
+        interval ``(j-1, j)`` it compares the current visual pose/motion with
+        the IMU preintegration available at runtime.  The learned branch can
+        therefore attenuate a factor when its own innovation is inconsistent
+        with the visual estimate, while a zero-initialized branch leaves old
+        checkpoints behaviorally unchanged.
+        """
+
+        if (
+            count <= 1
+            or not self.use_learned_imu_precision
+            or not (
+                self.use_imu_precision_discrepancy
+                or self.use_imu_precision_innovation
+            )
+        ):
+            return None
+
+        count = min(int(count), int(self.video.counter.value))
+        if count <= 1:
+            return None
+        if (
+            getattr(self.video, "imu_delta", None) is None
+            or getattr(self.video, "imu_info", None) is None
+        ):
+            return None
+
+        poses = self.video.poses[:count].unsqueeze(0).detach()
+        device, dtype = poses.device, poses.dtype
+        motion = None
+        if (
+            self.use_full_imu_ba
+            and getattr(self.video, "velocities", None) is not None
+            and getattr(self.video, "bias_acc", None) is not None
+            and getattr(self.video, "bias_gyro", None) is not None
+        ):
+            # The frontend may reach this before the first full DBA call.
+            # Seed only a zero/uninitialized velocity state from visual poses;
+            # once full DBA has run, its optimized local state is preserved.
+            self._initialize_runtime_velocity(0, count)
+            motion = torch.cat(
+                [
+                    self.video.velocities[:count],
+                    self.video.bias_acc[:count],
+                    self.video.bias_gyro[:count],
+                ],
+                dim=-1,
+            ).unsqueeze(0).detach()
+
+        return temporal_imu_visual_innovation_features(
+            poses,
+            self.video.imu_delta[:count],
+            imu_info=self.video.imu_info[:count],
+            imu_info_reference=self.imu_info_reference,
+            imu_motion=motion,
+            imu_bias_jacobian=(
+                self.video.imu_bias_jacobian[:count]
+                if getattr(self.video, "imu_bias_jacobian", None) is not None
+                else None
+            ),
+            gyro_bias=self._aligned_or_default_bias(
+                "imu_global_bias_gyro", self.imu_gyro_bias, device, dtype
+            ),
+            accel_bias=self._aligned_or_default_bias(
+                "imu_global_bias_acc", self.imu_acc_bias, device, dtype
+            ),
+            gravity=self._runtime_imu_gravity(device, dtype),
+            imu_camera_translation=(
+                self.video.imu_camera_translation_in_current_units().detach()
+            ),
+            imu_optimize_bias=self.imu_optimize_bias,
+            compose_order=self.imu_full_compose_order,
+            inverse_imu=self.imu_full_inverse,
+        )
+
     def _temporal_imu_quality_confidence(self, count):
         """Predict fallback confidence for temporal rows lacking visual edges.
 
@@ -648,14 +746,14 @@ class FactorGraph:
         if (
             count <= 0
             or not (
-                self.use_component_imu_confidence
-                or self.use_dvi_imu_quality_fusion
+                getattr(self, "use_component_imu_confidence", False)
+                or getattr(self, "use_dvi_imu_quality_fusion", False)
             )
         ):
             return None
         predictor_name = (
             "component_imu_quality_confidence"
-            if self.use_component_imu_confidence
+            if getattr(self, "use_component_imu_confidence", False)
             else "dvi_imu_quality_confidence"
         )
         predictor = getattr(self.update_op, predictor_name, None)
@@ -678,7 +776,7 @@ class FactorGraph:
             or confidence.shape[0] != 1
             or confidence.shape[1] < count
             or confidence.shape[-1]
-            != (3 if self.use_component_imu_confidence else 1)
+            != (3 if getattr(self, "use_component_imu_confidence", False) else 1)
         ):
             raise ValueError(
                 "IMU quality fallback must be [1, N, 1|3], got "
@@ -706,7 +804,16 @@ class FactorGraph:
         )
         if quality is None:
             return None
-        precision = predictor(quality)
+        discrepancy = self._temporal_imu_precision_innovation(count)
+        precision = predictor(
+            quality,
+            imu_discrepancy=(
+                discrepancy if self.use_imu_precision_discrepancy else None
+            ),
+            imu_innovation=(
+                discrepancy if self.use_imu_precision_innovation else None
+            ),
+        )
         if (
             precision is None
             or precision.ndim != 3
@@ -3355,6 +3462,9 @@ class FactorGraph:
         #       BA damping 값
         #   upmask:
         #       disparity upsampling mask
+        temporal_imu_innovation = self._temporal_imu_precision_innovation(
+            int(self.video.counter.value)
+        )
         update_out = self.update_op(
             self.net,
             self.inp,
@@ -3368,6 +3478,30 @@ class FactorGraph:
             use_dvi_imu_quality_fusion=self.use_dvi_imu_quality_fusion,
             use_learned_imu_precision=self.use_learned_imu_precision,
             imu_quality=self._edge_imu_quality(self.ii, self.jj),
+            imu_discrepancy=(
+                edge_imu_innovation_features(
+                    temporal_imu_innovation, self.ii, self.jj
+                )
+                if (
+                    temporal_imu_innovation is not None
+                    and self.use_imu_precision_discrepancy
+                )
+                else None
+            ),
+            imu_innovation=(
+                edge_imu_innovation_features(
+                    temporal_imu_innovation, self.ii, self.jj
+                )
+                if (
+                    temporal_imu_innovation is not None
+                    and self.use_imu_precision_innovation
+                )
+                else None
+            ),
+            use_imu_precision_visual_innovation=(
+                self.use_imu_precision_visual_innovation
+            ),
+            use_imu_precision_edge_fusion=self.use_imu_precision_edge_fusion,
         )
         if self.use_learned_imu_prediction:
             self.net, delta, weight, damping, upmask, imu_edge_confidence = update_out
@@ -3637,6 +3771,13 @@ class FactorGraph:
                         dtype=torch.float,
                     )
 
+                # One temporal state is shared by every factor chunk.  Apart
+                # from avoiding redundant work, this guarantees all chunks
+                # see the same causal DBA state in this outer iteration.
+                temporal_imu_innovation = self._temporal_imu_precision_innovation(
+                    int(self.video.counter.value)
+                )
+
                 for i in range(self.ii.min(), self.jj.max() + 1, s):
 
                     # source index가 [i, i+s) 범위에 있는 factor 선택
@@ -3681,6 +3822,32 @@ class FactorGraph:
                             use_dvi_imu_quality_fusion=self.use_dvi_imu_quality_fusion,
                             use_learned_imu_precision=self.use_learned_imu_precision,
                             imu_quality=self._edge_imu_quality(iis, jjs),
+                            imu_discrepancy=(
+                                edge_imu_innovation_features(
+                                    temporal_imu_innovation, iis, jjs
+                                )
+                                if (
+                                    temporal_imu_innovation is not None
+                                    and self.use_imu_precision_discrepancy
+                                )
+                                else None
+                            ),
+                            imu_innovation=(
+                                edge_imu_innovation_features(
+                                    temporal_imu_innovation, iis, jjs
+                                )
+                                if (
+                                    temporal_imu_innovation is not None
+                                    and self.use_imu_precision_innovation
+                                )
+                                else None
+                            ),
+                            use_imu_precision_visual_innovation=(
+                                self.use_imu_precision_visual_innovation
+                            ),
+                            use_imu_precision_edge_fusion=(
+                                self.use_imu_precision_edge_fusion
+                            ),
                         )
                         if self.use_learned_imu_prediction:
                             net, delta, weight, damping, upmask, imu_edge_confidence = update_out

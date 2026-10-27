@@ -1,3 +1,0 @@
-selection_metric=V1_02 common-frame metric SE(3) ATE RMSE
-best_candidate_label=learned_005000
-best_candidate_checkpoint=/home/ubuntu/DROID-SLAM/checkpoints/dvi_mh03_10fps_stage3_10000_005000.pth

@@ -1,252 +1,199 @@
-# DROID-SLAM
+# DROID-SLAM with Direct Learned R/V/P IMU Attenuation
 
+This repository is a focused visual–inertial extension of
+[DROID-SLAM](https://arxiv.org/abs/2108.10869). It preserves the pretrained
+DROID visual tracker and adds a compact learned head that decides how much to
+trust the **rotation, velocity, and position** components of each IMU
+preintegration factor.
 
-<!-- <center><img src="misc/DROID.png" width="640" style="center"></center> -->
+The public release is centered on one final configuration:
 
-
-[![IMAGE ALT TEXT HERE](misc/screenshot.png)](https://www.youtube.com/watch?v=GG78CSlSHSA)
-
-
-
-[DROID-SLAM: Deep Visual SLAM for Monocular, Stereo, and RGB-D Cameras](https://arxiv.org/abs/2108.10869)  
-Zachary Teed and Jia Deng
-
+```text
+frozen DROID visual backbone
+  + raw IMU preintegration and calibrated covariance
+  + direct learned (c_R, c_v, c_p) in (0, 1]^3
+  + two-stage 15DoF visual–inertial BA
 ```
+
+`c=1` means the full covariance-normalized physical IMU factor. The network
+may attenuate an unreliable temporal factor, but cannot amplify it above the
+sensor-calibrated reference. There is no global learned IMU lambda in the
+final model.
+
+## Final result
+
+On held-out EuRoC `V1_03_difficult`, using the strict original DROID EuRoC
+protocol and dense whole-trajectory Sim(3) ATE:
+
+| model | Sim(3) ATE RMSE | dense poses |
+|---|---:|---:|
+| Original visual DROID | 0.018560 m | 2,149 |
+| Direct learned R/V/P IMU attenuation | **0.018467 m** | 2,149 |
+
+This is a 0.093 mm / 0.501% numerical reduction on one held-out sequence and
+one run. It is not presented as a statistical generalization claim. See
+[results/V1_03_FINAL_RESULT.md](results/V1_03_FINAL_RESULT.md) for the exact
+protocol and [FINAL_PPT_TECHNICAL_BRIEF.md](FINAL_PPT_TECHNICAL_BRIEF.md) for
+the code-level architecture, training, and presentation material.
+
+## Architecture
+
+![Final direct R/V/P model](presentation_assets/final_direct_rvp_architecture.svg)
+
+For a temporal keyframe edge, the direct head reads:
+
+- the frozen DROID ConvGRU visual state, projected as `128 -> 32`;
+- a 7D IMU-quality descriptor from preintegrated `dt`, `dR`, `dv`, `dp`, and
+  relative R/V/P information.
+
+It fuses `32 + 16` features and predicts three logits:
+
+\[
+c=\exp[-\operatorname{softplus}(z)] \in (0,1]^3.
+\]
+
+In 15DoF BA the state per keyframe is pose(6), velocity(3), accelerometer
+bias(3), and gyroscope bias(3). The covariance-normalized residual and its
+Jacobian are scaled component-wise:
+
+\[
+\tilde r_R=\sqrt{c_R}r_R,\qquad
+\tilde r_v=\sqrt{c_v}r_v,\qquad
+\tilde r_p=\sqrt{c_p}r_p.
+\]
+
+Bias random-walk residuals remain governed by the physical sensor model; they
+are not suppressed by these three values.
+
+## Installation
+
+Clone recursively because the project uses `lietorch` and `pytorch_scatter`.
+
+```bash
+git clone --recursive <YOUR_REPOSITORY_URL>
+cd DROID-SLAM
+
+conda env create -f environment_novis.yaml
+conda activate droid_env
+pip install -r requirements.txt
+pip install thirdparty/lietorch
+pip install thirdparty/pytorch_scatter
+pip install -e .
+```
+
+Use a PyTorch/CUDA build compatible with the local NVIDIA driver. The
+evaluation uses a CUDA GPU and needs roughly 11 GB or more of VRAM.
+
+## Weights
+
+Two weights are required:
+
+1. Upstream visual DROID checkpoint, `droid.pth`.
+2. Final learned checkpoint,
+   `learned_attenuation_rvp_quality_pretrain_joint2000_001000.pth`.
+
+The final checkpoint is distributed as a release asset rather than committed
+to source history. Its SHA-256 is recorded in
+[models/FINAL_CHECKPOINT.md](models/FINAL_CHECKPOINT.md). Put both files at
+any local paths and configure them through environment variables.
+
+## Data preparation
+
+The final protocol expects a prepared EuRoC camera directory containing
+`data/`, `frames.csv`, and `imu0_sensor.yaml`, plus a rectified IMU prior and
+rectified camera YAML generated from the same camera–IMU calibration.
+
+The preparation utilities retained for this release are:
+
+```text
+tools/prepare_euroc_original_protocol_assets.py
+tools/export_euroc_original_protocol_motion_filter_manifests.sh
+tools/imu_preintegrate.py
+```
+
+Dataset paths are intentionally not hard-coded. Copy
+`configs/final_direct_rvp.env.example` outside the repository, edit its
+absolute paths, then source it:
+
+```bash
+cp configs/final_direct_rvp.env.example /tmp/final_direct_rvp.env
+# Edit /tmp/final_direct_rvp.env
+source /tmp/final_direct_rvp.env
+```
+
+## Reproduce the final V1_03 evaluation
+
+```bash
+source /path/to/final_direct_rvp.env
+bash tools/run_final_v1_03_evaluation.sh
+```
+
+The script performs exactly three actions:
+
+1. runs original visual DROID;
+2. runs the final learned direct R/V/P 15DoF model;
+3. evaluates both dense trajectories with whole-trajectory Sim(3) ATE.
+
+It fixes the runtime schedule to:
+
+```text
+local visual DBA x3 -> local full 15DoF DBA x2
+global visual DBA x7 -> global full 15DoF BA x12
+```
+
+It does **not** expose fixed-confidence, global-lambda, discrepancy,
+innovation, edge-fusion, or other ablation switches.
+
+## Train the final architecture
+
+```bash
+source /path/to/final_direct_rvp.env
+bash tools/run_final_direct_rvp_train.sh
+```
+
+The script uses `MH_03_medium` and `MH_04_difficult`, freezes the original
+visual DROID network and global IMU-bias parameters, then trains only the
+6,291-parameter direct precision head. It has two stages:
+
+1. 500-step IMU-quality / augmentation calibration pretraining.
+2. 2,000-step joint fine-tuning with post-BA pose loss and calibration loss.
+
+The final reported candidate is the phase-B 1k checkpoint; V1_03 must remain
+held out from gradient-based training.
+
+## Repository layout
+
+```text
+droid_slam/                         Core DROID + VI factor graph / 15DoF BA
+droid_slam/geom/imu_factor.py       IMU factor, quality descriptor, covariance logic
+droid_slam/geom/ba.py               R/V/P attenuation applied to residual/Jacobian
+train.py                            Frozen-backbone direct-head training
+demo.py                             Streaming DROID + two-stage VIO inference
+tools/run_final_direct_rvp_train.sh Final training entry point
+tools/run_final_v1_03_evaluation.sh Final evaluation entry point
+tools/evaluate_euroc_recon.py       Dense Sim(3) evaluation
+configs/                            Machine-local path template
+models/                             Checkpoint distribution metadata
+results/                            Small, versioned final result table
+presentation_assets/                Final editable SVG diagrams
+```
+
+Intermediate logs, reconstructed trajectories, datasets, PLY files, and
+experiment queues are ignored by Git. See
+[GITHUB_UPLOAD_GUIDE.md](GITHUB_UPLOAD_GUIDE.md) for the explicit upload list.
+
+## Attribution
+
+This codebase builds on:
+
+```bibtex
 @article{teed2021droid,
-  title={{DROID-SLAM: Deep Visual SLAM for Monocular, Stereo, and RGB-D Cameras}},
+  title={DROID-SLAM: Deep Visual SLAM for Monocular, Stereo, and RGB-D Cameras},
   author={Teed, Zachary and Deng, Jia},
-  journal={Advances in neural information processing systems},
+  journal={Advances in Neural Information Processing Systems},
   year={2021}
 }
 ```
 
-
-## Requirements
-
-To run the code you will need ...
-* **Inference:** Running the demos will require a GPU with at least 11G of memory. 
-
-* **Training:** Training requires a GPU with at least 24G of memory. We train on 4 x RTX-3090 GPUs.
-
-## Getting Started
-Clone the repo using the `--recursive` flag
-```Bash
-git clone --recursive https://github.com/princeton-vl/DROID-SLAM.git
-```
-
-  If you forgot `--recursive`
-  ```Bash
-  git submodule update --init --recursive .
-  ```
-
-### Installing
-
-Requires CUDA to be installed on your machine. If you run into issues, make sure the PyTorch and CUDA major versions match with the following check (minor version mismatch should be fine).
-
-```Bash
-nvidia-smi
-python -c "import torch; print(torch.version.cuda)"
-```
-
-```Bash
-python3 -m venv .venv
-source .venv/bin/activate
-
-# install requirements (tested up to torch 2.7)
-pip install -r requirements.txt
-
-# optional (for visualization)
-pip install moderngl moderngl-window
-
-# install third-party modules (this will take a while)
-pip install thirdparty/lietorch
-pip install thirdparty/pytorch_scatter
-
-# install droid-backends
-pip install -e .
-```
-
-<!-- ### Deprecated Conda Installation
-
-1. Creating a new anaconda environment using the provided .yaml file. Use `environment_novis.yaml` to if you do not want to use the visualization
-```Bash
-conda env create -f environment.yaml
-pip install evo --upgrade --no-binary evo
-pip install gdown
-```
-
-2. Compile the extensions (takes about 10 minutes)
-```Bash
-python setup.py install
-``` -->
-
-
-## Demos
-
-1. Download the model from google drive: [droid.pth](https://drive.google.com/file/d/1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh/view?usp=sharing) or with
-    ```Bash
-    ./tools/download_model.sh
-    ```
-
-2. Download some sample videos using the provided script.
-    ```Bash
-    ./tools/download_sample_data.sh
-    ```
-
-Run the demo on any of the samples (all demos can be run on a GPU with 11G of memory). To save the reconstruction with full resolution depth maps use the `--reconstruction_path` flag. If you ran with `--reconstruction_path my_reconstruction.pth`, you can view the reconstruction in high resolution by running
-```Bash
-python view_reconstruction.py my_reconstruction.pth
-```
-
-**Asynchronous and Multi-GPU Inference:** You can run the demos in asynchronous mode by running with `--asynchronous`. In this setting, the frontend and backend will run in seperate Python processes. You can additionally enable multi-GPU inference by setting the devices of the frontend and backend processes with the following arguments. 
-
-**Visualization currently doesn't work multi-gpu setting**. You will need to run with ``--disable_vis``.
-
-
-```Bash
-python demo.py --imagedir=data/sfm_bench/rgb --calib=calib/eth.txt
-```
-
-```Bash
-python demo.py --imagedir=data/mav0/cam0/data --calib=calib/euroc.txt --t0=150
-```
-
-```Bash
-python demo.py --imagedir=data/rgbd_dataset_freiburg3_cabinet/rgb --calib=calib/tum3.txt
-```
-
-
-**Running on your own data:** All you need is a calibration file. Calibration files are in the form 
-```
-fx fy cx cy [k1 k2 p1 p2 [ k3 [ k4 k5 k6 ]]]
-```
-with parameters in brackets optional.
-
-## Evaluation
-We provide evaluation scripts for TartanAir, EuRoC, TUM, and ETH3D-SLAM. EuRoC and TUM can be run on a 1080Ti. The TartanAir and ETH3D-SLAM datasets will require 24G of memory. 
-
-**Asynchronous and Multi-GPU Inference:** You can run evaluation in asynchronous mode by running with `--asynchronous`. In this setting, the frontend and backend will run in seperate Python processes. You can additionally enable multi-GPU inference by setting the devices of the frontend and backend processes with the following arguments. For example:
-```
-python evaluation_scripts/test_tartanair.py \
-  --datapath data/tartanair_test/mono \
-  --gt_path data/tartanair_test/mono_gt \
-  --frontend_device cuda:0 \
-  --backend_device cuda:1 \
-  --asynchronous \
-  --disable_vis
-```
-
-
-**Note:** Running with `--asynchronous` will typically produce better results, but this mode is not deterministic.
-
-### TartanAir (Mono + Stereo)
-
-Download the [TartanAir](https://theairlab.org/tartanair-dataset/) test set with this command.
-
-```Bash
-./tools/download_tartanair_test.sh
-```
-
-Or from these links: [Images](https://drive.google.com/file/d/1N8qoU-oEjRKdaKSrHPWA-xsnRtofR_jJ/view), [Groundtruth](https://cmu.box.com/shared/static/3p1sf0eljfwrz4qgbpc6g95xtn2alyfk.zip) 
-
-
-
-**Monocular evaluation:**
-```bash
-python evaluation_scripts/test_tartanair.py \
-  --datapath datasets/tartanair_test/mono \
-  --gt_path datasets/tartanair_test/mono_gt \
-  --disable_vis
-```
-
-**Stereo evaluation:**
-```bash
-python evaluation_scripts/test_tartanair.py \
-  --datapath datasets/tartanair_test/stereo \
-  --gt_path datasets/tartanair_test/stereo_gt \
-  --stereo --disable_vis
-```
-
-
-**Evaluating on the validation split:**
-
-Download the [TartanAir](https://theairlab.org/tartanair-dataset/) dataset using the script `thirdparty/tartanair_tools/download_training.py` and put them in `datasets/TartanAir`
-```Bash
-# monocular eval
-./tools/validate_tartanair.sh --plot_curve
-
-# stereo eval
-./tools/validate_tartanair.sh --plot_curve  --stereo
-```
-
-### EuRoC (Mono + Stereo)
-Download the [EuRoC](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets) sequences (ASL format):
-```Bash
-./tools/download_euroc.sh
-```
-
-Then run evaluation:
-```Bash
-# monocular eval (single gpu)
-./tools/evaluate_euroc.sh
-
-# monocular eval (multi gpu)
-./tools/evaluate_euroc.sh --asynchronous --frontend_device cuda:0 --backend_device cuda:1
-
-# stereo eval (single gpu)
-./tools/evaluate_euroc.sh --stereo
-
-# stereo eval (multi gpu)
-./tools/evaluate_euroc.sh --stereo --asynchronous --frontend_device cuda:0 --backend_device cuda:1
-```
-
-### TUM-RGBD (Mono)
-Download the [TUM-RGBD](https://vision.in.tum.de/data/datasets/rgbd-dataset/download) sequences:
-```
-./tools/download_tum.sh
-```
-Then run evaluation:
-```Bash
-# monocular eval (single gpu)
-./tools/evaluate_tum.sh
-
-# monocular eval (multi gpu)
-./tools/evaluate_tum.sh --asynchronous --frontend_device cuda:0 --backend_device cuda:1
-```
-
-### ETH3D (RGB-D)
-Download the [ETH3D](https://www.eth3d.net/slam_datasets) dataset:
-```Bash
-./tools/download_eth3d.sh
-```
-
-```Bash
-# RGB-D eval (single gpu)
-./tools/evaluate_eth3d.sh > eth3d_results.txt
-python evaluation_scripts/parse_results.py eth3d_results.txt
-
-# RGB-D eval (multi gpu)
-./tools/evaluate_eth3d.sh --asynchronous --frontend_device cuda:0 --backend_device cuda:1 > eth3d_results_async.txt
-python evaluation_scripts/parse_results.py eth3d_results_async.txt
-```
-
-## Training
-
-First download the TartanAir dataset. The download script can be found in `thirdparty/tartanair_tools/download_training.py`. You will only need the `rgb` and `depth` data.
-
-```
-python download_training.py --rgb --depth
-```
-
-You can then run the training script. We use 4x3090 RTX GPUs for training which takes approximatly 1 week. If you use a different number of GPUs, adjust the learning rate accordingly.
-
-**Note:** On the first training run, covisibility is computed between all pairs of frames. This can take several hours, but the results are cached so that future training runs will start immediately. 
-
-
-```
-python train.py --datapath=<path to tartanair> --gpus=4 --lr=0.00025
-```
-
-
-## Acknowledgements
-Data from [TartanAir](https://theairlab.org/tartanair-dataset/) was used to train our model. We additionally use evaluation tools from [evo](https://github.com/MichaelGrupp/evo) and [tartanair_tools](https://github.com/castacks/tartanair_tools).
+Retain the upstream license and third-party license notices when redistributing
+this repository.

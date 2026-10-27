@@ -1,0 +1,145 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="980" viewBox="0 0 1600 980" role="img" aria-labelledby="title desc">
+  <title id="title">Final selected DROID-SLAM learned RVP IMU attenuation architecture</title>
+  <desc id="desc">Frozen DROID visual features and raw IMU preintegration feed a compact learned direct RVP attenuation head. The resulting rotation, velocity, and position attenuations scale a covariance-normalized IMU factor inside 15DoF bundle adjustment.</desc>
+  <defs>
+    <style>
+      .title { font: 700 34px Arial, 'Noto Sans KR', sans-serif; fill: #172234; }
+      .sub { font: 500 17px Arial, 'Noto Sans KR', sans-serif; fill: #536273; }
+      .section { font: 700 20px Arial, 'Noto Sans KR', sans-serif; fill: #172234; }
+      .head { font: 700 18px Arial, 'Noto Sans KR', sans-serif; fill: #172234; }
+      .body { font: 500 16px Arial, 'Noto Sans KR', sans-serif; fill: #26384b; }
+      .small { font: 500 14px Arial, 'Noto Sans KR', sans-serif; fill: #536273; }
+      .tiny { font: 500 12.5px Arial, 'Noto Sans KR', sans-serif; fill: #536273; }
+      .white { font: 700 14px Arial, 'Noto Sans KR', sans-serif; fill: #fff; }
+      .node { stroke-width: 2; rx: 14; ry: 14; }
+      .blue { fill: #eaf2ff; stroke: #3f7fca; }
+      .orange { fill: #fff2df; stroke: #db8c32; }
+      .purple { fill: #f5eeff; stroke: #8a64c4; }
+      .green { fill: #eef9f2; stroke: #3e9e69; }
+      .gray { fill: #f6f8fa; stroke: #6c7b89; }
+      .frame-blue { fill: #fbfdff; stroke: #9fc1ea; stroke-width: 2; stroke-dasharray: 9 6; }
+      .frame-purple { fill: #fdfaff; stroke: #ccb9e8; stroke-width: 2; }
+      .av { fill: none; stroke: #3f7fca; stroke-width: 3; marker-end: url(#blue); }
+      .ai { fill: none; stroke: #db8c32; stroke-width: 3; marker-end: url(#orange); }
+      .ap { fill: none; stroke: #8a64c4; stroke-width: 3; marker-end: url(#purple); }
+      .ag { fill: none; stroke: #3e9e69; stroke-width: 3; marker-end: url(#green); }
+      .dash { fill: none; stroke: #8a64c4; stroke-width: 2.5; stroke-dasharray: 8 6; marker-end: url(#purple); }
+    </style>
+    <marker id="blue" markerWidth="11" markerHeight="11" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8Z" fill="#3f7fca"/></marker>
+    <marker id="orange" markerWidth="11" markerHeight="11" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8Z" fill="#db8c32"/></marker>
+    <marker id="purple" markerWidth="11" markerHeight="11" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8Z" fill="#8a64c4"/></marker>
+    <marker id="green" markerWidth="11" markerHeight="11" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8Z" fill="#3e9e69"/></marker>
+  </defs>
+
+  <rect width="1600" height="980" fill="#fff"/>
+  <text x="800" y="52" text-anchor="middle" class="title">최종 선택 모델: Direct R/V/P Learned IMU Attenuation in DROID-SLAM</text>
+  <text x="800" y="80" text-anchor="middle" class="sub">Visual backbone은 동결하고, covariance-normalized IMU factor만 구간·성분별로 감쇠한다</text>
+
+  <!-- Visual DROID path -->
+  <rect x="38" y="120" width="662" height="326" rx="22" class="frame-blue"/>
+  <rect x="62" y="102" width="296" height="38" rx="12" fill="#3f7fca"/>
+  <text x="210" y="128" text-anchor="middle" class="white">원본 DROID-SLAM visual path — frozen</text>
+  <rect x="70" y="183" width="125" height="80" class="node blue"/>
+  <text x="132" y="215" text-anchor="middle" class="head">Rectified image</text>
+  <text x="132" y="239" text-anchor="middle" class="small">stride 2 tracking</text>
+  <rect x="230" y="183" width="130" height="80" class="node blue"/>
+  <text x="295" y="215" text-anchor="middle" class="head">MotionFilter</text>
+  <text x="295" y="239" text-anchor="middle" class="small">keyframe selection</text>
+  <rect x="395" y="168" width="130" height="110" class="node blue"/>
+  <text x="460" y="205" text-anchor="middle" class="head">FNet / CNet</text>
+  <text x="460" y="229" text-anchor="middle" class="small">feature + context</text>
+  <text x="460" y="252" text-anchor="middle" class="small">correlation</text>
+  <rect x="557" y="168" width="115" height="110" class="node blue"/>
+  <text x="614" y="205" text-anchor="middle" class="head">ConvGRU</text>
+  <text x="614" y="229" text-anchor="middle" class="small">hidden h</text>
+  <text x="614" y="252" text-anchor="middle" class="small">128×H×W</text>
+  <path d="M195 223 H230 M360 223 H395 M525 223 H557" class="av"/>
+  <rect x="235" y="330" width="180" height="74" class="node blue"/>
+  <text x="325" y="360" text-anchor="middle" class="head">Visual update heads</text>
+  <text x="325" y="383" text-anchor="middle" class="small">correction Δ, weight wᵛ</text>
+  <rect x="460" y="330" width="195" height="74" class="node blue"/>
+  <text x="557" y="360" text-anchor="middle" class="head">Visual reprojection factor</text>
+  <text x="557" y="383" text-anchor="middle" class="small">DROID dense BA evidence</text>
+  <path d="M614 278 C614 310 420 300 325 330" class="av"/>
+  <path d="M415 367 H460" class="av"/>
+
+  <!-- IMU physics path -->
+  <rect x="38" y="535" width="420" height="265" rx="22" fill="#fffaf4" stroke="#efc18c" stroke-width="2"/>
+  <rect x="62" y="517" width="252" height="38" rx="12" fill="#db8c32"/>
+  <text x="188" y="543" text-anchor="middle" class="white">물리 IMU path — full-strength reference</text>
+  <rect x="72" y="606" width="124" height="84" class="node orange"/>
+  <text x="134" y="638" text-anchor="middle" class="head">Gyro + accel</text>
+  <text x="134" y="662" text-anchor="middle" class="small">raw high-rate samples</text>
+  <rect x="237" y="582" width="185" height="132" class="node orange"/>
+  <text x="329" y="617" text-anchor="middle" class="head">IMU preintegration</text>
+  <text x="329" y="643" text-anchor="middle" class="small">ΔR, Δv, Δp; covariance</text>
+  <text x="329" y="666" text-anchor="middle" class="small">bias Jacobian, Δt</text>
+  <text x="329" y="689" text-anchor="middle" class="small">camera-time interval</text>
+  <path d="M196 648 H237" class="ai"/>
+  <text x="250" y="754" text-anchor="middle" class="tiny">full covariance + sensor bias random walk remain physical priors</text>
+
+  <!-- Direct learned head -->
+  <rect x="750" y="120" width="430" height="680" rx="22" class="frame-purple"/>
+  <rect x="776" y="102" width="310" height="38" rx="12" fill="#8a64c4"/>
+  <text x="931" y="128" text-anchor="middle" class="white">새로 학습한 Direct precision head (6,291 params)</text>
+  <text x="965" y="170" text-anchor="middle" class="section">두 입력은 같은 temporal IMU edge에 대응</text>
+  <rect x="782" y="205" width="175" height="112" class="node purple"/>
+  <text x="870" y="239" text-anchor="middle" class="head">Visual embedding</text>
+  <text x="870" y="264" text-anchor="middle" class="small">1×1 Conv: 128→32</text>
+  <text x="870" y="287" text-anchor="middle" class="small">ReLU + spatial mean</text>
+  <text x="870" y="307" text-anchor="middle" class="small">v ∈ R³²</text>
+  <rect x="982" y="205" width="170" height="112" class="node purple"/>
+  <text x="1067" y="239" text-anchor="middle" class="head">IMU quality MLP</text>
+  <text x="1067" y="264" text-anchor="middle" class="small">q ∈ R⁷</text>
+  <text x="1067" y="287" text-anchor="middle" class="small">7→16→16, ReLU</text>
+  <text x="1067" y="307" text-anchor="middle" class="small">u ∈ R¹⁶</text>
+  <rect x="810" y="380" width="315" height="104" class="node purple"/>
+  <text x="968" y="414" text-anchor="middle" class="head">Fusion MLP</text>
+  <text x="968" y="439" text-anchor="middle" class="small">concat(v,u) ∈ R⁴⁸ → LayerNorm</text>
+  <text x="968" y="462" text-anchor="middle" class="small">48→32→3 logits (zᴿ,zⱽ,zᵖ)</text>
+  <rect x="810" y="545" width="315" height="120" class="node purple"/>
+  <text x="968" y="580" text-anchor="middle" class="head">Bounded attenuation</text>
+  <text x="968" y="609" text-anchor="middle" class="body">c = exp(−softplus(z)) ∈ (0,1]³</text>
+  <text x="968" y="635" text-anchor="middle" class="small">cᴿ, cⱽ, cᵖ : rotation / velocity / position</text>
+  <path d="M870 317 V380" class="ap"/>
+  <path d="M1067 317 V380" class="ap"/>
+  <path d="M968 484 V545" class="ap"/>
+  <text x="968" y="715" text-anchor="middle" class="small">No global λIMU · no learned residual-weight scalar</text>
+  <text x="968" y="741" text-anchor="middle" class="small">No discrepancy / innovation / edge-fusion branch in final model</text>
+
+  <!-- Connections into learned head -->
+  <path d="M672 223 C730 223 737 250 782 250" class="ap"/>
+  <path d="M422 648 C650 648 700 270 982 270" class="ap"/>
+  <text x="610" y="567" text-anchor="middle" class="tiny">q₇ = [Δt, |ΔR|/Δt, |Δv|/Δt, |Δp|/Δt², relative R/v/p information]</text>
+
+  <!-- Optimizer -->
+  <rect x="1240" y="225" width="320" height="300" class="node green"/>
+  <text x="1400" y="262" text-anchor="middle" class="head">Joint 15DoF dense BA</text>
+  <text x="1400" y="291" text-anchor="middle" class="body">state per keyframe</text>
+  <text x="1400" y="318" text-anchor="middle" class="small">pose(6) + velocity(3)</text>
+  <text x="1400" y="341" text-anchor="middle" class="small">accel bias(3) + gyro bias(3)</text>
+  <text x="1400" y="374" text-anchor="middle" class="small">visual reprojection factor</text>
+  <text x="1400" y="397" text-anchor="middle" class="small">+ covariance-normalized IMU factor</text>
+  <text x="1400" y="433" text-anchor="middle" class="body">r̃ᴿ=√cᴿrᴿ, r̃ⱽ=√cⱽrⱽ, r̃ᵖ=√cᵖrᵖ</text>
+  <text x="1400" y="462" text-anchor="middle" class="small">bias random-walk rows are not attenuated by c</text>
+  <path d="M655 367 C953 367 1011 385 1240 385" class="av"/>
+  <path d="M422 670 C830 670 943 450 1240 450" class="ai"/>
+  <path d="M1125 605 C1190 605 1160 450 1240 450" class="dash"/>
+
+  <rect x="1260" y="610" width="280" height="100" class="node gray"/>
+  <text x="1400" y="646" text-anchor="middle" class="head">Dense output trajectory</text>
+  <text x="1400" y="671" text-anchor="middle" class="small">global BA → pose filling → 20 Hz poses</text>
+  <text x="1400" y="693" text-anchor="middle" class="small">V1_03: 2,149 timestamps</text>
+  <path d="M1400 525 V610" class="ag"/>
+
+  <!-- Runtime schedule -->
+  <rect x="38" y="850" width="1522" height="98" rx="18" fill="#f5f7fa" stroke="#d9e0e6" stroke-width="2"/>
+  <text x="70" y="882" class="head">Final inference schedule</text>
+  <text x="335" y="882" text-anchor="middle" class="body">local visual DBA ×3</text>
+  <text x="620" y="882" text-anchor="middle" class="body">VI alignment</text>
+  <text x="884" y="882" text-anchor="middle" class="body">local full 15DoF ×2</text>
+  <text x="1172" y="882" text-anchor="middle" class="body">global visual DBA ×7</text>
+  <text x="1432" y="882" text-anchor="middle" class="body">global full 15DoF ×12</text>
+  <path d="M450 882 H520 M700 882 H775 M995 882 H1060 M1290 882 H1340" class="ag"/>
+  <text x="790" y="922" text-anchor="middle" class="small">학습과 달리 inference에는 GT, synthetic IMU corruption, gradient가 전혀 사용되지 않는다.</text>
+</svg>

@@ -1,1 +1,0 @@
-OUT_DIR=outputs/euroc_v2_03_global_bias_heldout_20261007_144240

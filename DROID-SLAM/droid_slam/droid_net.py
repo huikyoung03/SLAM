@@ -60,11 +60,15 @@ from geom.imu_factor import (
 
     edge_imu_quality_features,
 
+    edge_imu_innovation_features,
+
     imu_center_from_pose_data,
 
     temporal_imu_confidence_from_edges,
 
     temporal_imu_precision_from_edges,
+
+    temporal_imu_visual_innovation_features,
 
     temporal_imu_quality_features,
 
@@ -79,6 +83,49 @@ from geom.graph_utils import graph_to_edge_list, keyframe_indicies
 
 
 from torch_scatter import scatter_mean
+
+
+# The direct precision head historically used seven preintegration-quality
+# descriptors.  Three causal visual--IMU discrepancy magnitudes can be folded
+# into that *same* head, rather than adding an output-logit adapter.  Keeping
+# this separate from the legacy ``imu_precision_innovation`` branch is
+# intentional: the latter is an optional residual head, while this is an
+# input feature of the original direct R/v/p predictor.
+IMU_PRECISION_DISCREPANCY_DIM = 3
+IMU_PRECISION_DIRECT_INPUT_DIM = (
+    IMU_QUALITY_FEATURE_DIM + IMU_PRECISION_DISCREPANCY_DIM
+)
+
+
+def upgrade_direct_precision_quality_checkpoint(state_dict, model_state):
+    """Expand a historical 7D direct-quality first layer to 10D safely.
+
+    The extra discrepancy columns are initialized to zero.  Thus loading a
+    pre-discrepancy poster checkpoint preserves its output exactly until the
+    new feature is explicitly trained.  ``state_dict`` is updated in place
+    and the function returns whether a migration was applied.
+    """
+
+    key = "update.imu_precision_quality.0.weight"
+    if key not in state_dict or key not in model_state:
+        return False
+    source = state_dict[key]
+    target = model_state[key]
+    if source.shape == target.shape:
+        return False
+    if (
+        source.ndim != 2
+        or target.ndim != 2
+        or source.shape[0] != target.shape[0]
+        or source.shape[1] != IMU_QUALITY_FEATURE_DIM
+        or target.shape[1] != IMU_PRECISION_DIRECT_INPUT_DIM
+    ):
+        return False
+    upgraded = target.detach().clone()
+    upgraded.zero_()
+    upgraded[:, :IMU_QUALITY_FEATURE_DIM].copy_(source)
+    state_dict[key] = upgraded
+    return True
 
 
 
@@ -157,7 +204,12 @@ def initialize_imu_motion(
     return motion
 
 
-def full_imu_unroll_schedule(num_steps, use_full_imu_ba, pose_only_steps=0):
+def full_imu_unroll_schedule(
+    num_steps,
+    use_full_imu_ba,
+    pose_only_steps=0,
+    explicit_schedule=None,
+):
     """Return whether each unrolled DBA step uses the full IMU state.
 
     A two-stage local solve first gives visual DBA iterations to establish a
@@ -174,7 +226,20 @@ def full_imu_unroll_schedule(num_steps, use_full_imu_ba, pose_only_steps=0):
             f"pose_only_steps must be non-negative, got {pose_only_steps}"
         )
     if not use_full_imu_ba:
+        if explicit_schedule is not None and any(bool(value) for value in explicit_schedule):
+            raise ValueError("a full-IMU schedule requires use_full_imu_ba=True")
         return [False] * num_steps
+
+    if explicit_schedule is not None:
+        schedule = [bool(value) for value in explicit_schedule]
+        if len(schedule) != num_steps:
+            raise ValueError(
+                "explicit full-IMU schedule length must equal num_steps, got "
+                f"{len(schedule)} for {num_steps}"
+            )
+        if not any(schedule):
+            raise ValueError("explicit full-IMU schedule must contain a full 15DoF step")
+        return schedule
 
     return [step >= pose_only_steps for step in range(num_steps)]
 
@@ -498,7 +563,7 @@ class UpdateModule(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.imu_precision_quality = nn.Sequential(
-            nn.Linear(IMU_QUALITY_FEATURE_DIM, 16),
+            nn.Linear(IMU_PRECISION_DIRECT_INPUT_DIM, 16),
             nn.ReLU(inplace=True),
             nn.Linear(16, 16),
             nn.ReLU(inplace=True),
@@ -509,6 +574,52 @@ class UpdateModule(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(32, 3),
         )
+        # Causal visual--IMU innovation enters as an additive logit branch.
+        # Keeping the historical 48D visual+quality fusion unchanged lets an
+        # existing direct-precision checkpoint load exactly; the zero-initial
+        # final projection initially leaves its output untouched.
+        self.imu_precision_innovation = nn.Sequential(
+            nn.Linear(3, 16),
+            nn.ReLU(inplace=True),
+            nn.Linear(16, 3),
+        )
+        nn.init.zeros_(self.imu_precision_innovation[-1].weight)
+        nn.init.zeros_(self.imu_precision_innovation[-1].bias)
+        # A disagreement magnitude alone cannot distinguish the two cases
+        # below:
+        #   (a) a confident visual correspondence disagrees with IMU, and
+        #   (b) an ambiguous visual correspondence disagrees with IMU.
+        # They should not necessarily attenuate the IMU factor in the same
+        # way.  This compact, causal cross branch receives the three
+        # covariance-normalized visual--IMU innovations together with the
+        # mean and spatial spread of DROID's two visual BA weights.  It is
+        # deliberately separate from the old innovation branch so an older
+        # checkpoint remains exactly unchanged until this new branch is
+        # explicitly trained and enabled.
+        self.imu_precision_visual_innovation = nn.Sequential(
+            nn.Linear(7, 16),
+            nn.ReLU(inplace=True),
+            nn.Linear(16, 3),
+        )
+        nn.init.zeros_(self.imu_precision_visual_innovation[-1].weight)
+        nn.init.zeros_(self.imu_precision_visual_innovation[-1].bias)
+        # Edge-conditioned residual adapter.  The earlier visual-conditioned
+        # branch saw only four global statistics of the visual BA weights,
+        # which is too little to distinguish a real correspondence correction
+        # from an unreliable IMU interval.  This adapter instead receives,
+        # for *each active graph edge*, frozen ConvGRU visual evidence (32),
+        # raw IMU preintegration quality (7), causal R/v/p innovation (3),
+        # and DROID correspondence-correction/weight statistics (8).  It is
+        # additive and zero-initialized, so an older direct-precision
+        # checkpoint remains exactly behaviorally unchanged until training.
+        self.imu_precision_edge_fusion = nn.Sequential(
+            nn.LayerNorm(50),
+            nn.Linear(50, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 3),
+        )
+        nn.init.zeros_(self.imu_precision_edge_fusion[-1].weight)
+        nn.init.zeros_(self.imu_precision_edge_fusion[-1].bias)
         # A one-sided reliability is bounded above by the physical sensor
         # covariance reference. Do *not* initialize exactly at that upper
         # boundary: the old exp(clamp(logit, max=0)) mapping gave zero
@@ -651,7 +762,172 @@ class UpdateModule(nn.Module):
 
         return torch.exp(-F.softplus(logits))
 
-    def imu_precision_weights(self, net, imu_quality=None):
+    @staticmethod
+    def _validate_imu_precision_innovation(innovation, batch, edges, reference):
+        """Return finite [B, E, 3] innovation features or neutral zeros."""
+
+        if innovation is None:
+            return reference.new_zeros((batch, edges, 3))
+        innovation = innovation.to(device=reference.device, dtype=reference.dtype)
+        if innovation.ndim == 2:
+            innovation = innovation.unsqueeze(0)
+        if innovation.shape != (batch, edges, 3):
+            raise ValueError(
+                "imu_innovation must be [B, E, 3] for IMU precision, got "
+                f"{tuple(innovation.shape)} for B={batch}, E={edges}"
+            )
+        if not torch.isfinite(innovation).all():
+            raise ValueError("imu_innovation must be finite")
+        return innovation
+
+    @staticmethod
+    def _validate_imu_precision_visual_quality(
+        visual_quality,
+        batch,
+        edges,
+        reference,
+    ):
+        """Return causal [mean_x, mean_y, std_x, std_y] BA-weight features.
+
+        ``None`` intentionally means that no direct visual correspondence
+        exists for this temporal IMU interval (the quality-only fallback
+        path).  It must not be replaced by arbitrary constants and then fed
+        through the cross branch.
+        """
+
+        if visual_quality is None:
+            return None
+        visual_quality = visual_quality.to(
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        if visual_quality.ndim == 2:
+            visual_quality = visual_quality.unsqueeze(0)
+        if visual_quality.shape != (batch, edges, 4):
+            raise ValueError(
+                "visual_quality must be [B, E, 4] for IMU precision, got "
+                f"{tuple(visual_quality.shape)} for B={batch}, E={edges}"
+            )
+        if not torch.isfinite(visual_quality).all():
+            raise ValueError("visual_quality must be finite")
+        return visual_quality
+
+    @staticmethod
+    def _visual_ba_quality_features(weight, batch, edges):
+        """Summarize DROID's causal visual BA weights for each graph edge.
+
+        The visual head already predicts two sigmoid correspondence weights
+        used by DROID DBA.  Their spatial mean and standard deviation are
+        available at exactly the same recurrent update as the IMU precision
+        prediction.  Detaching them keeps the pretrained visual estimator
+        fixed: the new IMU branch learns to *read* visual reliability instead
+        of changing visual weights to satisfy an IMU objective.
+        """
+
+        if weight.ndim == 4:
+            if weight.shape[0] != batch * edges or weight.shape[1] < 2:
+                raise ValueError(
+                    "weight must be [B*E, >=2, H, W] for IMU visual quality, got "
+                    f"{tuple(weight.shape)} for B={batch}, E={edges}"
+                )
+            visual_weight = weight[:, :2].view(batch, edges, 2, *weight.shape[-2:])
+        elif weight.ndim == 5:
+            if weight.shape[:2] != (batch, edges) or weight.shape[2] < 2:
+                raise ValueError(
+                    "weight must be [B, E, >=2, H, W] for IMU visual quality, got "
+                    f"{tuple(weight.shape)} for B={batch}, E={edges}"
+                )
+            visual_weight = weight[:, :, :2]
+        else:
+            raise ValueError(
+                "weight must be [B*E, >=2, H, W] or [B, E, >=2, H, W] for "
+                f"IMU visual quality, got {tuple(weight.shape)}"
+            )
+
+        visual_weight = visual_weight.detach()
+        mean = visual_weight.mean(dim=(-2, -1))
+        std = visual_weight.flatten(start_dim=3).std(dim=-1, unbiased=False)
+        return torch.cat((mean, std), dim=-1)
+
+    @staticmethod
+    def _visual_correspondence_features(delta, weight, batch, edges):
+        """Return causal per-edge correspondence-correction evidence.
+
+        ``delta`` is DROID's current correspondence correction before DBA,
+        while ``weight`` is its current visual BA reliability.  We retain only
+        scale/stability statistics (absolute correction mean and spread,
+        followed by visual-weight mean and spread), so the IMU head cannot
+        exploit image position or any future/GT information.  Inputs are
+        detached: this branch reads frozen visual evidence but never changes
+        DROID's pretrained visual update to reduce an inertial loss.
+        """
+
+        def canonicalize(tensor, name):
+            if tensor.ndim == 4:
+                if tensor.shape[0] != batch * edges or tensor.shape[1] < 2:
+                    raise ValueError(
+                        f"{name} must be [B*E, >=2, H, W] for IMU edge fusion, "
+                        f"got {tuple(tensor.shape)} for B={batch}, E={edges}"
+                    )
+                return tensor[:, :2].view(batch, edges, 2, *tensor.shape[-2:])
+            if tensor.ndim == 5:
+                if tensor.shape[:2] != (batch, edges) or tensor.shape[2] < 2:
+                    raise ValueError(
+                        f"{name} must be [B, E, >=2, H, W] for IMU edge fusion, "
+                        f"got {tuple(tensor.shape)} for B={batch}, E={edges}"
+                    )
+                return tensor[:, :, :2]
+            raise ValueError(
+                f"{name} must be [B*E, >=2, H, W] or [B, E, >=2, H, W] "
+                f"for IMU edge fusion, got {tuple(tensor.shape)}"
+            )
+
+        correction = canonicalize(delta, "delta").detach()
+        visual_weight = canonicalize(weight, "weight").detach()
+        correction_abs_mean = correction.abs().mean(dim=(-2, -1))
+        correction_std = correction.flatten(start_dim=3).std(dim=-1, unbiased=False)
+        weight_mean = visual_weight.mean(dim=(-2, -1))
+        weight_std = visual_weight.flatten(start_dim=3).std(dim=-1, unbiased=False)
+        return torch.cat(
+            (correction_abs_mean, correction_std, weight_mean, weight_std),
+            dim=-1,
+        )
+
+    @staticmethod
+    def _validate_imu_precision_edge_features(
+        correspondence_features,
+        batch,
+        edges,
+        reference,
+    ):
+        """Return finite [B, E, 8] causal correspondence evidence."""
+
+        if correspondence_features is None:
+            return None
+        correspondence_features = correspondence_features.to(
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        if correspondence_features.ndim == 2:
+            correspondence_features = correspondence_features.unsqueeze(0)
+        if correspondence_features.shape != (batch, edges, 8):
+            raise ValueError(
+                "correspondence_features must be [B, E, 8] for IMU edge fusion, "
+                f"got {tuple(correspondence_features.shape)} for B={batch}, E={edges}"
+            )
+        if not torch.isfinite(correspondence_features).all():
+            raise ValueError("correspondence_features must be finite")
+        return correspondence_features
+
+    def imu_precision_weights(
+        self,
+        net,
+        imu_quality=None,
+        imu_innovation=None,
+        visual_quality=None,
+        correspondence_features=None,
+        imu_discrepancy=None,
+    ):
         """Return learned [rotation, velocity, position] IMU attenuation.
 
         The historical method name is retained for checkpoint/API
@@ -669,21 +945,59 @@ class UpdateModule(nn.Module):
         visual = visual.mean(dim=(2, 3)).view(batch, edges, -1)
 
         if imu_quality is None:
-            quality = visual.new_zeros((batch, edges, IMU_QUALITY_FEATURE_DIM))
+            raw_quality = visual.new_zeros((batch, edges, IMU_QUALITY_FEATURE_DIM))
         else:
-            quality = imu_quality.to(device=visual.device, dtype=visual.dtype)
-            if quality.ndim == 2:
-                quality = quality.unsqueeze(0)
-            if quality.shape != (batch, edges, IMU_QUALITY_FEATURE_DIM):
+            raw_quality = imu_quality.to(device=visual.device, dtype=visual.dtype)
+            if raw_quality.ndim == 2:
+                raw_quality = raw_quality.unsqueeze(0)
+            if raw_quality.shape != (batch, edges, IMU_QUALITY_FEATURE_DIM):
                 raise ValueError(
                     "imu_quality must be [B, E, 7] for IMU precision, got "
-                    f"{tuple(quality.shape)} for B={batch}, E={edges}"
+                    f"{tuple(raw_quality.shape)} for B={batch}, E={edges}"
                 )
-        quality = self.imu_precision_quality(quality)
+        discrepancy = self._validate_imu_precision_innovation(
+            imu_discrepancy, batch, edges, visual
+        )
+        # Direct discrepancy conditioning is deliberately part of the
+        # historical quality MLP input.  It is not an additive innovation
+        # adapter: with zero-initialized new columns, a poster checkpoint has
+        # exactly its original output before fine-tuning.
+        quality_input = torch.cat((raw_quality, discrepancy), dim=-1)
+        quality = self.imu_precision_quality(quality_input)
         logits = self.imu_precision_fusion(torch.cat((visual, quality), dim=-1))
+        innovation = self._validate_imu_precision_innovation(
+            imu_innovation, batch, edges, visual
+        )
+        logits = logits + self.imu_precision_innovation(innovation)
+        visual_quality = self._validate_imu_precision_visual_quality(
+            visual_quality, batch, edges, visual
+        )
+        if visual_quality is not None:
+            logits = logits + self.imu_precision_visual_innovation(
+                torch.cat((innovation, visual_quality), dim=-1)
+            )
+        correspondence_features = self._validate_imu_precision_edge_features(
+            correspondence_features, batch, edges, visual
+        )
+        if correspondence_features is not None:
+            edge_input = torch.cat(
+                (
+                    visual.detach(),
+                    raw_quality.detach(),
+                    innovation.detach(),
+                    correspondence_features,
+                ),
+                dim=-1,
+            )
+            logits = logits + self.imu_precision_edge_fusion(edge_input)
         return self._imu_attenuation_from_logits(logits)
 
-    def imu_precision_quality_weights(self, imu_quality):
+    def imu_precision_quality_weights(
+        self,
+        imu_quality,
+        imu_innovation=None,
+        imu_discrepancy=None,
+    ):
         """Return quality-only attenuation for valid rows without visual edges."""
 
         if imu_quality is None:
@@ -698,9 +1012,22 @@ class UpdateModule(nn.Module):
             )
         reference = self.imu_precision_fusion[-1].weight
         quality = quality.to(device=reference.device, dtype=reference.dtype)
-        quality = self.imu_precision_quality(quality)
+        discrepancy = self._validate_imu_precision_innovation(
+            imu_discrepancy,
+            quality.shape[0],
+            quality.shape[1],
+            quality,
+        )
+        quality = self.imu_precision_quality(torch.cat((quality, discrepancy), dim=-1))
         visual = quality.new_zeros((*quality.shape[:-1], 32))
         logits = self.imu_precision_fusion(torch.cat((visual, quality), dim=-1))
+        innovation = self._validate_imu_precision_innovation(
+            imu_innovation,
+            quality.shape[0],
+            quality.shape[1],
+            quality,
+        )
+        logits = logits + self.imu_precision_innovation(innovation)
         return self._imu_attenuation_from_logits(logits)
 
 
@@ -718,6 +1045,10 @@ class UpdateModule(nn.Module):
         use_dvi_imu_confidence=False,
         use_dvi_imu_quality_fusion=False,
         imu_quality=None,
+        imu_innovation=None,
+        use_imu_precision_visual_innovation=False,
+        use_imu_precision_edge_fusion=False,
+        imu_discrepancy=None,
     ):
 
         """ RaftSLAM update operator """
@@ -761,8 +1092,23 @@ class UpdateModule(nn.Module):
         weight = self.weight(net).view(*output_dim)
 
         if use_learned_imu_precision:
+            visual_quality = (
+                self._visual_ba_quality_features(weight, batch, num)
+                if use_imu_precision_visual_innovation
+                else None
+            )
+            correspondence_features = (
+                self._visual_correspondence_features(delta, weight, batch, num)
+                if use_imu_precision_edge_fusion
+                else None
+            )
             imu_confidence = self.imu_precision_weights(
-                net.view(batch, num, -1, ht, wd), imu_quality=imu_quality
+                net.view(batch, num, -1, ht, wd),
+                imu_quality=imu_quality,
+                imu_discrepancy=imu_discrepancy,
+                imu_innovation=imu_innovation,
+                visual_quality=visual_quality,
+                correspondence_features=correspondence_features,
             )
             imu_confidence = imu_confidence.unsqueeze(2).unsqueeze(2)
         elif return_component_imu_confidence:
@@ -1066,9 +1412,19 @@ class DroidNet(nn.Module):
 
         use_dvi_imu_quality_fusion=False,
 
+        use_imu_precision_discrepancy=False,
+
+        use_imu_precision_innovation=False,
+
+        use_imu_precision_visual_innovation=False,
+
+        use_imu_precision_edge_fusion=False,
+
         use_full_imu_ba=False,
 
         imu_pose_only_steps=0,
+
+        imu_full_stage_schedule=None,
 
         imu_full_pos_weight=0.05,
 
@@ -1180,6 +1536,19 @@ class DroidNet(nn.Module):
         use_learned_imu_precision = bool(
             use_learned_imu_precision and (return_imu_confidence or use_imu_ba)
         )
+        use_imu_precision_innovation = bool(
+            use_imu_precision_innovation and use_learned_imu_precision
+        )
+        use_imu_precision_discrepancy = bool(
+            use_imu_precision_discrepancy and use_learned_imu_precision
+        )
+        use_imu_precision_visual_innovation = bool(
+            use_imu_precision_visual_innovation
+            and use_imu_precision_innovation
+        )
+        use_imu_precision_edge_fusion = bool(
+            use_imu_precision_edge_fusion and use_imu_precision_innovation
+        )
         if use_learned_imu_precision:
             # Direct precision is a distinct factor parameterization; never
             # compose it with a sigmoid confidence branch.
@@ -1234,6 +1603,7 @@ class DroidNet(nn.Module):
             num_steps,
             use_full_imu_ba,
             pose_only_steps=imu_pose_only_steps,
+            explicit_schedule=imu_full_stage_schedule,
         )
         imu_motion = None
         imu_motion_prior = None
@@ -1283,8 +1653,17 @@ class DroidNet(nn.Module):
                 imu_temporal_quality
             )
         elif use_learned_imu_precision:
-            imu_quality_fallback = self.update.imu_precision_quality_weights(
-                imu_temporal_quality
+            # A causal visual--IMU discrepancy depends on the current visual
+            # prepass state, so its direct-precision fallback is recomputed
+            # inside every unroll. The legacy innovation adapter has the same
+            # requirement.
+            imu_quality_fallback = (
+                None
+                if (
+                    use_imu_precision_discrepancy
+                    or use_imu_precision_innovation
+                )
+                else self.update.imu_precision_quality_weights(imu_temporal_quality)
             )
         else:
             imu_quality_fallback = self.update.dvi_imu_quality_confidence(
@@ -1354,6 +1733,50 @@ class DroidNet(nn.Module):
 
             motion = motion.permute(0,1,4,2,3).clamp(-64.0, 64.0)
 
+            imu_edge_discrepancy = None
+            imu_edge_innovation = None
+            step_imu_quality_fallback = imu_quality_fallback
+            if use_imu_precision_discrepancy or use_imu_precision_innovation:
+                temporal_discrepancy = temporal_imu_visual_innovation_features(
+                    Gs.data.detach(),
+                    imu_delta,
+                    imu_info=imu_info,
+                    imu_info_reference=imu_info_reference,
+                    imu_motion=(
+                        imu_motion.detach() if imu_motion is not None else None
+                    ),
+                    imu_bias_jacobian=imu_bias_jacobian,
+                    gyro_bias=self.imu_gyro_bias.detach(),
+                    accel_bias=self.imu_acc_bias.detach(),
+                    gravity=imu_gravity,
+                    imu_camera_translation=imu_camera_translation,
+                    imu_optimize_bias=imu_optimize_bias,
+                    compose_order=imu_full_compose_order,
+                    inverse_imu=imu_full_inverse,
+                )
+                if use_imu_precision_discrepancy:
+                    imu_edge_discrepancy = edge_imu_innovation_features(
+                        temporal_discrepancy, ii, jj
+                    )
+                if use_imu_precision_innovation:
+                    imu_edge_innovation = edge_imu_innovation_features(
+                        temporal_discrepancy, ii, jj
+                    )
+                if imu_temporal_quality is not None:
+                    step_imu_quality_fallback = self.update.imu_precision_quality_weights(
+                        imu_temporal_quality,
+                        imu_discrepancy=(
+                            temporal_discrepancy
+                            if use_imu_precision_discrepancy
+                            else None
+                        ),
+                        imu_innovation=(
+                            temporal_discrepancy
+                            if use_imu_precision_innovation
+                            else None
+                        ),
+                    )
+
 
 
             update_out = self.update(
@@ -1382,6 +1805,16 @@ class DroidNet(nn.Module):
 
                 imu_quality=imu_edge_quality,
 
+                imu_discrepancy=imu_edge_discrepancy,
+
+                imu_innovation=imu_edge_innovation,
+
+                use_imu_precision_visual_innovation=(
+                    use_imu_precision_visual_innovation
+                ),
+
+                use_imu_precision_edge_fusion=use_imu_precision_edge_fusion,
+
             )
 
 
@@ -1397,8 +1830,8 @@ class DroidNet(nn.Module):
                         jj,
                         num_frames=Gs.data.shape[1],
                         fallback=(
-                            imu_quality_fallback
-                            if imu_quality_fallback is not None
+                            step_imu_quality_fallback
+                            if step_imu_quality_fallback is not None
                             else 1.0
                         ),
                     )
@@ -1409,8 +1842,8 @@ class DroidNet(nn.Module):
                         jj,
                         num_frames=Gs.data.shape[1],
                         fallback=(
-                            imu_quality_fallback
-                            if imu_quality_fallback is not None
+                            step_imu_quality_fallback
+                            if step_imu_quality_fallback is not None
                             else 1.0
                         ),
                     )

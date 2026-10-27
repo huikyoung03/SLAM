@@ -1,4 +1,4 @@
-a# Byte-compiled / optimized / DLL files
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -146,6 +146,7 @@ dist
 *.vscode/
 *.pth
 tests
+checkpoints
 datasets
 runs
 cache
@@ -154,7 +155,46 @@ cache
 data
 figures/*.pdf
 
-!checkpoints/*.pth
-!checkpoints/**/*.pth
+# ---------------------------------------------------------------------------
+# Final public release hygiene
+# ---------------------------------------------------------------------------
+# These directories are machine-specific and can be regenerated.  In
+# particular, reconstruction checkpoints/PLY files are hundreds of MB and
+# training logs often contain absolute local paths.
+/logs/
+/outputs/
+/checkpoints/
+/datasets/
+/runs/
+/cache/
+
+# Keep only the two final presentation diagrams.  Raw/metric PLY files and
+# trajectory screenshots are generated artifacts, not source assets.
+/presentation_assets/*
+!/presentation_assets/final_direct_rvp_architecture.svg
+!/presentation_assets/final_direct_rvp_training.svg
+
+# Internal notes and chronological experiment reports are not part of the
+# public release.  FINAL_PPT_TECHNICAL_BRIEF.md is the one curated document.
+/CHAPTER3_PRESENTATION_STORY.md
+/CODE_FLOW_REPORT.md
+/CURRENT_EXPERIMENT_STATUS_REPORT_*.md
+/DROID_IMU_PROGRESS_REPORT.md
+/INTERIM_PRESENTATION_*.md
+/PPT_SOURCE_*.md
+/PROGRESS_*.md
+/WEEKLY_REPORT_*.md
+/run_webp_imu_selected_experiment.sh
+/export_reconstruction_ply.py
+
+# Only final public tools are added from the otherwise experimental tools/
+# workspace.  Already tracked upstream DROID tools remain untouched.
+/tools/*
+!/tools/evaluate_euroc_recon.py
+!/tools/export_euroc_original_protocol_motion_filter_manifests.sh
+!/tools/imu_preintegrate.py
+!/tools/prepare_euroc_original_protocol_assets.py
+!/tools/run_final_direct_rvp_train.sh
+!/tools/run_final_v1_03_evaluation.sh
 
 
